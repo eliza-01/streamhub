@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from streamhub_common.logging import configure_logging
 from streamhub_common.settings import get_settings
 
-from .routers import auth, events, sessions
+from .routers import auth, capture, events, sessions, video
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -34,4 +34,6 @@ async def health_ready() -> dict[str, str]:
 
 app.include_router(sessions.router)
 app.include_router(events.router)
+app.include_router(capture.router)
+app.include_router(video.router)
 app.include_router(auth.router)

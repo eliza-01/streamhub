@@ -46,6 +46,7 @@ class TwitchIntegrityContext(BaseModel):
 vod_tasks: dict[uuid.UUID, asyncio.Task] = {}
 vod_integrity_contexts: dict[uuid.UUID, TwitchIntegrityContext] = {}
 auth_requests: dict[str, dict[str, Any]] = {}
+metadata_app_token: dict[str, Any] = {}
 
 
 @dataclass(slots=True)
@@ -560,6 +561,64 @@ async def load_runtime_twitch_auth() -> TwitchRuntimeAuth:
         raise RuntimeError("validated Twitch authorization has no user identity")
     return TwitchRuntimeAuth(access_token=access_token, user_id=user_id, login=login, scopes=scopes)
 
+
+
+
+async def load_metadata_access_token() -> str:
+    """Return a token for public Helix metadata calls without requiring Chat OAuth.
+
+    Client credentials are preferred because public Get Users/Get Streams/Get
+    Videos do not need user consent. If an existing deployment has no usable
+    client secret, a valid stored user token remains a compatibility fallback.
+    """
+    now = datetime.now(UTC)
+    cached = metadata_app_token.get("access_token")
+    expires_at = metadata_app_token.get("expires_at")
+    if cached and isinstance(expires_at, datetime) and expires_at > now + timedelta(seconds=60):
+        return str(cached)
+
+    app_error: Exception | None = None
+    if settings.twitch_client_secret:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    settings.twitch_token_url,
+                    data={
+                        "client_id": settings.twitch_client_id,
+                        "client_secret": settings.twitch_client_secret,
+                        "grant_type": "client_credentials",
+                    },
+                )
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Twitch app token request failed HTTP {response.status_code}: {response.text[:500]}"
+                )
+            payload = response.json()
+            token = str(payload.get("access_token") or "")
+            if not token:
+                raise RuntimeError("Twitch app token response did not contain access_token")
+            expires_in = max(120, int(payload.get("expires_in") or 3600))
+            metadata_app_token.clear()
+            metadata_app_token.update({"access_token": token, "expires_at": now + timedelta(seconds=expires_in)})
+            return token
+        except Exception as exc:
+            app_error = exc
+            logger.warning("Twitch app metadata token unavailable; trying stored user token: %s", exc)
+
+    try:
+        return (await load_runtime_twitch_auth()).access_token
+    except Exception as exc:
+        if app_error is not None:
+            raise RuntimeError(f"{app_error}; stored user token fallback unavailable: {exc}") from exc
+        raise
+
+
+def metadata_helix_headers(access_token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Client-Id": settings.twitch_client_id,
+        "Accept": "application/json",
+    }
 
 def helix_headers(auth: TwitchRuntimeAuth) -> dict[str, str]:
     return {
@@ -1185,12 +1244,37 @@ async def health_ready() -> dict[str, str]:
 @app.post("/internal/v1/metadata/resolve", dependencies=[Depends(require_internal_token)])
 async def resolve_twitch_metadata(payload: MetadataResolveRequest) -> dict:
     try:
-        auth = await load_runtime_twitch_auth()
+        metadata_token = await load_metadata_access_token()
+        metadata_headers = metadata_helix_headers(metadata_token)
         if payload.mode == "live":
             if not payload.channel_login:
                 raise HTTPException(400, "channel_login is required for LIVE metadata resolution")
-            broadcaster = await resolve_broadcaster(auth, payload.channel_login)
-            stream = await resolve_live_stream(auth, str(broadcaster.get("id") or ""))
+            async with httpx.AsyncClient(timeout=15) as client:
+                user_response = await client.get(
+                    f"{settings.twitch_api_base_url}/users",
+                    params={"login": payload.channel_login},
+                    headers=metadata_headers,
+                )
+            if user_response.status_code >= 400:
+                raise RuntimeError(
+                    f"Twitch Get Users failed HTTP {user_response.status_code}: {user_response.text[:500]}"
+                )
+            users = user_response.json().get("data") or []
+            if not users:
+                raise RuntimeError(f"Twitch channel {payload.channel_login!r} was not found")
+            broadcaster = users[0]
+            async with httpx.AsyncClient(timeout=15) as client:
+                stream_response = await client.get(
+                    f"{settings.twitch_api_base_url}/streams",
+                    params={"user_id": str(broadcaster.get("id") or "")},
+                    headers=metadata_headers,
+                )
+            if stream_response.status_code >= 400:
+                raise RuntimeError(
+                    f"Twitch Get Streams failed HTTP {stream_response.status_code}: {stream_response.text[:500]}"
+                )
+            streams = stream_response.json().get("data") or []
+            stream = streams[0] if streams else None
             if stream is None:
                 raise HTTPException(409, "Twitch channel is not live")
             return {
@@ -1212,7 +1296,7 @@ async def resolve_twitch_metadata(payload: MetadataResolveRequest) -> dict:
             response = await client.get(
                 f"{settings.twitch_api_base_url}/videos",
                 params={"id": payload.video_id},
-                headers=helix_headers(auth),
+                headers=metadata_headers,
             )
         if response.status_code >= 400:
             raise RuntimeError(f"Twitch Get Videos failed HTTP {response.status_code}: {response.text[:500]}")

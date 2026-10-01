@@ -31,6 +31,14 @@ class Settings(BaseSettings):
 
     chat_ingest_base_url: str = Field(default="http://chat-ingest:8001", alias="CHAT_INGEST_BASE_URL")
     twitch_adapter_base_url: str = Field(default="http://twitch-adapter:8002", alias="TWITCH_ADAPTER_BASE_URL")
+    video_recorder_base_url: str = Field(default="http://video-recorder:8003", alias="VIDEO_RECORDER_BASE_URL")
+
+    video_spool_root: str = Field(default="/spool", alias="VIDEO_SPOOL_ROOT")
+    video_segment_seconds: int = Field(default=10, ge=4, alias="VIDEO_SEGMENT_SECONDS")
+    video_stream_quality: str = Field(default="best", alias="VIDEO_STREAM_QUALITY")
+    video_reconnect_seconds: float = Field(default=5.0, ge=1.0, alias="VIDEO_RECONNECT_SECONDS")
+    video_stream_timeout_seconds: int = Field(default=90, ge=15, alias="VIDEO_STREAM_TIMEOUT_SECONDS")
+    video_stop_timeout_seconds: int = Field(default=20, ge=5, alias="VIDEO_STOP_TIMEOUT_SECONDS")
 
     twitch_client_id: str = Field(alias="TWITCH_CLIENT_ID")
     twitch_client_secret: str | None = Field(default=None, alias="TWITCH_CLIENT_SECRET")

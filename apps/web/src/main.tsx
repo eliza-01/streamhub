@@ -18,6 +18,65 @@ type Session = {
   progress_percent?: number | null;
 };
 
+type VideoSession = {
+  id: string;
+  event_id: string;
+  status: string;
+  completeness_status: string;
+  quality: string;
+  recorder_mode: string;
+  source_url: string;
+  recording_started_at_utc?: string | null;
+  ended_at_utc?: string | null;
+  duration_recorded_ms: number;
+  required_start_ms?: number | null;
+  required_end_ms?: number | null;
+  coverage_start_ms?: number | null;
+  coverage_end_ms?: number | null;
+  gap_count: number;
+  last_error?: string | null;
+  last_activity_at_utc?: string | null;
+  stop_reason?: string | null;
+  metadata?: { media_type?: "live" | "vod"; channel_login?: string | null } | null;
+  created_at: string;
+  updated_at: string;
+  progress_percent?: number | null;
+  segment_count?: number;
+  bytes?: number;
+};
+
+type VideoRun = {
+  id: number;
+  run_no: number;
+  status: string;
+  started_at_utc: string;
+  ended_at_utc?: string | null;
+  resume_source_offset_ms?: number | null;
+  first_segment_no?: number | null;
+  last_segment_no?: number | null;
+  streamlink_exit_code?: number | null;
+  ffmpeg_exit_code?: number | null;
+  close_reason?: string | null;
+  last_error?: string | null;
+};
+
+type VideoSegment = {
+  id: number;
+  segment_no: number;
+  video_run_id: number;
+  file_name: string;
+  relative_path: string;
+  timeline_start_ms: number;
+  timeline_end_ms: number;
+  source_media_start_ms?: number | null;
+  source_media_end_ms?: number | null;
+  duration_ms: number;
+  bytes: number;
+  storage_state: string;
+  integrity_state: string;
+  closed_at_utc: string;
+};
+
 type MediaEvent = {
   id: string;
   platform: string;
@@ -30,8 +89,11 @@ type MediaEvent = {
   source_duration_ms?: number | null;
   created_at: string;
   chat_sessions: Session[];
+  video_sessions: VideoSession[];
   chat_sessions_count: number;
+  video_sessions_count: number;
   active_chat_sessions_count: number;
+  active_video_sessions_count: number;
   has_chat: boolean;
   has_video: boolean;
   metadata?: { identity_state?: string } | null;
@@ -55,12 +117,25 @@ type CaptureProgress = {
   percent?: number | null;
 };
 
+type VideoCaptureProgress = {
+  session_id: string;
+  status: string;
+  completeness_status: string;
+  duration_recorded_ms: number;
+  coverage_end_ms?: number | null;
+  required_end_ms?: number | null;
+  gap_count: number;
+  last_error?: string | null;
+  percent?: number | null;
+};
+
 type ViewMode = "events" | "trash";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
 const PROGRESS_POLL_MS = 5000;
 const CAPTURE_BUSY_STATUSES = new Set(["arming", "recording", "paused", "reconciling"]);
 const CAPTURE_BUSY_COMPLETENESS = new Set(["collecting", "verifying"]);
+const VIDEO_BUSY_STATUSES = new Set(["arming", "recording", "reconnecting"]);
 
 function fmtMs(ms?: number | null) {
   if (ms == null) return "—";
@@ -71,8 +146,24 @@ function fmtMs(ms?: number | null) {
   return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
 }
 
+function fmtBytes(bytes?: number | null) {
+  if (bytes == null) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = Math.max(0, bytes);
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
 function isCaptureBusy(session: Session) {
   return CAPTURE_BUSY_STATUSES.has(session.status) || CAPTURE_BUSY_COMPLETENESS.has(session.completeness_status);
+}
+
+function isVideoBusy(session: VideoSession) {
+  return VIDEO_BUSY_STATUSES.has(session.status);
 }
 
 function localProgressPercent(session: Session): number | null {
@@ -83,26 +174,53 @@ function localProgressPercent(session: Session): number | null {
   return Math.min(99.9, Math.round((covered / session.source_duration_ms) * 1000) / 10);
 }
 
+function localVideoProgressPercent(session: VideoSession): number | null {
+  if (session.progress_percent != null) return session.progress_percent;
+  if (session.completeness_status === "complete") return 100;
+  if (session.metadata?.media_type !== "vod" || !session.required_end_ms || session.required_end_ms <= 0) return null;
+  const covered = Math.max(0, Math.min(session.coverage_end_ms || 0, session.required_end_ms));
+  return Math.min(99.9, Math.round((covered / session.required_end_ms) * 1000) / 10);
+}
+
 function ProgressBar({ session, progress }: { session: Session; progress?: CaptureProgress }) {
   const percent = progress?.percent ?? localProgressPercent(session);
   const status = progress?.status || session.status;
   if (!isCaptureBusy({ ...session, status, completeness_status: progress?.completeness_status || session.completeness_status })) {
     return null;
   }
-
   if (percent == null) {
     return (
       <div className="capture-progress" aria-label="Сбор идет, процент недоступен">
-        <div className="capture-progress-head"><span>Сбор идет</span><strong>LIVE</strong></div>
+        <div className="capture-progress-head"><span>Chat сбор</span><strong>LIVE</strong></div>
         <div className="progress-track indeterminate"><div className="progress-fill" /></div>
       </div>
     );
   }
-
   const safePercent = Math.max(0, Math.min(100, percent));
   return (
-    <div className="capture-progress" aria-label={`Прогресс сбора ${safePercent.toFixed(1)}%`}>
-      <div className="capture-progress-head"><span>Сбор</span><strong>{safePercent.toFixed(1)}%</strong></div>
+    <div className="capture-progress" aria-label={`Прогресс Chat ${safePercent.toFixed(1)}%`}>
+      <div className="capture-progress-head"><span>Chat</span><strong>{safePercent.toFixed(1)}%</strong></div>
+      <div className="progress-track"><div className="progress-fill" style={{ width: `${safePercent}%` }} /></div>
+    </div>
+  );
+}
+
+function VideoProgressBar({ session, progress }: { session: VideoSession; progress?: VideoCaptureProgress }) {
+  const effective = progress ? { ...session, ...progress } : session;
+  if (!isVideoBusy(effective)) return null;
+  const percent = progress?.percent ?? localVideoProgressPercent(session);
+  if (percent == null) {
+    return (
+      <div className="capture-progress" aria-label="Video запись идет">
+        <div className="capture-progress-head"><span>Video запись</span><strong>{fmtMs(effective.duration_recorded_ms)}</strong></div>
+        <div className="progress-track indeterminate"><div className="progress-fill" /></div>
+      </div>
+    );
+  }
+  const safePercent = Math.max(0, Math.min(100, percent));
+  return (
+    <div className="capture-progress" aria-label={`Прогресс Video ${safePercent.toFixed(1)}%`}>
+      <div className="capture-progress-head"><span>Video</span><strong>{safePercent.toFixed(1)}% · {fmtMs(effective.duration_recorded_ms)}</strong></div>
       <div className="progress-track"><div className="progress-fill" style={{ width: `${safePercent}%` }} /></div>
     </div>
   );
@@ -114,8 +232,12 @@ function App() {
   const [view, setView] = useState<ViewMode>("events");
   const [expandedIds, setExpandedIds] = useState<string[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
+  const [selectedVideo, setSelectedVideo] = useState<VideoSession | null>(null);
+  const [videoRuns, setVideoRuns] = useState<VideoRun[]>([]);
+  const [videoSegments, setVideoSegments] = useState<VideoSegment[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [progressBySession, setProgressBySession] = useState<Record<string, CaptureProgress>>({});
+  const [videoProgressBySession, setVideoProgressBySession] = useState<Record<string, VideoCaptureProgress>>({});
   const [position, setPosition] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [seekText, setSeekText] = useState("00:00:00");
@@ -129,6 +251,7 @@ function App() {
       const data = await res.json();
       setEvents(data.items || []);
       setProgressBySession({});
+      setVideoProgressBySession({});
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -153,6 +276,7 @@ function App() {
   }
 
   async function openSession(session: Session) {
+    setSelectedVideo(null);
     setSelected(session);
     setPosition(0);
     setPlaying(false);
@@ -161,6 +285,28 @@ function App() {
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setMessages(data.items || []);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function openVideoSession(session: VideoSession) {
+    setSelected(null);
+    setSelectedVideo(session);
+    try {
+      const [detailRes, runsRes, segmentsRes] = await Promise.all([
+        fetch(`${API}/api/v1/video-sessions/${session.id}`, { cache: "no-store" }),
+        fetch(`${API}/api/v1/video-sessions/${session.id}/runs`, { cache: "no-store" }),
+        fetch(`${API}/api/v1/video-sessions/${session.id}/segments?page_size=500`, { cache: "no-store" }),
+      ]);
+      if (!detailRes.ok) throw new Error(await detailRes.text());
+      if (!runsRes.ok) throw new Error(await runsRes.text());
+      if (!segmentsRes.ok) throw new Error(await segmentsRes.text());
+      const [detail, runs, segments] = await Promise.all([detailRes.json(), runsRes.json(), segmentsRes.json()]);
+      setSelectedVideo(detail);
+      setVideoRuns(runs.items || []);
+      setVideoSegments(segments.items || []);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -183,7 +329,7 @@ function App() {
           chat_sessions: event.chat_sessions.filter((item) => item.id !== session.id),
           chat_sessions_count: event.chat_sessions.filter((item) => item.id !== session.id).length,
         }))
-        .filter((event) => event.chat_sessions_count > 0));
+        .filter((event) => event.chat_sessions_count > 0 || event.video_sessions_count > 0));
       if (selected?.id === session.id) setSelected(null);
       setError(null);
     } catch (e) {
@@ -235,21 +381,28 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view]);
 
-  const monitoredIds = useMemo(
+  const monitoredChatIds = useMemo(
     () => view === "events"
       ? events.flatMap((event) => event.chat_sessions).filter(isCaptureBusy).map((session) => session.id)
       : [],
     [events, view]
   );
-  const monitoredKey = monitoredIds.join(",");
+  const monitoredVideoIds = useMemo(
+    () => view === "events"
+      ? events.flatMap((event) => event.video_sessions).filter(isVideoBusy).map((session) => session.id)
+      : [],
+    [events, view]
+  );
+  const monitoredKey = `c:${monitoredChatIds.join(",")}|v:${monitoredVideoIds.join(",")}`;
 
   useEffect(() => {
-    if (!monitoredKey) return;
+    if (monitoredChatIds.length === 0 && monitoredVideoIds.length === 0) return;
 
     let cancelled = false;
     let timer: number | undefined;
     let inFlight: AbortController | null = null;
-    const ids = monitoredKey.split(",");
+    const chatIds = [...monitoredChatIds];
+    const videoIds = [...monitoredVideoIds];
 
     const schedule = () => {
       if (!cancelled) timer = window.setTimeout(poll, PROGRESS_POLL_MS);
@@ -265,22 +418,27 @@ function App() {
       inFlight = new AbortController();
       try {
         const params = new URLSearchParams();
-        ids.forEach((id) => params.append("session_id", id));
-        const res = await fetch(`${API}/api/v1/sessions/capture-progress?${params.toString()}`, {
+        chatIds.forEach((id) => params.append("chat_session_id", id));
+        videoIds.forEach((id) => params.append("video_session_id", id));
+        const res = await fetch(`${API}/api/v1/capture/progress?${params.toString()}`, {
           signal: inFlight.signal,
           cache: "no-store",
         });
         if (!res.ok) throw new Error(await res.text());
         const data = await res.json();
-        const updates = (data.items || []) as CaptureProgress[];
         if (cancelled) return;
 
-        const updatesById = Object.fromEntries(updates.map((item) => [item.session_id, item]));
-        setProgressBySession((current) => ({ ...current, ...updatesById }));
+        const chatUpdates = (data.chat || []) as CaptureProgress[];
+        const videoUpdates = (data.video || []) as VideoCaptureProgress[];
+        const chatById = Object.fromEntries(chatUpdates.map((item) => [item.session_id, item]));
+        const videoById = Object.fromEntries(videoUpdates.map((item) => [item.session_id, item]));
+        setProgressBySession((current) => ({ ...current, ...chatById }));
+        setVideoProgressBySession((current) => ({ ...current, ...videoById }));
+
         setEvents((current) => current.map((event) => ({
           ...event,
           chat_sessions: event.chat_sessions.map((session) => {
-            const update = updatesById[session.id];
+            const update = chatById[session.id];
             return update ? {
               ...session,
               status: update.status,
@@ -290,18 +448,30 @@ function App() {
               progress_percent: update.percent,
             } : session;
           }),
+          video_sessions: event.video_sessions.map((session) => {
+            const update = videoById[session.id];
+            return update ? {
+              ...session,
+              status: update.status,
+              completeness_status: update.completeness_status,
+              duration_recorded_ms: update.duration_recorded_ms,
+              coverage_end_ms: update.coverage_end_ms,
+              required_end_ms: update.required_end_ms,
+              gap_count: update.gap_count,
+              last_error: update.last_error,
+              progress_percent: update.percent,
+            } : session;
+          }),
         })));
         setSelected((current) => {
           if (!current) return current;
-          const update = updatesById[current.id];
-          return update ? {
-            ...current,
-            status: update.status,
-            completeness_status: update.completeness_status,
-            source_duration_ms: update.source_duration_ms,
-            coverage_end_ms: update.coverage_end_ms,
-            progress_percent: update.percent,
-          } : current;
+          const update = chatById[current.id];
+          return update ? { ...current, ...update, progress_percent: update.percent } : current;
+        });
+        setSelectedVideo((current) => {
+          if (!current) return current;
+          const update = videoById[current.id];
+          return update ? { ...current, ...update, progress_percent: update.percent } : current;
         });
       } catch (e) {
         if (!(e instanceof DOMException && e.name === "AbortError")) {
@@ -319,6 +489,8 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer);
       inFlight?.abort();
     };
+    // arrays are encoded in monitoredKey so polling restarts only when active ids change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [monitoredKey]);
 
   useEffect(() => {
@@ -349,6 +521,58 @@ function App() {
     [messages, position]
   );
 
+  if (selectedVideo) {
+    const progress = videoProgressBySession[selectedVideo.id];
+    return (
+      <main>
+        <button className="link" onClick={() => setSelectedVideo(null)}>← Events</button>
+        <header className="detail-header">
+          <div>
+            <h1>Video Manager · core</h1>
+            <p className="muted">{selectedVideo.metadata?.media_type?.toUpperCase() || "VIDEO"} · {selectedVideo.status} · {selectedVideo.completeness_status}</p>
+          </div>
+          <div className="actions">
+            <button onClick={() => openVideoSession(selectedVideo)}>Обновить</button>
+          </div>
+        </header>
+        <VideoProgressBar session={selectedVideo} progress={progress} />
+        {selectedVideo.last_error && <div className="error">{selectedVideo.last_error}</div>}
+        <section className="video-overview">
+          <div><span>Записано</span><strong>{fmtMs(selectedVideo.duration_recorded_ms)}</strong></div>
+          <div><span>Сегментов</span><strong>{selectedVideo.segment_count || videoSegments.length}</strong></div>
+          <div><span>Размер</span><strong>{fmtBytes(selectedVideo.bytes || videoSegments.reduce((sum, item) => sum + item.bytes, 0))}</strong></div>
+          <div><span>Gaps</span><strong>{selectedVideo.gap_count}</strong></div>
+        </section>
+        <section className="video-block">
+          <div className="section-label">RUNS</div>
+          {videoRuns.length === 0 ? <div className="empty-child">Run ещё не создан</div> : (
+            <div className="table-wrap"><table><thead><tr><th>#</th><th>Status</th><th>Resume</th><th>Segments</th><th>Exit</th><th>Reason</th></tr></thead><tbody>
+              {videoRuns.map((run) => <tr key={run.id}>
+                <td>{run.run_no}</td><td>{run.status}</td><td>{fmtMs(run.resume_source_offset_ms)}</td>
+                <td>{run.first_segment_no ?? "—"}–{run.last_segment_no ?? "—"}</td>
+                <td>{run.streamlink_exit_code ?? "—"}/{run.ffmpeg_exit_code ?? "—"}</td><td>{run.close_reason || "—"}</td>
+              </tr>)}
+            </tbody></table></div>
+          )}
+        </section>
+        <section className="video-block">
+          <div className="section-label">SEGMENTS · spool</div>
+          <p className="muted small">На этом этапе показываются только реально закрытые MPEG-TS сегменты. Archive handoff будет отдельным следующим gate.</p>
+          {videoSegments.length === 0 ? <div className="empty-child">Закрытых сегментов пока нет</div> : (
+            <div className="table-wrap"><table><thead><tr><th>Segment</th><th>Run</th><th>Timeline</th><th>Duration</th><th>Bytes</th><th>Storage</th><th>Integrity</th></tr></thead><tbody>
+              {videoSegments.map((segment) => <tr key={segment.id}>
+                <td>#{segment.segment_no}</td><td>{segment.video_run_id}</td>
+                <td>{fmtMs(segment.timeline_start_ms)}–{fmtMs(segment.timeline_end_ms)}</td>
+                <td>{fmtMs(segment.duration_ms)}</td><td>{fmtBytes(segment.bytes)}</td>
+                <td>{segment.storage_state}</td><td>{segment.integrity_state}</td>
+              </tr>)}
+            </tbody></table></div>
+          )}
+        </section>
+      </main>
+    );
+  }
+
   if (selected) {
     const total = selected.source_duration_ms || Math.max(1, ...messages.map((m) => m.timeline_offset_ms));
     const isTrash = view === "trash";
@@ -376,25 +600,13 @@ function App() {
           <button onClick={() => setPlaying(true)}>Play</button>
           <button onClick={() => setPlaying(false)}>Pause</button>
           <button onClick={() => { setPlaying(false); setPosition(0); }}>Stop</button>
-          <input
-            type="range"
-            min={0}
-            max={Math.max(1, total)}
-            value={Math.min(position, total)}
-            onChange={(e) => setPosition(Number(e.target.value))}
-          />
+          <input min={0} max={Math.max(1, total)} type="range" value={Math.min(position, total)} onChange={(e) => setPosition(Number(e.target.value))} />
           <input value={seekText} onChange={(e) => setSeekText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && seekByText()} aria-label="HH:MM:SS seek" />
           <button onClick={seekByText}>Seek</button>
           <strong>{fmtMs(position)} / {fmtMs(total)}</strong>
         </section>
         <section className="chat">
-          {visible.map((m) => (
-            <div key={m.id} className="message">
-              <span className="time">{fmtMs(m.timeline_offset_ms)}</span>
-              <b>{m.chatter_name || m.chatter_login || "unknown"}</b>
-              <span>{m.message_text}</span>
-            </div>
-          ))}
+          {visible.map((m) => <div key={m.id} className="message"><span className="time">{fmtMs(m.timeline_offset_ms)}</span><b>{m.chatter_name || m.chatter_login || "unknown"}</b><span>{m.message_text}</span></div>)}
         </section>
       </main>
     );
@@ -405,7 +617,7 @@ function App() {
       <header>
         <div>
           <h1>StreamHub</h1>
-          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : "Twitch Events · Chat sessions"}</p>
+          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : "Twitch Events · Chat + Video sessions"}</p>
         </div>
         <div className="actions">
           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
@@ -426,51 +638,51 @@ function App() {
                   <button className="event-summary" onClick={() => toggleEvent(event.id)} aria-expanded={expanded}>
                     <div className="event-chevron">{expanded ? "▼" : "▶"}</div>
                     <div className="event-main">
-                      <div className="row">
-                        <strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong>
-                        <span className="event-type">{event.media_type.toUpperCase()}</span>
-                      </div>
+                      <div className="row"><strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong><span className="event-type">{event.media_type.toUpperCase()}</span></div>
                       <div className="event-title">{event.title || (event.media_type === "vod" ? `VOD ${event.external_key.split(":").pop()}` : "LIVE stream")}</div>
-                      <div className="row muted event-meta">
-                        <span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span>
-                        <span>{event.media_type === "vod" ? fmtMs(event.source_duration_ms) : "LIVE"}</span>
-                      </div>
+                      <div className="row muted event-meta"><span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span><span>{event.media_type === "vod" ? fmtMs(event.source_duration_ms) : "LIVE"}</span></div>
                     </div>
                     <div className="event-badges">
                       <span>Chat: {event.chat_sessions_count}</span>
+                      <span>Video: {event.video_sessions_count}</span>
                       {event.metadata?.identity_state && event.metadata.identity_state !== "canonical" && <span>legacy identity</span>}
-                      {event.active_chat_sessions_count > 0 && <span className="active-badge">active {event.active_chat_sessions_count}</span>}
+                      {event.active_chat_sessions_count > 0 && <span className="active-badge">chat active</span>}
+                      {event.active_video_sessions_count > 0 && <span className="active-badge">video active</span>}
                     </div>
                   </button>
 
                   {expanded && (
                     <div className="event-children">
                       <div className="section-label">CHAT SESSIONS</div>
-                      {event.chat_sessions.length === 0 ? (
-                        <div className="empty-child">Нет активных Chat sessions</div>
-                      ) : event.chat_sessions.map((session, index) => (
+                      {event.chat_sessions.length === 0 ? <div className="empty-child">Chat sessions нет</div> : event.chat_sessions.map((session, index) => (
                         <div className="session-row" key={session.id}>
                           <div className="session-number">#{index + 1}</div>
                           <div className="session-info">
-                            <div className="session-status-line">
-                              <strong>{session.status}</strong>
-                              <span>{session.completeness_status}</span>
-                              <span>{(session.message_count || 0).toLocaleString()} сообщений</span>
-                            </div>
+                            <div className="session-status-line"><strong>{session.status}</strong><span>{session.completeness_status}</span><span>{(session.message_count || 0).toLocaleString()} сообщений</span></div>
                             <div className="muted session-date">{new Date(session.created_at).toLocaleString()}</div>
                             <ProgressBar session={session} progress={progressBySession[session.id]} />
                           </div>
                           <div className="session-actions">
                             <button onClick={() => openSession(session)}>Открыть</button>
-                            <button
-                              className="danger subtle"
-                              disabled={actionId === session.id || isCaptureBusy(session)}
-                              title={isCaptureBusy(session) ? "Сначала остановите сбор" : "Переместить в корзину"}
-                              onClick={() => moveToTrash(session)}
-                            >
-                              В корзину
-                            </button>
+                            <button className="danger subtle" disabled={actionId === session.id || isCaptureBusy(session)} title={isCaptureBusy(session) ? "Сначала остановите сбор" : "Переместить в корзину"} onClick={() => moveToTrash(session)}>В корзину</button>
                           </div>
+                        </div>
+                      ))}
+
+                      <div className="section-label video-section-label">VIDEO SESSIONS</div>
+                      {event.video_sessions.length === 0 ? <div className="empty-child">Video sessions нет</div> : event.video_sessions.map((session, index) => (
+                        <div className="session-row video-session-row" key={session.id}>
+                          <div className="session-number">#{index + 1}</div>
+                          <div className="session-info">
+                            <div className="session-status-line">
+                              <strong>{session.status}</strong><span>{session.completeness_status}</span>
+                              <span>{fmtMs(session.duration_recorded_ms)}</span><span>{session.segment_count || 0} seg</span><span>{fmtBytes(session.bytes || 0)}</span>
+                            </div>
+                            <div className="muted session-date">{new Date(session.created_at).toLocaleString()} · gaps {session.gap_count}</div>
+                            <VideoProgressBar session={session} progress={videoProgressBySession[session.id]} />
+                            {session.last_error && <div className="inline-warning">{session.last_error}</div>}
+                          </div>
+                          <div className="session-actions"><button onClick={() => openVideoSession(session)}>Video Manager</button></div>
                         </div>
                       ))}
                     </div>

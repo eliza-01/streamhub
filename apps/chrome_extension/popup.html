@@ -11,13 +11,23 @@
     <h1>StreamHub</h1>
     <div id="status" class="status">Определяю контекст…</div>
     <div id="details" class="details"></div>
-    <div class="actions">
-      <button id="start">Start recording</button>
-      <button id="pause">Pause</button>
-      <button id="resume">Resume</button>
-      <button id="stop" class="danger">Stop</button>
-      <button id="auth">Authorize Twitch</button>
+    <div class="capture-toggles">
+      <label class="toggle"><input id="chat-toggle" type="checkbox" /> <span>Chat</span></label>
+      <label class="toggle"><input id="video-toggle" type="checkbox" /> <span>Video</span></label>
     </div>
+    <button id="start" class="primary wide">Start selected</button>
+    <div class="section-title">Chat</div>
+    <div class="actions three">
+      <button id="pause-chat">Pause</button>
+      <button id="resume-chat">Resume</button>
+      <button id="stop-chat" class="danger">Stop Chat</button>
+    </div>
+    <div class="section-title">Video</div>
+    <div class="actions">
+      <button id="stop-video" class="danger">Stop Video</button>
+      <button id="stop-all" class="danger">Stop All</button>
+    </div>
+    <button id="auth" class="wide auth">Authorize Twitch</button>
     <div id="message" class="message"></div>
   </main>
   <script src="popup.js" type="module"></script>

@@ -3,7 +3,8 @@ let state = null;
 let pollTimer = null;
 let activeTabId = null;
 let currentEventId = null;
-let activeSessionsCount = 0;
+let activeChatSession = null;
+let activeVideoSession = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -14,7 +15,14 @@ function showMessage(text) {
 }
 
 async function getState() {
-  const defaults = { apiBaseUrl: "http://localhost:18741", activeSessionId: null, activeSessionMode: null, activeSessionTabId: null };
+  const defaults = {
+    apiBaseUrl: "http://localhost:18741",
+    activeSessionId: null,
+    activeSessionMode: null,
+    activeSessionTabId: null,
+    captureChatEnabled: true,
+    captureVideoEnabled: false
+  };
   const stored = await chrome.storage.local.get(Object.keys(defaults));
   const next = { ...defaults, ...stored };
   if (["http://localhost:8000", "http://127.0.0.1:8000"].includes(next.apiBaseUrl)) {
@@ -33,9 +41,9 @@ async function api(path, init = {}) {
   return response.json();
 }
 
-async function persistActiveSession(activeSession) {
+async function persistActiveChatSession(activeSession) {
   state.activeSessionId = activeSession?.id || null;
-  state.activeSessionMode = activeSession?.media_type || null;
+  state.activeSessionMode = activeSession?.media_type || context?.mode || null;
   state.activeSessionTabId = activeSession ? activeTabId : null;
   await chrome.storage.local.set({
     activeSessionId: state.activeSessionId,
@@ -49,19 +57,31 @@ function render() {
   $("status").textContent = context?.supported
     ? `${context.mode?.toUpperCase()} · player ${context.player_open ? "open" : "closed"}`
     : "Неподдерживаемая страница Twitch";
+
+  $("chat-toggle").checked = Boolean(state?.captureChatEnabled);
+  $("video-toggle").checked = Boolean(state?.captureVideoEnabled);
+
   const parts = [
     context?.channel_login ? `channel: ${context.channel_login}` : null,
     context?.video_id ? `video_id: ${context.video_id}` : null,
     context?.duration_ms != null ? `duration: ${Math.round(context.duration_ms / 1000)}s` : null,
-    currentEventId ? `event: ${currentEventId}` : null,
-    state?.activeSessionId ? `session: ${state.activeSessionId}` : "session: none",
-    activeSessionsCount > 1 ? `active sessions: ${activeSessionsCount} (будут остановлены вместе)` : null
+    currentEventId ? `event: ${currentEventId}` : "event: none",
+    activeChatSession ? `chat: ${activeChatSession.id} · ${activeChatSession.status}` : "chat: idle",
+    activeVideoSession ? `video: ${activeVideoSession.id} · ${activeVideoSession.status}` : "video: idle"
   ].filter(Boolean);
   $("details").textContent = parts.join("\n");
-  $("start").disabled = !supported || Boolean(state?.activeSessionId);
-  $("pause").disabled = !state?.activeSessionId;
-  $("resume").disabled = !state?.activeSessionId;
-  $("stop").disabled = !state?.activeSessionId;
+
+  const selectedAny = Boolean(state?.captureChatEnabled || state?.captureVideoEnabled);
+  const selectedNeedStart = Boolean(
+    (state?.captureChatEnabled && !activeChatSession) ||
+    (state?.captureVideoEnabled && !activeVideoSession)
+  );
+  $("start").disabled = !supported || !selectedAny || !selectedNeedStart;
+  $("pause-chat").disabled = !activeChatSession;
+  $("resume-chat").disabled = !activeChatSession;
+  $("stop-chat").disabled = !activeChatSession;
+  $("stop-video").disabled = !activeVideoSession;
+  $("stop-all").disabled = !activeChatSession && !activeVideoSession;
 }
 
 async function getTwitchIntegrity(tabId) {
@@ -75,8 +95,9 @@ async function refreshContext() {
   if (!tab?.id || !tab.url?.includes("twitch.tv")) {
     context = { supported: false, mode: "unsupported", player_open: false };
     currentEventId = null;
-    activeSessionsCount = 0;
-    await persistActiveSession(null);
+    activeChatSession = null;
+    activeVideoSession = null;
+    await persistActiveChatSession(null);
     render();
     return;
   }
@@ -88,11 +109,12 @@ async function refreshContext() {
   render();
 }
 
-async function syncCurrentCollectorStatus({ silent = false } = {}) {
+async function syncCurrentCaptureStatus({ silent = false } = {}) {
   if (!context?.supported || !context?.player_open) {
     currentEventId = null;
-    activeSessionsCount = 0;
-    await persistActiveSession(null);
+    activeChatSession = null;
+    activeVideoSession = null;
+    await persistActiveChatSession(null);
     render();
     return null;
   }
@@ -102,13 +124,14 @@ async function syncCurrentCollectorStatus({ silent = false } = {}) {
     video_external_id: context.video_id || null
   };
   try {
-    const result = await api("/api/v1/collector/context-status", {
+    const result = await api("/api/v1/capture/context-status", {
       method: "POST",
       body: JSON.stringify(payload)
     });
     currentEventId = result.event?.id || null;
-    activeSessionsCount = Number(result.active_sessions_count || 0);
-    await persistActiveSession(result.active_session || null);
+    activeChatSession = result.active_chat_session || null;
+    activeVideoSession = result.active_video_session || null;
+    await persistActiveChatSession(activeChatSession);
     render();
     return result;
   } catch (e) {
@@ -118,19 +141,39 @@ async function syncCurrentCollectorStatus({ silent = false } = {}) {
   }
 }
 
+function modeLine(name, result) {
+  if (!result?.requested) return `${name}: не выбран`;
+  if (result.result === "started") return `${name}: запущен · ${result.session_id}`;
+  if (result.result === "already_active") return `${name}: уже идёт · ${result.session_id}`;
+  return `${name}: ошибка · ${result.error || "unknown"}`;
+}
+
+$("chat-toggle").addEventListener("change", async (event) => {
+  state.captureChatEnabled = Boolean(event.target.checked);
+  await chrome.storage.local.set({ captureChatEnabled: state.captureChatEnabled });
+  render();
+});
+
+$("video-toggle").addEventListener("change", async (event) => {
+  state.captureVideoEnabled = Boolean(event.target.checked);
+  await chrome.storage.local.set({ captureVideoEnabled: state.captureVideoEnabled });
+  render();
+});
+
 $("start").addEventListener("click", async () => {
   showMessage("");
   try {
-    const beforeStart = await syncCurrentCollectorStatus({ silent: true });
-    if (beforeStart?.active_session) {
-      showMessage(`Сбор уже идёт: ${beforeStart.active_session.id}`);
-      return;
+    await syncCurrentCaptureStatus({ silent: true });
+    const needChatStart = Boolean(state.captureChatEnabled && !activeChatSession);
+    const twitchIntegrity = context.mode === "vod" && needChatStart
+      ? await getTwitchIntegrity(activeTabId)
+      : null;
+    if (context.mode === "vod" && needChatStart && !twitchIntegrity?.client_integrity) {
+      throw new Error("Для VOD Chat ещё не пойман Twitch Client-Integrity. Video-only можно запускать без него.");
     }
-    const twitchIntegrity = context.mode === "vod" ? await getTwitchIntegrity(activeTabId) : null;
-    if (context.mode === "vod" && !twitchIntegrity?.client_integrity) {
-      throw new Error("Twitch Client-Integrity ещё не пойман. Обнови вкладку VOD, подожди несколько секунд и нажми Start снова.");
-    }
+
     const payload = {
+      platform: "twitch",
       mode: context.mode,
       channel_login: context.channel_login || null,
       video_external_id: context.video_id || null,
@@ -138,71 +181,91 @@ $("start").addEventListener("click", async () => {
       page_url: context.href,
       player_open: context.player_open,
       metadata: { browser_current_time_ms: context.current_time_ms || null },
+      capture: {
+        chat: Boolean(state.captureChatEnabled),
+        video: Boolean(state.captureVideoEnabled)
+      },
       twitch_integrity: twitchIntegrity
     };
-    const result = await api("/api/v1/collector/sessions", { method: "POST", body: JSON.stringify(payload) });
-    await persistActiveSession(result);
-    currentEventId = result.event_id || currentEventId;
-    activeSessionsCount = 1;
-    showMessage(`Запись запущена: ${result.id}`);
-    render();
+    const result = await api("/api/v1/capture/start", { method: "POST", body: JSON.stringify(payload) });
+    currentEventId = result.event?.id || currentEventId;
+    showMessage(`${modeLine("Chat", result.chat)}\n${modeLine("Video", result.video)}`);
+    await syncCurrentCaptureStatus({ silent: true });
   } catch (e) {
-    if (String(e).includes("409:")) await syncCurrentCollectorStatus({ silent: true });
     showMessage(`Ошибка Start: ${e}`);
   }
 });
 
-$("pause").addEventListener("click", async () => {
+$("pause-chat").addEventListener("click", async () => {
   try {
-    await syncCurrentCollectorStatus({ silent: true });
-    if (!state.activeSessionId) throw new Error("для текущего события активной сессии нет");
-    await api(`/api/v1/collector/sessions/${state.activeSessionId}/pause`, { method: "POST", body: "{}" });
-    showMessage("Pause установлен. Для LIVE данные по ТЗ не должны теряться; VOD останавливается на checkpoint.");
-  } catch (e) { showMessage(`Ошибка Pause: ${e}`); }
+    await syncCurrentCaptureStatus({ silent: true });
+    if (!activeChatSession) throw new Error("для текущего события активного Chat нет");
+    await api(`/api/v1/collector/sessions/${activeChatSession.id}/pause`, { method: "POST", body: "{}" });
+    showMessage("Chat Pause установлен.");
+    await syncCurrentCaptureStatus({ silent: true });
+  } catch (e) { showMessage(`Ошибка Chat Pause: ${e}`); }
 });
 
-$("resume").addEventListener("click", async () => {
+$("resume-chat").addEventListener("click", async () => {
   try {
-    await syncCurrentCollectorStatus({ silent: true });
-    if (!state.activeSessionId) throw new Error("для текущего события активной сессии нет");
-    if (state.activeSessionMode === "vod" && state.activeSessionTabId != null) {
-      const twitchIntegrity = await getTwitchIntegrity(state.activeSessionTabId);
+    await syncCurrentCaptureStatus({ silent: true });
+    if (!activeChatSession) throw new Error("для текущего события активного Chat нет");
+    if (context.mode === "vod" && activeTabId != null) {
+      const twitchIntegrity = await getTwitchIntegrity(activeTabId);
       if (twitchIntegrity?.client_integrity) {
-        await api(`/api/v1/collector/sessions/${state.activeSessionId}/twitch-integrity`, {
+        await api(`/api/v1/collector/sessions/${activeChatSession.id}/twitch-integrity`, {
           method: "POST", body: JSON.stringify(twitchIntegrity)
         });
       }
     }
-    await api(`/api/v1/collector/sessions/${state.activeSessionId}/resume`, { method: "POST", body: "{}" });
-    showMessage("Resume выполнен.");
-  } catch (e) { showMessage(`Ошибка Resume: ${e}`); }
+    await api(`/api/v1/collector/sessions/${activeChatSession.id}/resume`, { method: "POST", body: "{}" });
+    showMessage("Chat Resume выполнен.");
+    await syncCurrentCaptureStatus({ silent: true });
+  } catch (e) { showMessage(`Ошибка Chat Resume: ${e}`); }
 });
 
-$("stop").addEventListener("click", async () => {
-  if (!confirm("Остановить запись? Если диапазон ещё не покрыт полностью, сессия останется incomplete.")) return;
+$("stop-chat").addEventListener("click", async () => {
+  if (!confirm("Остановить только Chat? Video продолжит запись, если он активен.")) return;
   try {
-    await syncCurrentCollectorStatus({ silent: true });
-    if (!state.activeSessionId) {
-      showMessage("Для текущего события активного сбора уже нет.");
+    await syncCurrentCaptureStatus({ silent: true });
+    if (!activeChatSession) {
+      showMessage("Активного Chat уже нет.");
       return;
     }
-    let stopped = 1;
-    if (currentEventId) {
-      const result = await api(`/api/v1/events/${currentEventId}/stop-all`, { method: "POST", body: "{}" });
-      stopped = Number(result.chat?.stopped || 0);
-      const failed = Number(result.chat?.failed || 0);
-      if (failed) throw new Error(`не удалось остановить ${failed} активных сессий`);
-    } else {
-      await api(`/api/v1/collector/sessions/${state.activeSessionId}/stop`, {
-        method: "POST", body: JSON.stringify({ reason: "stop_user" })
-      });
+    await api(`/api/v1/collector/sessions/${activeChatSession.id}/stop`, {
+      method: "POST", body: JSON.stringify({ reason: "stop_user" })
+    });
+    showMessage("Chat остановлен. Video не затронут.");
+    await syncCurrentCaptureStatus({ silent: true });
+  } catch (e) { showMessage(`Ошибка Stop Chat: ${e}`); }
+});
+
+$("stop-video").addEventListener("click", async () => {
+  if (!confirm("Остановить только Video? Chat продолжит сбор, если он активен.")) return;
+  try {
+    await syncCurrentCaptureStatus({ silent: true });
+    if (!activeVideoSession) {
+      showMessage("Активного Video уже нет.");
+      return;
     }
-    currentEventId = null;
-    activeSessionsCount = 0;
-    await persistActiveSession(null);
-    showMessage(`Запись остановлена. Остановлено сессий: ${stopped}.`);
-    render();
-  } catch (e) { showMessage(`Ошибка Stop: ${e}`); }
+    await api(`/api/v1/video-sessions/${activeVideoSession.id}/stop`, { method: "POST", body: "{}" });
+    showMessage("Video остановлен. Chat не затронут.");
+    await syncCurrentCaptureStatus({ silent: true });
+  } catch (e) { showMessage(`Ошибка Stop Video: ${e}`); }
+});
+
+$("stop-all").addEventListener("click", async () => {
+  if (!confirm("Остановить Chat и Video текущего события?")) return;
+  try {
+    await syncCurrentCaptureStatus({ silent: true });
+    if (!currentEventId) {
+      showMessage("Для текущего события активных записей уже нет.");
+      return;
+    }
+    const result = await api(`/api/v1/events/${currentEventId}/stop-all`, { method: "POST", body: "{}" });
+    showMessage(`Stop All: Chat ${result.chat?.stopped || 0}, Video ${result.video?.stopped || 0}`);
+    await syncCurrentCaptureStatus({ silent: true });
+  } catch (e) { showMessage(`Ошибка Stop All: ${e}`); }
 });
 
 $("auth").addEventListener("click", async () => {
@@ -231,5 +294,5 @@ $("auth").addEventListener("click", async () => {
 (async function init() {
   state = await getState();
   await refreshContext();
-  await syncCurrentCollectorStatus();
+  await syncCurrentCaptureStatus();
 })();

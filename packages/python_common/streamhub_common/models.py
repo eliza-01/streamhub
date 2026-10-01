@@ -207,11 +207,99 @@ class CaptureJob(Base):
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
 
 
+class VideoSession(Base):
+    __tablename__ = "video_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("media_events.id", ondelete="RESTRICT"), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="new", index=True)
+    completeness_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    quality: Mapped[str] = mapped_column(String(32), default="best")
+    recorder_mode: Mapped[str] = mapped_column(String(32), default="direct_hls_copy")
+    source_url: Mapped[str] = mapped_column(String(2048))
+    recording_started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    ended_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    duration_recorded_ms: Mapped[int] = mapped_column(BigInteger, default=0)
+    required_start_ms: Mapped[int | None] = mapped_column(BigInteger)
+    required_end_ms: Mapped[int | None] = mapped_column(BigInteger)
+    coverage_start_ms: Mapped[int | None] = mapped_column(BigInteger)
+    coverage_end_ms: Mapped[int | None] = mapped_column(BigInteger)
+    gap_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_activity_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    stop_reason: Mapped[str | None] = mapped_column(String(64))
+    metadata_json: Mapped[dict | None] = mapped_column(JSON)
+    deleted_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class VideoRun(Base):
+    __tablename__ = "video_runs"
+    __table_args__ = (UniqueConstraint("video_session_id", "run_no", name="uq_video_run_session_no"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
+    run_no: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    started_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    ended_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    resume_source_offset_ms: Mapped[int | None] = mapped_column(BigInteger)
+    first_segment_no: Mapped[int | None] = mapped_column(Integer)
+    last_segment_no: Mapped[int | None] = mapped_column(Integer)
+    streamlink_exit_code: Mapped[int | None] = mapped_column(Integer)
+    ffmpeg_exit_code: Mapped[int | None] = mapped_column(Integer)
+    close_reason: Mapped[str | None] = mapped_column(String(64))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class VideoSegment(Base):
+    __tablename__ = "video_segments"
+    __table_args__ = (UniqueConstraint("video_session_id", "segment_no", name="uq_video_segment_session_no"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
+    video_run_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("video_runs.id", ondelete="CASCADE"), index=True)
+    segment_no: Mapped[int] = mapped_column(Integer)
+    file_name: Mapped[str] = mapped_column(String(255))
+    relative_path: Mapped[str] = mapped_column(String(512))
+    timeline_start_ms: Mapped[int] = mapped_column(BigInteger)
+    timeline_end_ms: Mapped[int] = mapped_column(BigInteger)
+    source_media_start_ms: Mapped[int | None] = mapped_column(BigInteger)
+    source_media_end_ms: Mapped[int | None] = mapped_column(BigInteger)
+    duration_ms: Mapped[int] = mapped_column(Integer)
+    bytes: Mapped[int] = mapped_column(BigInteger)
+    mime_type: Mapped[str] = mapped_column(String(64), default="video/mp2t")
+    storage_state: Mapped[str] = mapped_column(String(24), default="spool", index=True)
+    integrity_state: Mapped[str] = mapped_column(String(24), default="size_verified")
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    closed_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class VideoGap(Base):
+    __tablename__ = "video_gaps"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
+    after_run_no: Mapped[int | None] = mapped_column(Integer)
+    before_run_no: Mapped[int | None] = mapped_column(Integer)
+    started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    ended_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    source_start_ms: Mapped[int | None] = mapped_column(BigInteger)
+    source_end_ms: Mapped[int | None] = mapped_column(BigInteger)
+    reason: Mapped[str] = mapped_column(String(64), default="unknown")
+    resolved: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), ForeignKey("media_events.id", ondelete="SET NULL"), index=True)
     session_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), ForeignKey("sessions.id", ondelete="SET NULL"), index=True)
+    video_session_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="SET NULL"), index=True)
     action: Mapped[str] = mapped_column(String(64), index=True)
     payload_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)

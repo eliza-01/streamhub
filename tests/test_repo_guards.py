@@ -37,8 +37,9 @@ def test_web_progress_poll_is_batched_slow_and_visibility_aware():
     source = (root / "apps/web/src/main.tsx").read_text()
     assert "PROGRESS_POLL_MS = 5000" in source
     assert 'document.visibilityState !== "visible"' in source
-    assert 'params.append("session_id", id)' in source
-    assert "/sessions/capture-progress" in source
+    assert 'params.append("chat_session_id", id)' in source
+    assert 'params.append("video_session_id", id)' in source
+    assert "/capture/progress" in source
 
 
 def test_permanent_purge_removes_session_scoped_traces():
@@ -72,7 +73,8 @@ def test_extension_uses_backend_context_state_and_no_autostart():
     root = Path(__file__).resolve().parents[1]
     popup = (root / "apps/chrome_extension/popup.js").read_text()
     popup_html = (root / "apps/chrome_extension/popup.html").read_text()
-    assert "/api/v1/collector/context-status" in popup
+    assert "/api/v1/capture/context-status" in popup
+    assert "/api/v1/capture/start" in popup
     assert "/stop-all" in popup
     assert "autostart" not in popup.lower()
     assert "autostart" not in popup_html.lower()
@@ -83,3 +85,61 @@ def test_start_is_serialized_per_event_in_backend():
     source = (root / "apps/api/app/routers/sessions.py").read_text()
     assert ".with_for_update()" in source
     assert "active chat session already exists for event" in source
+
+
+def test_video_recorder_core_is_lossless_segmented_and_internal_only():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps/video_recorder/app/main.py").read_text()
+    commands = (root / "apps/video_recorder/app/commands.py").read_text()
+    dockerfile = (root / "apps/video_recorder/Dockerfile").read_text()
+    compose = (root / "docker-compose.yml").read_text()
+    assert '"-c",\n        "copy"' in commands
+    assert "temp_file+program_date_time+independent_segments+discont_start" in commands
+    assert "streamlink" in dockerfile.lower()
+    assert "ffmpeg" in dockerfile.lower()
+    assert "shell=True" not in source
+    block = compose.split("  video-recorder:", 1)[1].split("\n  api:", 1)[0]
+    assert "ports:" not in block
+    assert "streamhub_video_spool:/spool" in block
+    api_block = compose.split("  api:", 1)[1].split("\n  web:", 1)[0]
+    assert "video-recorder:" not in api_block
+
+
+def test_video_capture_vertical_slice_is_exposed_in_extension_and_web():
+    root = Path(__file__).resolve().parents[1]
+    popup = (root / "apps/chrome_extension/popup.js").read_text()
+    popup_html = (root / "apps/chrome_extension/popup.html").read_text()
+    web = (root / "apps/web/src/main.tsx").read_text()
+    assert 'id="chat-toggle"' in popup_html
+    assert 'id="video-toggle"' in popup_html
+    assert "/api/v1/capture/start" in popup
+    assert "/api/v1/video-sessions/" in popup
+    assert "Video Manager" in web
+    assert "VIDEO SESSIONS" in web
+    assert "SEGMENTS · spool" in web
+
+
+def test_video_only_start_does_not_require_vod_integrity():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps/api/app/routers/capture.py").read_text()
+    assert 'if payload.capture.chat:' in source
+    assert 'elif payload.mode == "vod" and not payload.twitch_integrity:' in source
+    assert 'if payload.capture.video:' in source
+
+
+def test_video_schema_migration_is_additive_after_event_domain():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "migrations/versions/0003_video_capture_core.py").read_text()
+    assert 'down_revision = "0002_event_domain"' in source
+    for table in ("video_sessions", "video_runs", "video_segments", "video_gaps"):
+        assert f'"{table}"' in source
+    assert 'drop_table("sessions")' not in source
+    assert 'drop_table("chat_messages")' not in source
+
+
+def test_capture_progress_is_one_batched_request_every_five_seconds():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps/web/src/main.tsx").read_text()
+    assert "PROGRESS_POLL_MS = 5000" in source
+    assert source.count("/api/v1/capture/progress?") == 1
+    assert 'document.visibilityState !== "visible"' in source

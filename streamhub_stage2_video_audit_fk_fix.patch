@@ -1,0 +1,32 @@
+--- a/apps/api/app/routers/capture.py
++++ b/apps/api/app/routers/capture.py
+@@ -184,6 +184,11 @@
+         },
+     )
+     db.add(session)
++    # audit_log.video_session_id has a real FK to video_sessions.id. Flush the
++    # parent row first so MySQL can validate the audit insert in the same
++    # transaction instead of depending on ORM flush ordering between unrelated
++    # mapped objects.
++    await db.flush()
+     db.add(
+         AuditLog(
+             event_id=event_id,
+--- a/tests/test_capture_start_rollback_guard.py
++++ b/tests/test_capture_start_rollback_guard.py
+@@ -22,3 +22,15 @@
+ 
+     assert "except httpx.HTTPError as exc:" in recorder_block
+     assert "video-recorder unavailable" in recorder_block
++
++def test_video_session_is_flushed_before_fk_audit_row():
++    root = Path(__file__).resolve().parents[1]
++    source = (root / "apps/api/app/routers/capture.py").read_text()
++    video_block = source.split("async def start_video_for_event", 1)[1].split('@router.post("/capture/start")', 1)[0]
++
++    session_add = video_block.index("db.add(session)")
++    parent_flush = video_block.index("await db.flush()", session_add)
++    audit_add = video_block.index("AuditLog(", parent_flush)
++
++    assert session_add < parent_flush < audit_add
++

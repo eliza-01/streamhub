@@ -1,0 +1,3232 @@
+diff --git a/.env.example b/.env.example
+index da3ee4f..3f076a1 100644
+--- a/.env.example
++++ b/.env.example
+@@ -147,3 +147,14 @@ VOD_REPLAY_RETRY_MAX_SECONDS=120
+ VOD_REPLAY_CHECKPOINT_EVERY_PAGES=1
+ VOD_REPLAY_REQUIRE_END_OF_PAGINATION=true
+ VOD_REPLAY_DOM_FALLBACK_CAN_MARK_COMPLETE=false
++
++# -----------------------------------------------------------------------------
++# v1.3 — Video Recorder core (Stage 2)
++# -----------------------------------------------------------------------------
++VIDEO_RECORDER_BASE_URL=http://video-recorder:8003
++VIDEO_SPOOL_ROOT=/spool
++VIDEO_SEGMENT_SECONDS=10
++VIDEO_STREAM_QUALITY=best
++VIDEO_RECONNECT_SECONDS=5
++VIDEO_STREAM_TIMEOUT_SECONDS=90
++VIDEO_STOP_TIMEOUT_SECONDS=20
+diff --git a/apps/api/app/main.py b/apps/api/app/main.py
+index bbd8a8d..df8a57a 100644
+--- a/apps/api/app/main.py
++++ b/apps/api/app/main.py
+@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from streamhub_common.logging import configure_logging
+ from streamhub_common.settings import get_settings
+ 
+-from .routers import auth, events, sessions
++from .routers import auth, capture, events, sessions, video
+ 
+ settings = get_settings()
+ configure_logging(settings.log_level)
+@@ -34,4 +34,6 @@ async def health_ready() -> dict[str, str]:
+ 
+ app.include_router(sessions.router)
+ app.include_router(events.router)
++app.include_router(capture.router)
++app.include_router(video.router)
+ app.include_router(auth.router)
+diff --git a/apps/api/app/routers/capture.py b/apps/api/app/routers/capture.py
+new file mode 100644
+index 0000000..4befd7e
+--- /dev/null
++++ b/apps/api/app/routers/capture.py
+@@ -0,0 +1,379 @@
++from __future__ import annotations
++
++import uuid
++from datetime import UTC, datetime
++from typing import Literal
++
++from fastapi import APIRouter, Depends, HTTPException, Query
++from pydantic import BaseModel, Field
++from sqlalchemy import select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from streamhub_common.db import get_db
++from streamhub_common.models import AuditLog, MediaEvent, Session, VideoSession
++from streamhub_common.settings import get_settings
++
++from ..event_domain import resolve_or_create_media_event
++from .sessions import (
++    ACTIVE_CAPTURE_SESSION_STATUSES,
++    SessionStartRequest,
++    TwitchIntegrityContext,
++    capture_progress_percent,
++    resolve_live_metadata,
++    session_dict,
++    start_session,
++)
++from .video import ACTIVE_VIDEO_STATUSES, recorder_post, video_progress_percent, video_session_dict
++
++router = APIRouter(prefix="/api/v1", tags=["capture"])
++settings = get_settings()
++
++
++class CaptureSelection(BaseModel):
++    chat: bool = True
++    video: bool = False
++
++
++class CaptureStartRequest(BaseModel):
++    platform: str = "twitch"
++    mode: Literal["live", "vod"]
++    channel_external_id: str | None = None
++    channel_login: str | None = None
++    channel_display_name: str | None = None
++    stream_external_id: str | None = None
++    video_external_id: str | None = None
++    title: str | None = None
++    category_id: str | None = None
++    category_name: str | None = None
++    source_started_at_utc: datetime | None = None
++    duration_ms: int | None = Field(default=None, ge=0)
++    page_url: str | None = None
++    player_open: bool = True
++    metadata: dict | None = None
++    capture: CaptureSelection
++    twitch_integrity: TwitchIntegrityContext | None = None
++
++
++class CaptureContextRequest(BaseModel):
++    mode: Literal["live", "vod"]
++    channel_login: str | None = None
++    video_external_id: str | None = None
++
++
++def mode_result(*, requested: bool, result: str, session_id: str | None = None, error: str | None = None) -> dict:
++    return {"requested": requested, "result": result, "session_id": session_id, "error": error}
++
++
++async def normalize_context(payload: CaptureStartRequest) -> CaptureStartRequest:
++    if not payload.player_open:
++        raise HTTPException(400, "recognized player is required")
++    if payload.mode == "vod":
++        if not payload.video_external_id:
++            raise HTTPException(400, "video_external_id is required for VOD")
++        return payload
++    if not payload.channel_login:
++        raise HTTPException(400, "channel_login is required for LIVE")
++    if payload.stream_external_id:
++        return payload
++    resolved, started_at = await resolve_live_metadata(payload.channel_login)
++    return payload.model_copy(
++        update={
++            "channel_external_id": resolved.get("channel_external_id") or payload.channel_external_id,
++            "channel_login": resolved.get("channel_login") or payload.channel_login,
++            "channel_display_name": resolved.get("channel_display_name") or payload.channel_display_name,
++            "stream_external_id": str(resolved["stream_external_id"]),
++            "title": resolved.get("title") or payload.title,
++            "category_id": resolved.get("category_id") or payload.category_id,
++            "category_name": resolved.get("category_name") or payload.category_name,
++            "source_started_at_utc": started_at or payload.source_started_at_utc,
++        }
++    )
++
++
++async def resolve_event(payload: CaptureStartRequest, db: AsyncSession) -> MediaEvent:
++    event = await resolve_or_create_media_event(
++        db,
++        session_id=uuid.uuid4(),
++        platform=payload.platform,
++        media_type=payload.mode,
++        channel_external_id=payload.channel_external_id,
++        channel_login=payload.channel_login,
++        channel_display_name=payload.channel_display_name,
++        stream_external_id=payload.stream_external_id,
++        video_external_id=payload.video_external_id,
++        title=payload.title,
++        category_id=payload.category_id,
++        category_name=payload.category_name,
++        source_started_at_utc=payload.source_started_at_utc.replace(tzinfo=None) if payload.source_started_at_utc else None,
++        source_duration_ms=payload.duration_ms,
++        page_url=payload.page_url,
++    )
++    await db.commit()
++    await db.refresh(event)
++    return event
++
++
++async def active_chat_for_event(db: AsyncSession, event_id: uuid.UUID) -> Session | None:
++    return await db.scalar(
++        select(Session)
++        .where(
++            Session.event_id == event_id,
++            Session.deleted_at_utc.is_(None),
++            Session.status.in_(ACTIVE_CAPTURE_SESSION_STATUSES),
++        )
++        .order_by(Session.created_at.desc())
++        .limit(1)
++    )
++
++
++async def active_video_for_event(db: AsyncSession, event_id: uuid.UUID) -> VideoSession | None:
++    return await db.scalar(
++        select(VideoSession)
++        .where(
++            VideoSession.event_id == event_id,
++            VideoSession.deleted_at_utc.is_(None),
++            VideoSession.status.in_(ACTIVE_VIDEO_STATUSES),
++        )
++        .order_by(VideoSession.created_at.desc())
++        .limit(1)
++    )
++
++
++async def start_video_for_event(payload: CaptureStartRequest, event: MediaEvent, db: AsyncSession) -> dict:
++    # Serialize video Start independently from Chat Start on the canonical event row.
++    await db.execute(select(MediaEvent).where(MediaEvent.id == event.id).with_for_update())
++    active = await active_video_for_event(db, event.id)
++    if active is not None:
++        await db.rollback()
++        return mode_result(requested=True, result="already_active", session_id=str(active.id))
++
++    source_url = event.source_url or payload.page_url
++    if not source_url:
++        await db.rollback()
++        return mode_result(requested=True, result="failed", error="canonical Twitch source URL is missing")
++
++    now = datetime.now(UTC).replace(tzinfo=None)
++    session = VideoSession(
++        id=uuid.uuid4(),
++        event_id=event.id,
++        status="arming",
++        completeness_status="collecting",
++        quality=settings.video_stream_quality,
++        recorder_mode="direct_hls_copy",
++        source_url=source_url,
++        recording_started_at_utc=now,
++        required_start_ms=0,
++        required_end_ms=payload.duration_ms if payload.mode == "vod" else None,
++        coverage_start_ms=None,
++        coverage_end_ms=None,
++        gap_count=0,
++        last_activity_at_utc=now,
++        metadata_json={
++            "media_type": payload.mode,
++            "video_external_id": payload.video_external_id,
++            "stream_external_id": payload.stream_external_id,
++            "channel_login": payload.channel_login,
++            "stage": "video_capture_core",
++        },
++    )
++    db.add(session)
++    db.add(
++        AuditLog(
++            event_id=event.id,
++            video_session_id=session.id,
++            action="video_start_requested",
++            payload_json={"media_type": payload.mode, "quality": session.quality},
++        )
++    )
++    await db.commit()
++
++    try:
++        await recorder_post(
++            "/internal/v1/video-sessions",
++            {
++                "session_id": str(session.id),
++                "event_id": str(event.id),
++                "media_type": payload.mode,
++                "source_url": source_url,
++                "quality": session.quality,
++                "source_duration_ms": payload.duration_ms,
++            },
++        )
++    except HTTPException as exc:
++        session.status = "failed"
++        session.completeness_status = "failed"
++        session.last_error = str(exc.detail)
++        session.ended_at_utc = datetime.now(UTC).replace(tzinfo=None)
++        await db.commit()
++        return mode_result(requested=True, result="failed", session_id=str(session.id), error=str(exc.detail))
++
++    return mode_result(requested=True, result="started", session_id=str(session.id))
++
++
++@router.post("/capture/start")
++async def start_capture(payload: CaptureStartRequest, db: AsyncSession = Depends(get_db)) -> dict:
++    if not payload.capture.chat and not payload.capture.video:
++        raise HTTPException(400, "at least one capture mode must be selected")
++    payload = await normalize_context(payload)
++    event = await resolve_event(payload, db)
++
++    chat_result = mode_result(requested=False, result="not_requested")
++    video_result = mode_result(requested=False, result="not_requested")
++
++    if payload.capture.chat:
++        active_chat = await active_chat_for_event(db, event.id)
++        if active_chat is not None:
++            chat_result = mode_result(requested=True, result="already_active", session_id=str(active_chat.id))
++        elif payload.mode == "vod" and not payload.twitch_integrity:
++            chat_result = mode_result(
++                requested=True,
++                result="failed",
++                error="browser-captured Twitch Client-Integrity is required for VOD Chat",
++            )
++        else:
++            try:
++                result = await start_session(
++                    SessionStartRequest(
++                        platform=payload.platform,
++                        mode=payload.mode,
++                        channel_external_id=payload.channel_external_id,
++                        channel_login=payload.channel_login,
++                        channel_display_name=payload.channel_display_name,
++                        stream_external_id=payload.stream_external_id,
++                        video_external_id=payload.video_external_id,
++                        title=payload.title,
++                        category_id=payload.category_id,
++                        category_name=payload.category_name,
++                        source_started_at_utc=payload.source_started_at_utc,
++                        duration_ms=payload.duration_ms,
++                        page_url=payload.page_url,
++                        player_open=payload.player_open,
++                        metadata=payload.metadata,
++                        twitch_integrity=payload.twitch_integrity,
++                    ),
++                    db,
++                )
++                chat_result = mode_result(requested=True, result="started", session_id=result["id"])
++            except HTTPException as exc:
++                await db.rollback()
++                active_chat = await active_chat_for_event(db, event.id)
++                if exc.status_code == 409 and active_chat is not None:
++                    chat_result = mode_result(requested=True, result="already_active", session_id=str(active_chat.id))
++                else:
++                    chat_result = mode_result(requested=True, result="failed", error=str(exc.detail))
++
++    if payload.capture.video:
++        try:
++            refreshed_event = await db.get(MediaEvent, event.id)
++            assert refreshed_event is not None
++            video_result = await start_video_for_event(payload, refreshed_event, db)
++        except Exception as exc:
++            await db.rollback()
++            video_result = mode_result(requested=True, result="failed", error=str(exc))
++
++    return {
++        "event": {
++            "id": str(event.id),
++            "media_type": event.media_type,
++            "video_external_id": event.video_external_id,
++            "stream_external_id": event.stream_external_id,
++        },
++        "chat": chat_result,
++        "video": video_result,
++        "ok": any(item["result"] in {"started", "already_active"} for item in (chat_result, video_result)),
++    }
++
++
++@router.get("/capture/progress")
++async def capture_progress(
++    chat_session_id: list[uuid.UUID] | None = Query(default=None),
++    video_session_id: list[uuid.UUID] | None = Query(default=None),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    chat_ids = list(dict.fromkeys(chat_session_id or []))
++    video_ids = list(dict.fromkeys(video_session_id or []))
++    if len(chat_ids) + len(video_ids) > 200:
++        raise HTTPException(400, "at most 200 capture session ids are allowed")
++
++    chat_rows = []
++    if chat_ids:
++        chat_rows = (
++            await db.execute(
++                select(Session).where(Session.id.in_(chat_ids), Session.deleted_at_utc.is_(None))
++            )
++        ).scalars().all()
++    video_rows = []
++    if video_ids:
++        video_rows = (
++            await db.execute(
++                select(VideoSession).where(VideoSession.id.in_(video_ids), VideoSession.deleted_at_utc.is_(None))
++            )
++        ).scalars().all()
++
++    return {
++        "chat": [
++            {
++                "session_id": str(row.id),
++                "media_type": row.media_type,
++                "status": row.status,
++                "completeness_status": row.completeness_status,
++                "source_duration_ms": row.source_duration_ms,
++                "coverage_end_ms": row.coverage_end_ms,
++                "percent": capture_progress_percent(
++                    media_type=row.media_type,
++                    status_value=row.status,
++                    completeness_status=row.completeness_status,
++                    source_duration_ms=row.source_duration_ms,
++                    coverage_end_ms=row.coverage_end_ms,
++                ),
++            }
++            for row in chat_rows
++        ],
++        "video": [
++            {
++                "session_id": str(row.id),
++                "status": row.status,
++                "completeness_status": row.completeness_status,
++                "duration_recorded_ms": row.duration_recorded_ms,
++                "coverage_end_ms": row.coverage_end_ms,
++                "required_end_ms": row.required_end_ms,
++                "gap_count": row.gap_count,
++                "last_error": row.last_error,
++                "percent": video_progress_percent(row),
++            }
++            for row in video_rows
++        ],
++        "poll_after_ms": 5000,
++    }
++
++
++@router.post("/capture/context-status")
++async def capture_context_status(payload: CaptureContextRequest, db: AsyncSession = Depends(get_db)) -> dict:
++    resolved_stream_id = None
++    if payload.mode == "vod":
++        if not payload.video_external_id:
++            raise HTTPException(400, "video_external_id is required for VOD")
++        external_key = f"twitch:vod:{payload.video_external_id}"
++    else:
++        if not payload.channel_login:
++            raise HTTPException(400, "channel_login is required for LIVE")
++        resolved, _started_at = await resolve_live_metadata(payload.channel_login)
++        resolved_stream_id = str(resolved["stream_external_id"])
++        external_key = f"twitch:live:{resolved_stream_id}"
++
++    event = await db.scalar(select(MediaEvent).where(MediaEvent.external_key == external_key))
++    if event is None:
++        return {
++            "event": None,
++            "active_chat_session": None,
++            "active_video_session": None,
++            "resolved_stream_external_id": resolved_stream_id,
++        }
++    chat = await active_chat_for_event(db, event.id)
++    video = await active_video_for_event(db, event.id)
++    return {
++        "event": {"id": str(event.id), "external_key": event.external_key, "media_type": event.media_type},
++        "active_chat_session": session_dict(chat) if chat else None,
++        "active_video_session": video_session_dict(video) if video else None,
++        "resolved_stream_external_id": resolved_stream_id,
++    }
+diff --git a/apps/api/app/routers/events.py b/apps/api/app/routers/events.py
+index 171adef..59f6ad8 100644
+--- a/apps/api/app/routers/events.py
++++ b/apps/api/app/routers/events.py
+@@ -9,9 +9,10 @@ from sqlalchemy import and_, func, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from streamhub_common.db import get_db
+-from streamhub_common.models import ChatMessage, MediaEvent, Session
++from streamhub_common.models import ChatMessage, MediaEvent, Session, VideoSegment, VideoSession
+ 
+ from .sessions import ACTIVE_CAPTURE_SESSION_STATUSES, capture_progress_percent, session_dict, stop_capture_row
++from .video import ACTIVE_VIDEO_STATUSES, stop_video_capture_row, video_progress_percent, video_session_dict
+ 
+ router = APIRouter(prefix="/api/v1", tags=["events"])
+ 
+@@ -84,15 +85,57 @@ async def _chat_summaries_by_event(db: AsyncSession, event_ids: list[uuid.UUID])
+     return grouped
+ 
+ 
+-def _event_payload(event: MediaEvent, chat_sessions: list[dict]) -> dict:
+-    active_count = sum(1 for session in chat_sessions if session["status"] in ACTIVE_CAPTURE_SESSION_STATUSES)
++async def _video_summaries_by_event(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[dict]]:
++    if not event_ids:
++        return {}
++    sessions = (
++        await db.execute(
++            select(VideoSession)
++            .where(VideoSession.event_id.in_(event_ids), VideoSession.deleted_at_utc.is_(None))
++            .order_by(VideoSession.event_id, VideoSession.created_at.asc())
++        )
++    ).scalars().all()
++    if not sessions:
++        return {}
++
++    ids = [row.id for row in sessions]
++    aggregate_rows = (
++        await db.execute(
++            select(
++                VideoSegment.video_session_id,
++                func.count(VideoSegment.id),
++                func.coalesce(func.sum(VideoSegment.bytes), 0),
++            )
++            .where(VideoSegment.video_session_id.in_(ids))
++            .group_by(VideoSegment.video_session_id)
++        )
++    ).all()
++    aggregates = {session_id: (int(count or 0), int(total_bytes or 0)) for session_id, count, total_bytes in aggregate_rows}
++
++    grouped: dict[uuid.UUID, list[dict]] = defaultdict(list)
++    for row in sessions:
++        segment_count, total_bytes = aggregates.get(row.id, (0, 0))
++        payload = video_session_dict(row)
++        payload["segment_count"] = segment_count
++        payload["bytes"] = total_bytes
++        payload["progress_percent"] = video_progress_percent(row)
++        grouped[row.event_id].append(payload)
++    return grouped
++
++
++def _event_payload(event: MediaEvent, chat_sessions: list[dict], video_sessions: list[dict]) -> dict:
++    active_chat_count = sum(1 for session in chat_sessions if session["status"] in ACTIVE_CAPTURE_SESSION_STATUSES)
++    active_video_count = sum(1 for session in video_sessions if session["status"] in ACTIVE_VIDEO_STATUSES)
+     return {
+         **event_dict(event),
+         "chat_sessions": chat_sessions,
++        "video_sessions": video_sessions,
+         "chat_sessions_count": len(chat_sessions),
+-        "active_chat_sessions_count": active_count,
++        "video_sessions_count": len(video_sessions),
++        "active_chat_sessions_count": active_chat_count,
++        "active_video_sessions_count": active_video_count,
+         "has_chat": bool(chat_sessions),
+-        "has_video": False,
++        "has_video": bool(video_sessions),
+     }
+ 
+ 
+@@ -111,7 +154,12 @@ async def list_events(
+         .where(Session.event_id == MediaEvent.id, Session.deleted_at_utc.is_(None))
+         .exists()
+     )
+-    conditions = [MediaEvent.deleted_at_utc.is_(None), visible_chat_exists]
++    visible_video_exists = (
++        select(VideoSession.id)
++        .where(VideoSession.event_id == MediaEvent.id, VideoSession.deleted_at_utc.is_(None))
++        .exists()
++    )
++    conditions = [MediaEvent.deleted_at_utc.is_(None), visible_chat_exists | visible_video_exists]
+     if channel:
+         conditions.append(MediaEvent.channel_login == channel)
+     if type:
+@@ -119,7 +167,7 @@ async def list_events(
+     if title:
+         conditions.append(MediaEvent.title.like(f"%{title}%"))
+     if active is not None:
+-        active_exists = (
++        active_chat_exists = (
+             select(Session.id)
+             .where(
+                 Session.event_id == MediaEvent.id,
+@@ -128,7 +176,17 @@ async def list_events(
+             )
+             .exists()
+         )
+-        conditions.append(active_exists if active else ~active_exists)
++        active_video_exists = (
++            select(VideoSession.id)
++            .where(
++                VideoSession.event_id == MediaEvent.id,
++                VideoSession.deleted_at_utc.is_(None),
++                VideoSession.status.in_(ACTIVE_VIDEO_STATUSES),
++            )
++            .exists()
++        )
++        any_active = active_chat_exists | active_video_exists
++        conditions.append(any_active if active else ~any_active)
+ 
+     where_clause = and_(*conditions)
+     total = await db.scalar(select(func.count()).select_from(MediaEvent).where(where_clause))
+@@ -142,9 +200,14 @@ async def list_events(
+         )
+     ).scalars().all()
+ 
+-    summaries = await _chat_summaries_by_event(db, [event.id for event in events])
++    event_ids = [event.id for event in events]
++    chat_summaries = await _chat_summaries_by_event(db, event_ids)
++    video_summaries = await _video_summaries_by_event(db, event_ids)
+     return {
+-        "items": [_event_payload(event, summaries.get(event.id, [])) for event in events],
++        "items": [
++            _event_payload(event, chat_summaries.get(event.id, []), video_summaries.get(event.id, []))
++            for event in events
++        ],
+         "total": int(total or 0),
+         "page": page,
+         "page_size": page_size,
+@@ -156,8 +219,9 @@ async def get_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
+     event = await db.get(MediaEvent, event_id)
+     if event is None or event.deleted_at_utc is not None:
+         raise HTTPException(404, "event not found")
+-    summaries = await _chat_summaries_by_event(db, [event_id])
+-    return _event_payload(event, summaries.get(event_id, []))
++    chat_summaries = await _chat_summaries_by_event(db, [event_id])
++    video_summaries = await _video_summaries_by_event(db, [event_id])
++    return _event_payload(event, chat_summaries.get(event_id, []), video_summaries.get(event_id, []))
+ 
+ 
+ @router.post("/events/{event_id}/stop-all")
+@@ -178,20 +242,45 @@ async def stop_all_event_capture(event_id: uuid.UUID, db: AsyncSession = Depends
+         )
+     ).scalars().all()
+ 
+-    results = []
++    chat_results = []
+     for row in active_rows:
+         try:
+             await stop_capture_row(db, row, reason="stop_all_user")
+-            results.append({"session_id": str(row.id), "result": "stopped", "error": None})
++            chat_results.append({"session_id": str(row.id), "result": "stopped", "error": None})
++        except HTTPException as exc:
++            chat_results.append({"session_id": str(row.id), "result": "failed", "error": str(exc.detail)})
++
++    active_video_rows = (
++        await db.execute(
++            select(VideoSession)
++            .where(
++                VideoSession.event_id == event_id,
++                VideoSession.deleted_at_utc.is_(None),
++                VideoSession.status.in_(ACTIVE_VIDEO_STATUSES),
++            )
++            .order_by(VideoSession.created_at.desc())
++        )
++    ).scalars().all()
++    video_results = []
++    for row in active_video_rows:
++        try:
++            await stop_video_capture_row(db, row, reason="stop_all_user")
++            video_results.append({"session_id": str(row.id), "result": "stopped", "error": None})
+         except HTTPException as exc:
+-            results.append({"session_id": str(row.id), "result": "failed", "error": str(exc.detail)})
++            video_results.append({"session_id": str(row.id), "result": "failed", "error": str(exc.detail)})
+     await db.commit()
+     return {
+         "event_id": str(event_id),
+         "chat": {
+             "active_before": len(active_rows),
+-            "stopped": sum(1 for item in results if item["result"] == "stopped"),
+-            "failed": sum(1 for item in results if item["result"] == "failed"),
+-            "results": results,
++            "stopped": sum(1 for item in chat_results if item["result"] == "stopped"),
++            "failed": sum(1 for item in chat_results if item["result"] == "failed"),
++            "results": chat_results,
++        },
++        "video": {
++            "active_before": len(active_video_rows),
++            "stopped": sum(1 for item in video_results if item["result"] == "stopped"),
++            "failed": sum(1 for item in video_results if item["result"] == "failed"),
++            "results": video_results,
+         },
+     }
+diff --git a/apps/api/app/routers/video.py b/apps/api/app/routers/video.py
+new file mode 100644
+index 0000000..21f43ce
+--- /dev/null
++++ b/apps/api/app/routers/video.py
+@@ -0,0 +1,219 @@
++from __future__ import annotations
++
++import uuid
++from datetime import UTC, datetime
++
++import httpx
++from fastapi import APIRouter, Depends, HTTPException, Query
++from sqlalchemy import func, select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from streamhub_common.db import get_db
++from streamhub_common.models import AuditLog, VideoRun, VideoSegment, VideoSession
++from streamhub_common.settings import get_settings
++
++router = APIRouter(prefix="/api/v1", tags=["video"])
++settings = get_settings()
++
++ACTIVE_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting"})
++
++
++def video_progress_percent(row: VideoSession) -> float | None:
++    if row.completeness_status == "complete":
++        return 100.0
++    media_type = (row.metadata_json or {}).get("media_type")
++    if media_type != "vod" or not row.required_end_ms or row.required_end_ms <= 0:
++        return None
++    covered = max(0, min(int(row.coverage_end_ms or 0), int(row.required_end_ms)))
++    return min(99.9, round((covered / row.required_end_ms) * 100.0, 1))
++
++
++def video_session_dict(row: VideoSession) -> dict:
++    return {
++        "id": str(row.id),
++        "event_id": str(row.event_id),
++        "status": row.status,
++        "completeness_status": row.completeness_status,
++        "quality": row.quality,
++        "recorder_mode": row.recorder_mode,
++        "source_url": row.source_url,
++        "recording_started_at_utc": row.recording_started_at_utc,
++        "ended_at_utc": row.ended_at_utc,
++        "duration_recorded_ms": row.duration_recorded_ms,
++        "required_start_ms": row.required_start_ms,
++        "required_end_ms": row.required_end_ms,
++        "coverage_start_ms": row.coverage_start_ms,
++        "coverage_end_ms": row.coverage_end_ms,
++        "gap_count": row.gap_count,
++        "last_error": row.last_error,
++        "last_activity_at_utc": row.last_activity_at_utc,
++        "stop_reason": row.stop_reason,
++        "metadata": row.metadata_json,
++        "deleted_at_utc": row.deleted_at_utc,
++        "created_at": row.created_at,
++        "updated_at": row.updated_at,
++        "progress_percent": video_progress_percent(row),
++    }
++
++
++async def recorder_post(path: str, payload: dict) -> dict:
++    headers = {"X-Internal-Service-Token": settings.internal_service_token}
++    async with httpx.AsyncClient(timeout=30.0) as client:
++        response = await client.post(f"{settings.video_recorder_base_url}{path}", json=payload, headers=headers)
++    if response.status_code >= 400:
++        raise HTTPException(status_code=502, detail=f"video-recorder error: {response.text[:500]}")
++    return response.json()
++
++
++async def stop_video_capture_row(db: AsyncSession, row: VideoSession, *, reason: str) -> None:
++    await recorder_post(f"/internal/v1/video-sessions/{row.id}/stop", {"reason": reason})
++    await db.refresh(row)
++    db.add(
++        AuditLog(
++            event_id=row.event_id,
++            video_session_id=row.id,
++            action="video_manual_stop",
++            payload_json={"reason": reason},
++        )
++    )
++
++
++@router.post("/video-sessions/{session_id}/stop")
++async def stop_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    row = await db.get(VideoSession, session_id)
++    if row is None or row.deleted_at_utc is not None:
++        raise HTTPException(404, "video session not found")
++    if row.status not in ACTIVE_VIDEO_STATUSES:
++        return video_session_dict(row)
++    await stop_video_capture_row(db, row, reason="user_stop")
++    await db.commit()
++    await db.refresh(row)
++    return video_session_dict(row)
++
++
++@router.get("/video-sessions/capture-progress")
++async def video_capture_progress(
++    session_id: list[uuid.UUID] | None = Query(default=None),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    ids = list(dict.fromkeys(session_id or []))
++    if len(ids) > 100:
++        raise HTTPException(400, "at most 100 session_id values are allowed")
++    if not ids:
++        return {"items": [], "poll_after_ms": 5000}
++    rows = (
++        await db.execute(
++            select(VideoSession).where(VideoSession.id.in_(ids), VideoSession.deleted_at_utc.is_(None))
++        )
++    ).scalars().all()
++    return {
++        "items": [
++            {
++                "session_id": str(row.id),
++                "status": row.status,
++                "completeness_status": row.completeness_status,
++                "duration_recorded_ms": row.duration_recorded_ms,
++                "coverage_end_ms": row.coverage_end_ms,
++                "required_end_ms": row.required_end_ms,
++                "gap_count": row.gap_count,
++                "last_error": row.last_error,
++                "percent": video_progress_percent(row),
++            }
++            for row in rows
++        ],
++        "poll_after_ms": 5000,
++    }
++
++
++@router.get("/video-sessions/{session_id}")
++async def get_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    row = await db.get(VideoSession, session_id)
++    if row is None or row.deleted_at_utc is not None:
++        raise HTTPException(404, "video session not found")
++    segment_count, total_bytes = (
++        await db.execute(
++            select(func.count(VideoSegment.id), func.coalesce(func.sum(VideoSegment.bytes), 0)).where(
++                VideoSegment.video_session_id == session_id
++            )
++        )
++    ).one()
++    return {
++        **video_session_dict(row),
++        "segment_count": int(segment_count or 0),
++        "bytes": int(total_bytes or 0),
++    }
++
++
++@router.get("/video-sessions/{session_id}/runs")
++async def list_video_runs(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    row = await db.get(VideoSession, session_id)
++    if row is None or row.deleted_at_utc is not None:
++        raise HTTPException(404, "video session not found")
++    runs = (
++        await db.execute(
++            select(VideoRun).where(VideoRun.video_session_id == session_id).order_by(VideoRun.run_no)
++        )
++    ).scalars().all()
++    return {
++        "items": [
++            {
++                "id": run.id,
++                "run_no": run.run_no,
++                "status": run.status,
++                "started_at_utc": run.started_at_utc,
++                "ended_at_utc": run.ended_at_utc,
++                "resume_source_offset_ms": run.resume_source_offset_ms,
++                "first_segment_no": run.first_segment_no,
++                "last_segment_no": run.last_segment_no,
++                "streamlink_exit_code": run.streamlink_exit_code,
++                "ffmpeg_exit_code": run.ffmpeg_exit_code,
++                "close_reason": run.close_reason,
++                "last_error": run.last_error,
++            }
++            for run in runs
++        ]
++    }
++
++
++@router.get("/video-sessions/{session_id}/segments")
++async def list_video_segments(
++    session_id: uuid.UUID,
++    after_segment_no: int = Query(default=0, ge=0),
++    page_size: int = Query(default=100, ge=1, le=500),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    row = await db.get(VideoSession, session_id)
++    if row is None or row.deleted_at_utc is not None:
++        raise HTTPException(404, "video session not found")
++    segments = (
++        await db.execute(
++            select(VideoSegment)
++            .where(VideoSegment.video_session_id == session_id, VideoSegment.segment_no > after_segment_no)
++            .order_by(VideoSegment.segment_no)
++            .limit(page_size + 1)
++        )
++    ).scalars().all()
++    has_more = len(segments) > page_size
++    segments = segments[:page_size]
++    return {
++        "items": [
++            {
++                "id": segment.id,
++                "segment_no": segment.segment_no,
++                "video_run_id": segment.video_run_id,
++                "file_name": segment.file_name,
++                "relative_path": segment.relative_path,
++                "timeline_start_ms": segment.timeline_start_ms,
++                "timeline_end_ms": segment.timeline_end_ms,
++                "source_media_start_ms": segment.source_media_start_ms,
++                "source_media_end_ms": segment.source_media_end_ms,
++                "duration_ms": segment.duration_ms,
++                "bytes": segment.bytes,
++                "storage_state": segment.storage_state,
++                "integrity_state": segment.integrity_state,
++                "closed_at_utc": segment.closed_at_utc,
++            }
++            for segment in segments
++        ],
++        "next_after_segment_no": segments[-1].segment_no if has_more and segments else None,
++    }
+diff --git a/apps/chrome_extension/popup.css b/apps/chrome_extension/popup.css
+index b396c8e..d764e59 100644
+--- a/apps/chrome_extension/popup.css
++++ b/apps/chrome_extension/popup.css
+@@ -1,13 +1,19 @@
+ :root { font-family: Inter, system-ui, sans-serif; color: #171717; }
+-body { margin: 0; width: 340px; background: #f7f7f8; }
++body { margin: 0; width: 360px; background: #f7f7f8; }
+ main { padding: 16px; }
+ h1 { margin: 0 0 14px; font-size: 20px; }
+ .status, .details, .message { background: white; border: 1px solid #e4e4e7; border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+-.details { font-size: 12px; line-height: 1.55; color: #52525b; }
++.details { font-size: 12px; line-height: 1.55; color: #52525b; white-space: pre-wrap; }
++.capture-toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
++.toggle { display: flex; gap: 8px; align-items: center; margin: 0; padding: 10px; border: 1px solid #e4e4e7; border-radius: 9px; background: white; font-size: 13px; }
++.section-title { margin: 13px 2px 6px; color: #71717a; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+ .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
++.actions.three { grid-template-columns: 1fr 1fr 1.25fr; }
+ button { border: 1px solid #d4d4d8; border-radius: 9px; background: white; padding: 9px; cursor: pointer; }
+ button:disabled { opacity: .45; cursor: default; }
++.primary { font-weight: 700; border-color: #a1a1aa; }
++.wide { width: 100%; margin-top: 8px; }
++.auth { margin-top: 12px; }
+ .danger { border-color: #f0a3a3; }
+-.toggle { display: flex; gap: 8px; align-items: center; margin: 12px 2px; font-size: 13px; }
+-.message { display: none; font-size: 12px; white-space: pre-wrap; }
++.message { display: none; margin-top: 10px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+ .message.show { display: block; }
+diff --git a/apps/chrome_extension/popup.html b/apps/chrome_extension/popup.html
+index d92be95..c761bf6 100644
+--- a/apps/chrome_extension/popup.html
++++ b/apps/chrome_extension/popup.html
+@@ -11,13 +11,23 @@
+     <h1>StreamHub</h1>
+     <div id="status" class="status">Определяю контекст…</div>
+     <div id="details" class="details"></div>
++    <div class="capture-toggles">
++      <label class="toggle"><input id="chat-toggle" type="checkbox" /> <span>Chat</span></label>
++      <label class="toggle"><input id="video-toggle" type="checkbox" /> <span>Video</span></label>
++    </div>
++    <button id="start" class="primary wide">Start selected</button>
++    <div class="section-title">Chat</div>
++    <div class="actions three">
++      <button id="pause-chat">Pause</button>
++      <button id="resume-chat">Resume</button>
++      <button id="stop-chat" class="danger">Stop Chat</button>
++    </div>
++    <div class="section-title">Video</div>
+     <div class="actions">
+-      <button id="start">Start recording</button>
+-      <button id="pause">Pause</button>
+-      <button id="resume">Resume</button>
+-      <button id="stop" class="danger">Stop</button>
+-      <button id="auth">Authorize Twitch</button>
++      <button id="stop-video" class="danger">Stop Video</button>
++      <button id="stop-all" class="danger">Stop All</button>
+     </div>
++    <button id="auth" class="wide auth">Authorize Twitch</button>
+     <div id="message" class="message"></div>
+   </main>
+   <script src="popup.js" type="module"></script>
+diff --git a/apps/chrome_extension/popup.js b/apps/chrome_extension/popup.js
+index 22792ab..4145c1d 100644
+--- a/apps/chrome_extension/popup.js
++++ b/apps/chrome_extension/popup.js
+@@ -3,7 +3,8 @@ let state = null;
+ let pollTimer = null;
+ let activeTabId = null;
+ let currentEventId = null;
+-let activeSessionsCount = 0;
++let activeChatSession = null;
++let activeVideoSession = null;
+ 
+ const $ = (id) => document.getElementById(id);
+ 
+@@ -14,7 +15,14 @@ function showMessage(text) {
+ }
+ 
+ async function getState() {
+-  const defaults = { apiBaseUrl: "http://localhost:18741", activeSessionId: null, activeSessionMode: null, activeSessionTabId: null };
++  const defaults = {
++    apiBaseUrl: "http://localhost:18741",
++    activeSessionId: null,
++    activeSessionMode: null,
++    activeSessionTabId: null,
++    captureChatEnabled: true,
++    captureVideoEnabled: false
++  };
+   const stored = await chrome.storage.local.get(Object.keys(defaults));
+   const next = { ...defaults, ...stored };
+   if (["http://localhost:8000", "http://127.0.0.1:8000"].includes(next.apiBaseUrl)) {
+@@ -33,9 +41,9 @@ async function api(path, init = {}) {
+   return response.json();
+ }
+ 
+-async function persistActiveSession(activeSession) {
++async function persistActiveChatSession(activeSession) {
+   state.activeSessionId = activeSession?.id || null;
+-  state.activeSessionMode = activeSession?.media_type || null;
++  state.activeSessionMode = activeSession?.media_type || context?.mode || null;
+   state.activeSessionTabId = activeSession ? activeTabId : null;
+   await chrome.storage.local.set({
+     activeSessionId: state.activeSessionId,
+@@ -49,19 +57,31 @@ function render() {
+   $("status").textContent = context?.supported
+     ? `${context.mode?.toUpperCase()} · player ${context.player_open ? "open" : "closed"}`
+     : "Неподдерживаемая страница Twitch";
++
++  $("chat-toggle").checked = Boolean(state?.captureChatEnabled);
++  $("video-toggle").checked = Boolean(state?.captureVideoEnabled);
++
+   const parts = [
+     context?.channel_login ? `channel: ${context.channel_login}` : null,
+     context?.video_id ? `video_id: ${context.video_id}` : null,
+     context?.duration_ms != null ? `duration: ${Math.round(context.duration_ms / 1000)}s` : null,
+-    currentEventId ? `event: ${currentEventId}` : null,
+-    state?.activeSessionId ? `session: ${state.activeSessionId}` : "session: none",
+-    activeSessionsCount > 1 ? `active sessions: ${activeSessionsCount} (будут остановлены вместе)` : null
++    currentEventId ? `event: ${currentEventId}` : "event: none",
++    activeChatSession ? `chat: ${activeChatSession.id} · ${activeChatSession.status}` : "chat: idle",
++    activeVideoSession ? `video: ${activeVideoSession.id} · ${activeVideoSession.status}` : "video: idle"
+   ].filter(Boolean);
+   $("details").textContent = parts.join("\n");
+-  $("start").disabled = !supported || Boolean(state?.activeSessionId);
+-  $("pause").disabled = !state?.activeSessionId;
+-  $("resume").disabled = !state?.activeSessionId;
+-  $("stop").disabled = !state?.activeSessionId;
++
++  const selectedAny = Boolean(state?.captureChatEnabled || state?.captureVideoEnabled);
++  const selectedNeedStart = Boolean(
++    (state?.captureChatEnabled && !activeChatSession) ||
++    (state?.captureVideoEnabled && !activeVideoSession)
++  );
++  $("start").disabled = !supported || !selectedAny || !selectedNeedStart;
++  $("pause-chat").disabled = !activeChatSession;
++  $("resume-chat").disabled = !activeChatSession;
++  $("stop-chat").disabled = !activeChatSession;
++  $("stop-video").disabled = !activeVideoSession;
++  $("stop-all").disabled = !activeChatSession && !activeVideoSession;
+ }
+ 
+ async function getTwitchIntegrity(tabId) {
+@@ -75,8 +95,9 @@ async function refreshContext() {
+   if (!tab?.id || !tab.url?.includes("twitch.tv")) {
+     context = { supported: false, mode: "unsupported", player_open: false };
+     currentEventId = null;
+-    activeSessionsCount = 0;
+-    await persistActiveSession(null);
++    activeChatSession = null;
++    activeVideoSession = null;
++    await persistActiveChatSession(null);
+     render();
+     return;
+   }
+@@ -88,11 +109,12 @@ async function refreshContext() {
+   render();
+ }
+ 
+-async function syncCurrentCollectorStatus({ silent = false } = {}) {
++async function syncCurrentCaptureStatus({ silent = false } = {}) {
+   if (!context?.supported || !context?.player_open) {
+     currentEventId = null;
+-    activeSessionsCount = 0;
+-    await persistActiveSession(null);
++    activeChatSession = null;
++    activeVideoSession = null;
++    await persistActiveChatSession(null);
+     render();
+     return null;
+   }
+@@ -102,13 +124,14 @@ async function syncCurrentCollectorStatus({ silent = false } = {}) {
+     video_external_id: context.video_id || null
+   };
+   try {
+-    const result = await api("/api/v1/collector/context-status", {
++    const result = await api("/api/v1/capture/context-status", {
+       method: "POST",
+       body: JSON.stringify(payload)
+     });
+     currentEventId = result.event?.id || null;
+-    activeSessionsCount = Number(result.active_sessions_count || 0);
+-    await persistActiveSession(result.active_session || null);
++    activeChatSession = result.active_chat_session || null;
++    activeVideoSession = result.active_video_session || null;
++    await persistActiveChatSession(activeChatSession);
+     render();
+     return result;
+   } catch (e) {
+@@ -118,19 +141,39 @@ async function syncCurrentCollectorStatus({ silent = false } = {}) {
+   }
+ }
+ 
++function modeLine(name, result) {
++  if (!result?.requested) return `${name}: не выбран`;
++  if (result.result === "started") return `${name}: запущен · ${result.session_id}`;
++  if (result.result === "already_active") return `${name}: уже идёт · ${result.session_id}`;
++  return `${name}: ошибка · ${result.error || "unknown"}`;
++}
++
++$("chat-toggle").addEventListener("change", async (event) => {
++  state.captureChatEnabled = Boolean(event.target.checked);
++  await chrome.storage.local.set({ captureChatEnabled: state.captureChatEnabled });
++  render();
++});
++
++$("video-toggle").addEventListener("change", async (event) => {
++  state.captureVideoEnabled = Boolean(event.target.checked);
++  await chrome.storage.local.set({ captureVideoEnabled: state.captureVideoEnabled });
++  render();
++});
++
+ $("start").addEventListener("click", async () => {
+   showMessage("");
+   try {
+-    const beforeStart = await syncCurrentCollectorStatus({ silent: true });
+-    if (beforeStart?.active_session) {
+-      showMessage(`Сбор уже идёт: ${beforeStart.active_session.id}`);
+-      return;
+-    }
+-    const twitchIntegrity = context.mode === "vod" ? await getTwitchIntegrity(activeTabId) : null;
+-    if (context.mode === "vod" && !twitchIntegrity?.client_integrity) {
+-      throw new Error("Twitch Client-Integrity ещё не пойман. Обнови вкладку VOD, подожди несколько секунд и нажми Start снова.");
++    await syncCurrentCaptureStatus({ silent: true });
++    const needChatStart = Boolean(state.captureChatEnabled && !activeChatSession);
++    const twitchIntegrity = context.mode === "vod" && needChatStart
++      ? await getTwitchIntegrity(activeTabId)
++      : null;
++    if (context.mode === "vod" && needChatStart && !twitchIntegrity?.client_integrity) {
++      throw new Error("Для VOD Chat ещё не пойман Twitch Client-Integrity. Video-only можно запускать без него.");
+     }
++
+     const payload = {
++      platform: "twitch",
+       mode: context.mode,
+       channel_login: context.channel_login || null,
+       video_external_id: context.video_id || null,
+@@ -138,71 +181,91 @@ $("start").addEventListener("click", async () => {
+       page_url: context.href,
+       player_open: context.player_open,
+       metadata: { browser_current_time_ms: context.current_time_ms || null },
++      capture: {
++        chat: Boolean(state.captureChatEnabled),
++        video: Boolean(state.captureVideoEnabled)
++      },
+       twitch_integrity: twitchIntegrity
+     };
+-    const result = await api("/api/v1/collector/sessions", { method: "POST", body: JSON.stringify(payload) });
+-    await persistActiveSession(result);
+-    currentEventId = result.event_id || currentEventId;
+-    activeSessionsCount = 1;
+-    showMessage(`Запись запущена: ${result.id}`);
+-    render();
++    const result = await api("/api/v1/capture/start", { method: "POST", body: JSON.stringify(payload) });
++    currentEventId = result.event?.id || currentEventId;
++    showMessage(`${modeLine("Chat", result.chat)}\n${modeLine("Video", result.video)}`);
++    await syncCurrentCaptureStatus({ silent: true });
+   } catch (e) {
+-    if (String(e).includes("409:")) await syncCurrentCollectorStatus({ silent: true });
+     showMessage(`Ошибка Start: ${e}`);
+   }
+ });
+ 
+-$("pause").addEventListener("click", async () => {
++$("pause-chat").addEventListener("click", async () => {
+   try {
+-    await syncCurrentCollectorStatus({ silent: true });
+-    if (!state.activeSessionId) throw new Error("для текущего события активной сессии нет");
+-    await api(`/api/v1/collector/sessions/${state.activeSessionId}/pause`, { method: "POST", body: "{}" });
+-    showMessage("Pause установлен. Для LIVE данные по ТЗ не должны теряться; VOD останавливается на checkpoint.");
+-  } catch (e) { showMessage(`Ошибка Pause: ${e}`); }
++    await syncCurrentCaptureStatus({ silent: true });
++    if (!activeChatSession) throw new Error("для текущего события активного Chat нет");
++    await api(`/api/v1/collector/sessions/${activeChatSession.id}/pause`, { method: "POST", body: "{}" });
++    showMessage("Chat Pause установлен.");
++    await syncCurrentCaptureStatus({ silent: true });
++  } catch (e) { showMessage(`Ошибка Chat Pause: ${e}`); }
+ });
+ 
+-$("resume").addEventListener("click", async () => {
++$("resume-chat").addEventListener("click", async () => {
+   try {
+-    await syncCurrentCollectorStatus({ silent: true });
+-    if (!state.activeSessionId) throw new Error("для текущего события активной сессии нет");
+-    if (state.activeSessionMode === "vod" && state.activeSessionTabId != null) {
+-      const twitchIntegrity = await getTwitchIntegrity(state.activeSessionTabId);
++    await syncCurrentCaptureStatus({ silent: true });
++    if (!activeChatSession) throw new Error("для текущего события активного Chat нет");
++    if (context.mode === "vod" && activeTabId != null) {
++      const twitchIntegrity = await getTwitchIntegrity(activeTabId);
+       if (twitchIntegrity?.client_integrity) {
+-        await api(`/api/v1/collector/sessions/${state.activeSessionId}/twitch-integrity`, {
++        await api(`/api/v1/collector/sessions/${activeChatSession.id}/twitch-integrity`, {
+           method: "POST", body: JSON.stringify(twitchIntegrity)
+         });
+       }
+     }
+-    await api(`/api/v1/collector/sessions/${state.activeSessionId}/resume`, { method: "POST", body: "{}" });
+-    showMessage("Resume выполнен.");
+-  } catch (e) { showMessage(`Ошибка Resume: ${e}`); }
++    await api(`/api/v1/collector/sessions/${activeChatSession.id}/resume`, { method: "POST", body: "{}" });
++    showMessage("Chat Resume выполнен.");
++    await syncCurrentCaptureStatus({ silent: true });
++  } catch (e) { showMessage(`Ошибка Chat Resume: ${e}`); }
++});
++
++$("stop-chat").addEventListener("click", async () => {
++  if (!confirm("Остановить только Chat? Video продолжит запись, если он активен.")) return;
++  try {
++    await syncCurrentCaptureStatus({ silent: true });
++    if (!activeChatSession) {
++      showMessage("Активного Chat уже нет.");
++      return;
++    }
++    await api(`/api/v1/collector/sessions/${activeChatSession.id}/stop`, {
++      method: "POST", body: JSON.stringify({ reason: "stop_user" })
++    });
++    showMessage("Chat остановлен. Video не затронут.");
++    await syncCurrentCaptureStatus({ silent: true });
++  } catch (e) { showMessage(`Ошибка Stop Chat: ${e}`); }
+ });
+ 
+-$("stop").addEventListener("click", async () => {
+-  if (!confirm("Остановить запись? Если диапазон ещё не покрыт полностью, сессия останется incomplete.")) return;
++$("stop-video").addEventListener("click", async () => {
++  if (!confirm("Остановить только Video? Chat продолжит сбор, если он активен.")) return;
+   try {
+-    await syncCurrentCollectorStatus({ silent: true });
+-    if (!state.activeSessionId) {
+-      showMessage("Для текущего события активного сбора уже нет.");
++    await syncCurrentCaptureStatus({ silent: true });
++    if (!activeVideoSession) {
++      showMessage("Активного Video уже нет.");
+       return;
+     }
+-    let stopped = 1;
+-    if (currentEventId) {
+-      const result = await api(`/api/v1/events/${currentEventId}/stop-all`, { method: "POST", body: "{}" });
+-      stopped = Number(result.chat?.stopped || 0);
+-      const failed = Number(result.chat?.failed || 0);
+-      if (failed) throw new Error(`не удалось остановить ${failed} активных сессий`);
+-    } else {
+-      await api(`/api/v1/collector/sessions/${state.activeSessionId}/stop`, {
+-        method: "POST", body: JSON.stringify({ reason: "stop_user" })
+-      });
++    await api(`/api/v1/video-sessions/${activeVideoSession.id}/stop`, { method: "POST", body: "{}" });
++    showMessage("Video остановлен. Chat не затронут.");
++    await syncCurrentCaptureStatus({ silent: true });
++  } catch (e) { showMessage(`Ошибка Stop Video: ${e}`); }
++});
++
++$("stop-all").addEventListener("click", async () => {
++  if (!confirm("Остановить Chat и Video текущего события?")) return;
++  try {
++    await syncCurrentCaptureStatus({ silent: true });
++    if (!currentEventId) {
++      showMessage("Для текущего события активных записей уже нет.");
++      return;
+     }
+-    currentEventId = null;
+-    activeSessionsCount = 0;
+-    await persistActiveSession(null);
+-    showMessage(`Запись остановлена. Остановлено сессий: ${stopped}.`);
+-    render();
+-  } catch (e) { showMessage(`Ошибка Stop: ${e}`); }
++    const result = await api(`/api/v1/events/${currentEventId}/stop-all`, { method: "POST", body: "{}" });
++    showMessage(`Stop All: Chat ${result.chat?.stopped || 0}, Video ${result.video?.stopped || 0}`);
++    await syncCurrentCaptureStatus({ silent: true });
++  } catch (e) { showMessage(`Ошибка Stop All: ${e}`); }
+ });
+ 
+ $("auth").addEventListener("click", async () => {
+@@ -231,5 +294,5 @@ $("auth").addEventListener("click", async () => {
+ (async function init() {
+   state = await getState();
+   await refreshContext();
+-  await syncCurrentCollectorStatus();
++  await syncCurrentCaptureStatus();
+ })();
+diff --git a/apps/twitch_adapter/app/main.py b/apps/twitch_adapter/app/main.py
+index 11e7ad1..7225d1f 100644
+--- a/apps/twitch_adapter/app/main.py
++++ b/apps/twitch_adapter/app/main.py
+@@ -46,6 +46,7 @@ class TwitchIntegrityContext(BaseModel):
+ vod_tasks: dict[uuid.UUID, asyncio.Task] = {}
+ vod_integrity_contexts: dict[uuid.UUID, TwitchIntegrityContext] = {}
+ auth_requests: dict[str, dict[str, Any]] = {}
++metadata_app_token: dict[str, Any] = {}
+ 
+ 
+ @dataclass(slots=True)
+@@ -561,6 +562,64 @@ async def load_runtime_twitch_auth() -> TwitchRuntimeAuth:
+     return TwitchRuntimeAuth(access_token=access_token, user_id=user_id, login=login, scopes=scopes)
+ 
+ 
++
++
++async def load_metadata_access_token() -> str:
++    """Return a token for public Helix metadata calls without requiring Chat OAuth.
++
++    Client credentials are preferred because public Get Users/Get Streams/Get
++    Videos do not need user consent. If an existing deployment has no usable
++    client secret, a valid stored user token remains a compatibility fallback.
++    """
++    now = datetime.now(UTC)
++    cached = metadata_app_token.get("access_token")
++    expires_at = metadata_app_token.get("expires_at")
++    if cached and isinstance(expires_at, datetime) and expires_at > now + timedelta(seconds=60):
++        return str(cached)
++
++    app_error: Exception | None = None
++    if settings.twitch_client_secret:
++        try:
++            async with httpx.AsyncClient(timeout=15) as client:
++                response = await client.post(
++                    settings.twitch_token_url,
++                    data={
++                        "client_id": settings.twitch_client_id,
++                        "client_secret": settings.twitch_client_secret,
++                        "grant_type": "client_credentials",
++                    },
++                )
++            if response.status_code >= 400:
++                raise RuntimeError(
++                    f"Twitch app token request failed HTTP {response.status_code}: {response.text[:500]}"
++                )
++            payload = response.json()
++            token = str(payload.get("access_token") or "")
++            if not token:
++                raise RuntimeError("Twitch app token response did not contain access_token")
++            expires_in = max(120, int(payload.get("expires_in") or 3600))
++            metadata_app_token.clear()
++            metadata_app_token.update({"access_token": token, "expires_at": now + timedelta(seconds=expires_in)})
++            return token
++        except Exception as exc:
++            app_error = exc
++            logger.warning("Twitch app metadata token unavailable; trying stored user token: %s", exc)
++
++    try:
++        return (await load_runtime_twitch_auth()).access_token
++    except Exception as exc:
++        if app_error is not None:
++            raise RuntimeError(f"{app_error}; stored user token fallback unavailable: {exc}") from exc
++        raise
++
++
++def metadata_helix_headers(access_token: str) -> dict[str, str]:
++    return {
++        "Authorization": f"Bearer {access_token}",
++        "Client-Id": settings.twitch_client_id,
++        "Accept": "application/json",
++    }
++
+ def helix_headers(auth: TwitchRuntimeAuth) -> dict[str, str]:
+     return {
+         "Authorization": f"Bearer {auth.access_token}",
+@@ -1185,12 +1244,37 @@ async def health_ready() -> dict[str, str]:
+ @app.post("/internal/v1/metadata/resolve", dependencies=[Depends(require_internal_token)])
+ async def resolve_twitch_metadata(payload: MetadataResolveRequest) -> dict:
+     try:
+-        auth = await load_runtime_twitch_auth()
++        metadata_token = await load_metadata_access_token()
++        metadata_headers = metadata_helix_headers(metadata_token)
+         if payload.mode == "live":
+             if not payload.channel_login:
+                 raise HTTPException(400, "channel_login is required for LIVE metadata resolution")
+-            broadcaster = await resolve_broadcaster(auth, payload.channel_login)
+-            stream = await resolve_live_stream(auth, str(broadcaster.get("id") or ""))
++            async with httpx.AsyncClient(timeout=15) as client:
++                user_response = await client.get(
++                    f"{settings.twitch_api_base_url}/users",
++                    params={"login": payload.channel_login},
++                    headers=metadata_headers,
++                )
++            if user_response.status_code >= 400:
++                raise RuntimeError(
++                    f"Twitch Get Users failed HTTP {user_response.status_code}: {user_response.text[:500]}"
++                )
++            users = user_response.json().get("data") or []
++            if not users:
++                raise RuntimeError(f"Twitch channel {payload.channel_login!r} was not found")
++            broadcaster = users[0]
++            async with httpx.AsyncClient(timeout=15) as client:
++                stream_response = await client.get(
++                    f"{settings.twitch_api_base_url}/streams",
++                    params={"user_id": str(broadcaster.get("id") or "")},
++                    headers=metadata_headers,
++                )
++            if stream_response.status_code >= 400:
++                raise RuntimeError(
++                    f"Twitch Get Streams failed HTTP {stream_response.status_code}: {stream_response.text[:500]}"
++                )
++            streams = stream_response.json().get("data") or []
++            stream = streams[0] if streams else None
+             if stream is None:
+                 raise HTTPException(409, "Twitch channel is not live")
+             return {
+@@ -1212,7 +1296,7 @@ async def resolve_twitch_metadata(payload: MetadataResolveRequest) -> dict:
+             response = await client.get(
+                 f"{settings.twitch_api_base_url}/videos",
+                 params={"id": payload.video_id},
+-                headers=helix_headers(auth),
++                headers=metadata_headers,
+             )
+         if response.status_code >= 400:
+             raise RuntimeError(f"Twitch Get Videos failed HTTP {response.status_code}: {response.text[:500]}")
+diff --git a/apps/video_recorder/Dockerfile b/apps/video_recorder/Dockerfile
+new file mode 100644
+index 0000000..66a3b7a
+--- /dev/null
++++ b/apps/video_recorder/Dockerfile
+@@ -0,0 +1,13 @@
++FROM python:3.12-slim
++WORKDIR /opt/streamhub
++ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
++    && rm -rf /var/lib/apt/lists/*
++COPY requirements.txt ./requirements.txt
++RUN pip install --no-cache-dir -r requirements.txt "streamlink>=7,<9"
++COPY packages/python_common ./packages/python_common
++RUN pip install --no-cache-dir ./packages/python_common
++COPY apps/video_recorder ./apps/video_recorder
++WORKDIR /opt/streamhub/apps/video_recorder
++CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8003"]
+diff --git a/apps/video_recorder/app/__init__.py b/apps/video_recorder/app/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/apps/video_recorder/app/commands.py b/apps/video_recorder/app/commands.py
+new file mode 100644
+index 0000000..063ea29
+--- /dev/null
++++ b/apps/video_recorder/app/commands.py
+@@ -0,0 +1,86 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++
++def build_streamlink_command(
++    *,
++    media_type: str,
++    source_url: str,
++    quality: str,
++    resume_source_offset_ms: int | None,
++    stream_timeout_seconds: int,
++) -> list[str]:
++    command = [
++        "streamlink",
++        "--stdout",
++        "--retry-streams",
++        "5",
++        "--retry-max",
++        "0",
++        "--retry-open",
++        "10",
++        "--stream-segment-attempts",
++        "10",
++        "--stream-segment-threads",
++        "3",
++        "--stream-timeout",
++        str(stream_timeout_seconds),
++    ]
++    if media_type == "vod" and resume_source_offset_ms:
++        command.extend(["--hls-start-offset", f"{resume_source_offset_ms / 1000:.3f}"])
++    command.extend([source_url, quality])
++    return command
++
++
++def build_ffmpeg_command(
++    *,
++    segments_dir: Path,
++    runs_dir: Path,
++    run_no: int,
++    start_number: int,
++    segment_seconds: int,
++) -> list[str]:
++    return [
++        "ffmpeg",
++        "-hide_banner",
++        "-loglevel",
++        "warning",
++        "-nostdin",
++        "-fflags",
++        "+genpts",
++        "-i",
++        "pipe:0",
++        "-map",
++        "0:v:0?",
++        "-map",
++        "0:a:0?",
++        "-c",
++        "copy",
++        "-f",
++        "hls",
++        "-hls_time",
++        str(segment_seconds),
++        "-hls_list_size",
++        "0",
++        "-start_number",
++        str(start_number),
++        "-hls_flags",
++        "temp_file+program_date_time+independent_segments+discont_start",
++        "-hls_segment_filename",
++        str(segments_dir / "seg_%06d.ts"),
++        str(runs_dir / f"run_{run_no:06d}.m3u8"),
++    ]
++
++
++def segment_no_from_name(name: str) -> int | None:
++    value = name
++    if value.endswith(".tmp"):
++        value = value[:-4]
++    if not value.startswith("seg_") or not value.endswith(".ts"):
++        return None
++    try:
++        number = int(value[4:-3])
++    except ValueError:
++        return None
++    return number if number >= 0 else None
+diff --git a/apps/video_recorder/app/main.py b/apps/video_recorder/app/main.py
+new file mode 100644
+index 0000000..5029ece
+--- /dev/null
++++ b/apps/video_recorder/app/main.py
+@@ -0,0 +1,699 @@
++from __future__ import annotations
++
++import asyncio
++import logging
++import os
++import shutil
++import subprocess
++import uuid
++from contextlib import asynccontextmanager
++from datetime import UTC, datetime
++from pathlib import Path
++from typing import Literal
++
++from fastapi import Depends, FastAPI, HTTPException
++from pydantic import BaseModel
++from sqlalchemy import func, select
++
++from streamhub_common.db import SessionLocal
++from streamhub_common.logging import configure_logging
++from streamhub_common.models import VideoGap, VideoRun, VideoSegment, VideoSession
++from streamhub_common.security import require_internal_token
++from streamhub_common.settings import get_settings
++
++from app.commands import build_ffmpeg_command, build_streamlink_command, segment_no_from_name
++
++settings = get_settings()
++configure_logging(settings.log_level)
++logger = logging.getLogger("streamhub.video_recorder")
++
++ACTIVE_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting"})
++
++
++def utcnow_naive() -> datetime:
++    return datetime.now(UTC).replace(tzinfo=None)
++
++
++def safe_session_root(session_id: uuid.UUID) -> Path:
++    root = Path(settings.video_spool_root).resolve()
++    candidate = (root / str(session_id)).resolve()
++    candidate.relative_to(root)
++    return candidate
++
++
++def ensure_spool_dirs(session_id: uuid.UUID) -> tuple[Path, Path, Path]:
++    root = safe_session_root(session_id)
++    segments = root / "segments"
++    runs = root / "runs"
++    logs = root / "logs"
++    for path in (segments, runs, logs):
++        path.mkdir(parents=True, exist_ok=True)
++    return segments, runs, logs
++
++
++class VideoStartRequest(BaseModel):
++    session_id: uuid.UUID
++    event_id: uuid.UUID
++    media_type: Literal["live", "vod"]
++    source_url: str
++    quality: str = "best"
++    source_duration_ms: int | None = None
++
++
++class StopRequest(BaseModel):
++    reason: str = "user_stop"
++
++
++async def probe_duration_ms(path: Path) -> int:
++    proc = await asyncio.create_subprocess_exec(
++        "ffprobe",
++        "-v",
++        "error",
++        "-show_entries",
++        "format=duration",
++        "-of",
++        "default=noprint_wrappers=1:nokey=1",
++        str(path),
++        stdout=asyncio.subprocess.PIPE,
++        stderr=asyncio.subprocess.PIPE,
++    )
++    stdout, stderr = await proc.communicate()
++    if proc.returncode != 0:
++        raise RuntimeError(f"ffprobe failed for {path.name}: {stderr.decode(errors='replace')[:300]}")
++    try:
++        seconds = float(stdout.decode().strip())
++    except ValueError as exc:
++        raise RuntimeError(f"ffprobe returned invalid duration for {path.name}") from exc
++    return max(1, int(round(seconds * 1000)))
++
++
++async def max_segment_no(session_id: uuid.UUID) -> int:
++    async with SessionLocal() as db:
++        value = await db.scalar(
++            select(func.max(VideoSegment.segment_no)).where(VideoSegment.video_session_id == session_id)
++        )
++    db_max = int(value or 0)
++    segments_dir, _runs_dir, _logs_dir = ensure_spool_dirs(session_id)
++    spool_max = 0
++    for path in segments_dir.glob("seg_*.ts*"):
++        number = segment_no_from_name(path.name)
++        if number is not None:
++            spool_max = max(spool_max, number)
++    return max(db_max, spool_max)
++
++
++async def next_run_no(session_id: uuid.UUID) -> int:
++    async with SessionLocal() as db:
++        value = await db.scalar(select(func.max(VideoRun.run_no)).where(VideoRun.video_session_id == session_id))
++        return int(value or 0) + 1
++
++
++async def build_spool_playlist(session_id: uuid.UUID, *, finished: bool = False) -> None:
++    root = safe_session_root(session_id)
++    async with SessionLocal() as db:
++        rows = (
++            await db.execute(
++                select(VideoSegment, VideoRun.run_no)
++                .join(VideoRun, VideoRun.id == VideoSegment.video_run_id)
++                .where(VideoSegment.video_session_id == session_id)
++                .order_by(VideoSegment.segment_no)
++            )
++        ).all()
++    if not rows:
++        return
++
++    target_duration = max(1, max((segment.duration_ms + 999) // 1000 for segment, _run_no in rows))
++    lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{target_duration}", "#EXT-X-MEDIA-SEQUENCE:0"]
++    previous_run = None
++    for segment, run_no in rows:
++        if previous_run is not None and run_no != previous_run:
++            lines.append("#EXT-X-DISCONTINUITY")
++        lines.append(f"#EXTINF:{segment.duration_ms / 1000:.3f},")
++        lines.append(f"segments/{segment.file_name}")
++        previous_run = run_no
++    if finished:
++        lines.append("#EXT-X-ENDLIST")
++
++    tmp = root / "recording.m3u8.tmp"
++    final = root / "recording.m3u8"
++    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    os.replace(tmp, final)
++
++
++def playlist_segment_numbers(session_id: uuid.UUID, run_no: int) -> set[int]:
++    _segments_dir, runs_dir, _logs_dir = ensure_spool_dirs(session_id)
++    playlist = runs_dir / f"run_{run_no:06d}.m3u8"
++    if not playlist.exists():
++        return set()
++    result: set[int] = set()
++    try:
++        lines = playlist.read_text(encoding="utf-8", errors="replace").splitlines()
++    except OSError:
++        return set()
++    for line in lines:
++        value = line.strip()
++        if not value or value.startswith("#"):
++            continue
++        name = Path(value).name
++        if not name.startswith("seg_") or not name.endswith(".ts"):
++            continue
++        try:
++            result.add(int(name[4:-3]))
++        except ValueError:
++            continue
++    return result
++
++
++async def index_closed_segments(session_id: uuid.UUID, run_id: int, run_no: int) -> int:
++    segments_dir, _runs_dir, _logs_dir = ensure_spool_dirs(session_id)
++    allowed_segment_numbers = playlist_segment_numbers(session_id, run_no)
++    if not allowed_segment_numbers:
++        return 0
++    async with SessionLocal() as db:
++        existing = set(
++            (
++                await db.execute(
++                    select(VideoSegment.segment_no).where(VideoSegment.video_session_id == session_id)
++                )
++            ).scalars().all()
++        )
++        session = await db.get(VideoSession, session_id)
++        run = await db.get(VideoRun, run_id)
++        if session is None or run is None:
++            return 0
++
++        created = 0
++        timeline_cursor = int(session.coverage_end_ms or 0)
++        for path in sorted(segments_dir.glob("seg_*.ts")):
++            try:
++                segment_no = int(path.stem.split("_")[-1])
++            except ValueError:
++                continue
++            if segment_no not in allowed_segment_numbers:
++                continue
++            if segment_no in existing or path.with_suffix(path.suffix + ".tmp").exists():
++                continue
++            try:
++                size = path.stat().st_size
++            except FileNotFoundError:
++                continue
++            if size <= 0:
++                continue
++            duration_ms = await probe_duration_ms(path)
++            source_start = timeline_cursor if session.metadata_json and session.metadata_json.get("media_type") == "vod" else None
++            source_end = timeline_cursor + duration_ms if source_start is not None else None
++            row = VideoSegment(
++                video_session_id=session_id,
++                video_run_id=run_id,
++                segment_no=segment_no,
++                file_name=path.name,
++                relative_path=f"segments/{path.name}",
++                timeline_start_ms=timeline_cursor,
++                timeline_end_ms=timeline_cursor + duration_ms,
++                source_media_start_ms=source_start,
++                source_media_end_ms=source_end,
++                duration_ms=duration_ms,
++                bytes=size,
++                storage_state="spool",
++                integrity_state="size_verified",
++                closed_at_utc=utcnow_naive(),
++            )
++            db.add(row)
++            timeline_cursor += duration_ms
++            existing.add(segment_no)
++            created += 1
++            run.first_segment_no = segment_no if run.first_segment_no is None else min(run.first_segment_no, segment_no)
++            run.last_segment_no = segment_no if run.last_segment_no is None else max(run.last_segment_no, segment_no)
++
++        if created:
++            session.duration_recorded_ms = timeline_cursor
++            session.coverage_start_ms = 0 if session.coverage_start_ms is None else session.coverage_start_ms
++            session.coverage_end_ms = timeline_cursor
++            session.last_activity_at_utc = utcnow_naive()
++            await db.commit()
++        else:
++            await db.rollback()
++
++    if created:
++        await build_spool_playlist(session_id)
++    return created
++
++
++
++
++
++class RecorderWorker:
++    def __init__(self, request: VideoStartRequest):
++        self.request = request
++        self.stop_event = asyncio.Event()
++        self.task: asyncio.Task | None = None
++        self.streamlink_proc: subprocess.Popen | None = None
++        self.ffmpeg_proc: subprocess.Popen | None = None
++        self.stop_reason = "user_stop"
++
++    def start(self) -> None:
++        if self.task and not self.task.done():
++            return
++        self.task = asyncio.create_task(self.run(), name=f"video-{self.request.session_id}")
++
++    async def request_stop(self, reason: str) -> None:
++        self.stop_reason = reason
++        self.stop_event.set()
++        if self.streamlink_proc and self.streamlink_proc.poll() is None:
++            self.streamlink_proc.terminate()
++        if self.task:
++            try:
++                await asyncio.wait_for(asyncio.shield(self.task), timeout=settings.video_stop_timeout_seconds)
++            except asyncio.TimeoutError:
++                await self.force_stop()
++                try:
++                    await asyncio.wait_for(asyncio.shield(self.task), timeout=5)
++                except asyncio.TimeoutError:
++                    self.task.cancel()
++
++    async def force_stop(self) -> None:
++        for proc in (self.streamlink_proc, self.ffmpeg_proc):
++            if proc and proc.poll() is None:
++                proc.kill()
++
++    async def reconcile_previous_runs(self) -> int | None:
++        async with SessionLocal() as db:
++            runs = (
++                await db.execute(
++                    select(VideoRun)
++                    .where(VideoRun.video_session_id == self.request.session_id)
++                    .order_by(VideoRun.run_no)
++                )
++            ).scalars().all()
++        for run in runs:
++            await index_closed_segments(self.request.session_id, run.id, run.run_no)
++        async with SessionLocal() as db:
++            stale = (
++                await db.execute(
++                    select(VideoRun).where(
++                        VideoRun.video_session_id == self.request.session_id,
++                        VideoRun.status.in_({"starting", "running"}),
++                    )
++                )
++            ).scalars().all()
++            for run in stale:
++                run.status = "closed"
++                run.ended_at_utc = utcnow_naive()
++                run.close_reason = "service_restart"
++            if stale:
++                await db.commit()
++        return max((run.run_no for run in runs), default=None)
++
++    async def create_run(self) -> VideoRun:
++        run_no = await next_run_no(self.request.session_id)
++        segment_start = await max_segment_no(self.request.session_id) + 1
++        async with SessionLocal() as db:
++            session = await db.get(VideoSession, self.request.session_id)
++            if session is None:
++                raise RuntimeError("video session disappeared")
++            resume_offset = int(session.coverage_end_ms or 0) if self.request.media_type == "vod" else None
++            run = VideoRun(
++                video_session_id=self.request.session_id,
++                run_no=run_no,
++                status="starting",
++                started_at_utc=utcnow_naive(),
++                resume_source_offset_ms=resume_offset,
++                first_segment_no=segment_start,
++            )
++            db.add(run)
++            await db.flush()
++            run_id = run.id
++            await db.commit()
++            await db.refresh(run)
++            assert run.id == run_id
++            return run
++
++    async def launch(self, run: VideoRun) -> tuple[subprocess.Popen, subprocess.Popen, object]:
++        segments_dir, runs_dir, logs_dir = ensure_spool_dirs(self.request.session_id)
++        start_number = await max_segment_no(self.request.session_id) + 1
++        log_handle = open(logs_dir / "recorder.log", "ab", buffering=0)
++
++        streamlink_cmd = build_streamlink_command(
++            media_type=self.request.media_type,
++            source_url=self.request.source_url,
++            quality=self.request.quality or settings.video_stream_quality,
++            resume_source_offset_ms=run.resume_source_offset_ms,
++            stream_timeout_seconds=settings.video_stream_timeout_seconds,
++        )
++        ffmpeg_cmd = build_ffmpeg_command(
++            segments_dir=segments_dir,
++            runs_dir=runs_dir,
++            run_no=run.run_no,
++            start_number=start_number,
++            segment_seconds=settings.video_segment_seconds,
++        )
++        log_handle.write(
++            (
++                f"\n[{datetime.now(UTC).isoformat()}] run={run.run_no} start_segment={start_number} "
++                f"media={self.request.media_type} resume_ms={run.resume_source_offset_ms or 0}\n"
++            ).encode("utf-8")
++        )
++        streamlink_proc = subprocess.Popen(
++            streamlink_cmd,
++            stdout=subprocess.PIPE,
++            stderr=log_handle,
++            bufsize=0,
++        )
++        assert streamlink_proc.stdout is not None
++        ffmpeg_proc = subprocess.Popen(
++            ffmpeg_cmd,
++            stdin=streamlink_proc.stdout,
++            stdout=subprocess.DEVNULL,
++            stderr=log_handle,
++        )
++        # ffmpeg owns the read side now; closing the parent's duplicate lets EOF
++        # propagate when Streamlink exits.
++        streamlink_proc.stdout.close()
++        self.streamlink_proc = streamlink_proc
++        self.ffmpeg_proc = ffmpeg_proc
++        return streamlink_proc, ffmpeg_proc, log_handle
++
++    async def close_pipeline(self) -> None:
++        if self.streamlink_proc and self.streamlink_proc.poll() is None:
++            self.streamlink_proc.terminate()
++            try:
++                await asyncio.to_thread(self.streamlink_proc.wait, 5)
++            except subprocess.TimeoutExpired:
++                self.streamlink_proc.kill()
++                await asyncio.to_thread(self.streamlink_proc.wait)
++        if self.ffmpeg_proc and self.ffmpeg_proc.poll() is None:
++            try:
++                await asyncio.to_thread(self.ffmpeg_proc.wait, 8)
++            except subprocess.TimeoutExpired:
++                self.ffmpeg_proc.terminate()
++                try:
++                    await asyncio.to_thread(self.ffmpeg_proc.wait, 5)
++                except subprocess.TimeoutExpired:
++                    self.ffmpeg_proc.kill()
++                    await asyncio.to_thread(self.ffmpeg_proc.wait)
++
++    async def update_run_closed(self, run_id: int, *, close_reason: str, last_error: str | None = None) -> None:
++        async with SessionLocal() as db:
++            run = await db.get(VideoRun, run_id)
++            if run is None:
++                return
++            run.status = "failed" if last_error else "closed"
++            run.ended_at_utc = utcnow_naive()
++            run.streamlink_exit_code = self.streamlink_proc.returncode if self.streamlink_proc else None
++            run.ffmpeg_exit_code = self.ffmpeg_proc.returncode if self.ffmpeg_proc else None
++            run.close_reason = close_reason
++            run.last_error = last_error
++            await db.commit()
++
++    async def mark_session(self, **values) -> None:
++        async with SessionLocal() as db:
++            session = await db.get(VideoSession, self.request.session_id)
++            if session is None:
++                return
++            for key, value in values.items():
++                setattr(session, key, value)
++            session.last_activity_at_utc = utcnow_naive()
++            await db.commit()
++
++    async def add_live_gap(self, previous_run_no: int, before_run_no: int) -> None:
++        async with SessionLocal() as db:
++            session = await db.get(VideoSession, self.request.session_id)
++            if session is None:
++                return
++            session.gap_count = int(session.gap_count or 0) + 1
++            db.add(
++                VideoGap(
++                    video_session_id=self.request.session_id,
++                    after_run_no=previous_run_no,
++                    before_run_no=before_run_no,
++                    started_at_utc=utcnow_naive(),
++                    reason="disconnect",
++                    resolved=False,
++                )
++            )
++            await db.commit()
++
++    async def finalize_user_stop(self) -> None:
++        async with SessionLocal() as db:
++            session = await db.get(VideoSession, self.request.session_id)
++            if session is None:
++                return
++            session.status = "completed"
++            session.ended_at_utc = utcnow_naive()
++            session.stop_reason = self.stop_reason
++            if self.request.media_type == "live" and not session.gap_count and not session.last_error:
++                session.completeness_status = "complete"
++                session.required_end_ms = session.coverage_end_ms
++            else:
++                session.completeness_status = "incomplete"
++            session.last_activity_at_utc = utcnow_naive()
++            await db.commit()
++        await build_spool_playlist(self.request.session_id, finished=True)
++
++    async def finalize_vod_eof(self) -> None:
++        async with SessionLocal() as db:
++            session = await db.get(VideoSession, self.request.session_id)
++            if session is None:
++                return
++            source_duration = self.request.source_duration_ms or session.required_end_ms
++            coverage = int(session.coverage_end_ms or 0)
++            tolerance = max(5000, settings.video_segment_seconds * 1500)
++            verified = source_duration is None or coverage >= max(0, int(source_duration) - tolerance)
++            session.status = "completed"
++            session.ended_at_utc = utcnow_naive()
++            session.stop_reason = "vod_eof"
++            session.completeness_status = "complete" if verified and not session.gap_count else "incomplete"
++            session.last_error = None if verified else f"VOD EOF coverage {coverage}ms is below source duration {source_duration}ms"
++            session.last_activity_at_utc = utcnow_naive()
++            await db.commit()
++        await build_spool_playlist(self.request.session_id, finished=True)
++
++    async def run(self) -> None:
++        previous_run_no = await self.reconcile_previous_runs()
++        await self.mark_session(status="arming", completeness_status="collecting", last_error=None)
++        try:
++            while not self.stop_event.is_set():
++                run = await self.create_run()
++                if self.request.media_type == "live" and previous_run_no is not None:
++                    await self.add_live_gap(previous_run_no, run.run_no)
++                previous_run_no = run.run_no
++                try:
++                    streamlink_proc, ffmpeg_proc, log_handle = await self.launch(run)
++                except Exception as exc:
++                    error = f"recorder launch failed: {exc}"
++                    await self.update_run_closed(run.id, close_reason="launch_error", last_error=error)
++                    await self.mark_session(status="reconnecting", last_error=error)
++                    if self.stop_event.is_set():
++                        if self.stop_reason == "service_shutdown":
++                            await self.mark_session(status="reconnecting", last_error=None)
++                        else:
++                            await self.finalize_user_stop()
++                        break
++                    try:
++                        await asyncio.wait_for(self.stop_event.wait(), timeout=settings.video_reconnect_seconds)
++                    except asyncio.TimeoutError:
++                        continue
++                    if self.stop_reason == "service_shutdown":
++                        await self.mark_session(status="reconnecting", last_error=None)
++                    else:
++                        await self.finalize_user_stop()
++                    break
++
++                async with SessionLocal() as db:
++                    db_run = await db.get(VideoRun, run.id)
++                    if db_run:
++                        db_run.status = "running"
++                    session = await db.get(VideoSession, self.request.session_id)
++                    if session:
++                        session.status = "recording"
++                        session.last_error = None
++                        session.last_activity_at_utc = utcnow_naive()
++                    await db.commit()
++
++                try:
++                    while not self.stop_event.is_set():
++                        await index_closed_segments(self.request.session_id, run.id, run.run_no)
++                        if streamlink_proc.poll() is not None or ffmpeg_proc.poll() is not None:
++                            break
++                        await asyncio.sleep(1.0)
++                    await self.close_pipeline()
++                    await index_closed_segments(self.request.session_id, run.id, run.run_no)
++                finally:
++                    try:
++                        log_handle.close()
++                    except Exception:
++                        pass
++
++                if self.stop_event.is_set():
++                    await self.update_run_closed(run.id, close_reason=self.stop_reason)
++                    if self.stop_reason == "service_shutdown":
++                        await self.mark_session(status="reconnecting", last_error=None)
++                    else:
++                        await self.finalize_user_stop()
++                    break
++
++                clean_eof = streamlink_proc.returncode == 0 and ffmpeg_proc.returncode == 0
++                if self.request.media_type == "vod" and clean_eof:
++                    await self.update_run_closed(run.id, close_reason="vod_eof")
++                    await self.finalize_vod_eof()
++                    break
++
++                error = (
++                    f"pipeline exited streamlink={streamlink_proc.returncode} ffmpeg={ffmpeg_proc.returncode}; "
++                    f"retry in {settings.video_reconnect_seconds:g}s"
++                )
++                await self.update_run_closed(run.id, close_reason="disconnect", last_error=error)
++                await self.mark_session(status="reconnecting", last_error=error)
++                try:
++                    await asyncio.wait_for(self.stop_event.wait(), timeout=settings.video_reconnect_seconds)
++                except asyncio.TimeoutError:
++                    continue
++                if self.stop_reason == "service_shutdown":
++                    await self.mark_session(status="reconnecting", last_error=None)
++                else:
++                    await self.finalize_user_stop()
++                break
++        except asyncio.CancelledError:
++            await self.force_stop()
++            raise
++        except Exception as exc:
++            logger.exception("video recorder worker failed session=%s", self.request.session_id)
++            await self.mark_session(status="failed", completeness_status="failed", last_error=str(exc), ended_at_utc=utcnow_naive())
++        finally:
++            self.streamlink_proc = None
++            self.ffmpeg_proc = None
++            workers.pop(self.request.session_id, None)
++
++
++workers: dict[uuid.UUID, RecorderWorker] = {}
++
++
++async def start_worker(request: VideoStartRequest) -> RecorderWorker:
++    existing = workers.get(request.session_id)
++    if existing and existing.task and not existing.task.done():
++        return existing
++    worker = RecorderWorker(request)
++    workers[request.session_id] = worker
++    worker.start()
++    return worker
++
++
++async def recover_active_sessions() -> None:
++    await asyncio.sleep(0.5)
++    async with SessionLocal() as db:
++        rows = (
++            await db.execute(
++                select(VideoSession).where(VideoSession.status.in_(ACTIVE_VIDEO_STATUSES), VideoSession.deleted_at_utc.is_(None))
++            )
++        ).scalars().all()
++    for row in rows:
++        media_type = (row.metadata_json or {}).get("media_type")
++        if media_type not in {"live", "vod"}:
++            logger.error("cannot recover video session %s: media_type missing", row.id)
++            await RecorderWorker(
++                VideoStartRequest(
++                    session_id=row.id,
++                    event_id=row.event_id,
++                    media_type="vod",
++                    source_url=row.source_url,
++                    quality=row.quality,
++                )
++            ).mark_session(status="failed", completeness_status="failed", last_error="recovery metadata missing media_type")
++            continue
++        await start_worker(
++            VideoStartRequest(
++                session_id=row.id,
++                event_id=row.event_id,
++                media_type=media_type,
++                source_url=row.source_url,
++                quality=row.quality,
++                source_duration_ms=row.required_end_ms,
++            )
++        )
++        logger.info("recovered video session %s media=%s", row.id, media_type)
++
++
++@asynccontextmanager
++async def lifespan(_app: FastAPI):
++    Path(settings.video_spool_root).mkdir(parents=True, exist_ok=True)
++    recovery = asyncio.create_task(recover_active_sessions())
++    try:
++        yield
++    finally:
++        recovery.cancel()
++        for worker in list(workers.values()):
++            try:
++                await worker.request_stop("service_shutdown")
++            except Exception:
++                logger.exception("failed stopping video worker session=%s", worker.request.session_id)
++
++
++app = FastAPI(title="StreamHub Video Recorder", version="0.1.0", lifespan=lifespan)
++
++
++@app.get("/health/live")
++async def health_live() -> dict[str, str]:
++    return {"status": "ok"}
++
++
++@app.get("/health/ready")
++async def health_ready() -> dict:
++    missing = [name for name in ("streamlink", "ffmpeg", "ffprobe") if shutil.which(name) is None]
++    root = Path(settings.video_spool_root)
++    root.mkdir(parents=True, exist_ok=True)
++    writable = os.access(root, os.W_OK)
++    if missing or not writable:
++        raise HTTPException(503, detail={"missing": missing, "spool_writable": writable})
++    try:
++        async with SessionLocal() as db:
++            await db.scalar(select(func.count()).select_from(VideoSession))
++    except Exception as exc:
++        raise HTTPException(503, detail=f"database unavailable: {exc}") from exc
++    return {"status": "ready", "spool_root": str(root)}
++
++
++@app.post("/internal/v1/video-sessions", dependencies=[Depends(require_internal_token)])
++async def start_video_session(payload: VideoStartRequest) -> dict:
++    async with SessionLocal() as db:
++        row = await db.get(VideoSession, payload.session_id)
++        if row is None:
++            raise HTTPException(404, "video session not found")
++        if row.event_id != payload.event_id:
++            raise HTTPException(409, "video session event mismatch")
++        if row.status not in {"new", "arming", "reconnecting"}:
++            if row.status == "recording":
++                return {"status": "already_active", "session_id": str(row.id)}
++            raise HTTPException(409, f"cannot start video session in state {row.status}")
++    await start_worker(payload)
++    return {"status": "started", "session_id": str(payload.session_id)}
++
++
++@app.post("/internal/v1/video-sessions/{session_id}/stop", dependencies=[Depends(require_internal_token)])
++async def stop_video_session(session_id: uuid.UUID, payload: StopRequest) -> dict:
++    worker = workers.get(session_id)
++    if worker:
++        await worker.request_stop(payload.reason)
++        async with SessionLocal() as db:
++            row = await db.get(VideoSession, session_id)
++            if row is not None and row.status in ACTIVE_VIDEO_STATUSES:
++                row.status = "completed"
++                row.completeness_status = "incomplete"
++                row.stop_reason = payload.reason
++                row.ended_at_utc = utcnow_naive()
++                row.last_activity_at_utc = utcnow_naive()
++                await db.commit()
++        return {"status": "stopped", "session_id": str(session_id)}
++
++    async with SessionLocal() as db:
++        row = await db.get(VideoSession, session_id)
++        if row is None:
++            raise HTTPException(404, "video session not found")
++        if row.status in {"completed", "failed", "soft_deleted"}:
++            return {"status": row.status, "session_id": str(session_id)}
++        row.status = "completed"
++        row.completeness_status = "incomplete"
++        row.stop_reason = payload.reason
++        row.ended_at_utc = utcnow_naive()
++        row.last_activity_at_utc = utcnow_naive()
++        await db.commit()
++    return {"status": "stopped_without_runtime", "session_id": str(session_id)}
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index c61bb4a..96252e8 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -18,6 +18,65 @@ type Session = {
+   progress_percent?: number | null;
+ };
+ 
++type VideoSession = {
++  id: string;
++  event_id: string;
++  status: string;
++  completeness_status: string;
++  quality: string;
++  recorder_mode: string;
++  source_url: string;
++  recording_started_at_utc?: string | null;
++  ended_at_utc?: string | null;
++  duration_recorded_ms: number;
++  required_start_ms?: number | null;
++  required_end_ms?: number | null;
++  coverage_start_ms?: number | null;
++  coverage_end_ms?: number | null;
++  gap_count: number;
++  last_error?: string | null;
++  last_activity_at_utc?: string | null;
++  stop_reason?: string | null;
++  metadata?: { media_type?: "live" | "vod"; channel_login?: string | null } | null;
++  created_at: string;
++  updated_at: string;
++  progress_percent?: number | null;
++  segment_count?: number;
++  bytes?: number;
++};
++
++type VideoRun = {
++  id: number;
++  run_no: number;
++  status: string;
++  started_at_utc: string;
++  ended_at_utc?: string | null;
++  resume_source_offset_ms?: number | null;
++  first_segment_no?: number | null;
++  last_segment_no?: number | null;
++  streamlink_exit_code?: number | null;
++  ffmpeg_exit_code?: number | null;
++  close_reason?: string | null;
++  last_error?: string | null;
++};
++
++type VideoSegment = {
++  id: number;
++  segment_no: number;
++  video_run_id: number;
++  file_name: string;
++  relative_path: string;
++  timeline_start_ms: number;
++  timeline_end_ms: number;
++  source_media_start_ms?: number | null;
++  source_media_end_ms?: number | null;
++  duration_ms: number;
++  bytes: number;
++  storage_state: string;
++  integrity_state: string;
++  closed_at_utc: string;
++};
++
+ type MediaEvent = {
+   id: string;
+   platform: string;
+@@ -30,8 +89,11 @@ type MediaEvent = {
+   source_duration_ms?: number | null;
+   created_at: string;
+   chat_sessions: Session[];
++  video_sessions: VideoSession[];
+   chat_sessions_count: number;
++  video_sessions_count: number;
+   active_chat_sessions_count: number;
++  active_video_sessions_count: number;
+   has_chat: boolean;
+   has_video: boolean;
+   metadata?: { identity_state?: string } | null;
+@@ -55,12 +117,25 @@ type CaptureProgress = {
+   percent?: number | null;
+ };
+ 
++type VideoCaptureProgress = {
++  session_id: string;
++  status: string;
++  completeness_status: string;
++  duration_recorded_ms: number;
++  coverage_end_ms?: number | null;
++  required_end_ms?: number | null;
++  gap_count: number;
++  last_error?: string | null;
++  percent?: number | null;
++};
++
+ type ViewMode = "events" | "trash";
+ 
+ const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
+ const PROGRESS_POLL_MS = 5000;
+ const CAPTURE_BUSY_STATUSES = new Set(["arming", "recording", "paused", "reconciling"]);
+ const CAPTURE_BUSY_COMPLETENESS = new Set(["collecting", "verifying"]);
++const VIDEO_BUSY_STATUSES = new Set(["arming", "recording", "reconnecting"]);
+ 
+ function fmtMs(ms?: number | null) {
+   if (ms == null) return "—";
+@@ -71,10 +146,26 @@ function fmtMs(ms?: number | null) {
+   return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
+ }
+ 
++function fmtBytes(bytes?: number | null) {
++  if (bytes == null) return "—";
++  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
++  let value = Math.max(0, bytes);
++  let index = 0;
++  while (value >= 1024 && index < units.length - 1) {
++    value /= 1024;
++    index += 1;
++  }
++  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
++}
++
+ function isCaptureBusy(session: Session) {
+   return CAPTURE_BUSY_STATUSES.has(session.status) || CAPTURE_BUSY_COMPLETENESS.has(session.completeness_status);
+ }
+ 
++function isVideoBusy(session: VideoSession) {
++  return VIDEO_BUSY_STATUSES.has(session.status);
++}
++
+ function localProgressPercent(session: Session): number | null {
+   if (session.progress_percent != null) return session.progress_percent;
+   if (session.completeness_status === "complete" || session.status === "completed") return 100;
+@@ -83,26 +174,53 @@ function localProgressPercent(session: Session): number | null {
+   return Math.min(99.9, Math.round((covered / session.source_duration_ms) * 1000) / 10);
+ }
+ 
++function localVideoProgressPercent(session: VideoSession): number | null {
++  if (session.progress_percent != null) return session.progress_percent;
++  if (session.completeness_status === "complete") return 100;
++  if (session.metadata?.media_type !== "vod" || !session.required_end_ms || session.required_end_ms <= 0) return null;
++  const covered = Math.max(0, Math.min(session.coverage_end_ms || 0, session.required_end_ms));
++  return Math.min(99.9, Math.round((covered / session.required_end_ms) * 1000) / 10);
++}
++
+ function ProgressBar({ session, progress }: { session: Session; progress?: CaptureProgress }) {
+   const percent = progress?.percent ?? localProgressPercent(session);
+   const status = progress?.status || session.status;
+   if (!isCaptureBusy({ ...session, status, completeness_status: progress?.completeness_status || session.completeness_status })) {
+     return null;
+   }
+-
+   if (percent == null) {
+     return (
+       <div className="capture-progress" aria-label="Сбор идет, процент недоступен">
+-        <div className="capture-progress-head"><span>Сбор идет</span><strong>LIVE</strong></div>
++        <div className="capture-progress-head"><span>Chat сбор</span><strong>LIVE</strong></div>
+         <div className="progress-track indeterminate"><div className="progress-fill" /></div>
+       </div>
+     );
+   }
++  const safePercent = Math.max(0, Math.min(100, percent));
++  return (
++    <div className="capture-progress" aria-label={`Прогресс Chat ${safePercent.toFixed(1)}%`}>
++      <div className="capture-progress-head"><span>Chat</span><strong>{safePercent.toFixed(1)}%</strong></div>
++      <div className="progress-track"><div className="progress-fill" style={{ width: `${safePercent}%` }} /></div>
++    </div>
++  );
++}
+ 
++function VideoProgressBar({ session, progress }: { session: VideoSession; progress?: VideoCaptureProgress }) {
++  const effective = progress ? { ...session, ...progress } : session;
++  if (!isVideoBusy(effective)) return null;
++  const percent = progress?.percent ?? localVideoProgressPercent(session);
++  if (percent == null) {
++    return (
++      <div className="capture-progress" aria-label="Video запись идет">
++        <div className="capture-progress-head"><span>Video запись</span><strong>{fmtMs(effective.duration_recorded_ms)}</strong></div>
++        <div className="progress-track indeterminate"><div className="progress-fill" /></div>
++      </div>
++    );
++  }
+   const safePercent = Math.max(0, Math.min(100, percent));
+   return (
+-    <div className="capture-progress" aria-label={`Прогресс сбора ${safePercent.toFixed(1)}%`}>
+-      <div className="capture-progress-head"><span>Сбор</span><strong>{safePercent.toFixed(1)}%</strong></div>
++    <div className="capture-progress" aria-label={`Прогресс Video ${safePercent.toFixed(1)}%`}>
++      <div className="capture-progress-head"><span>Video</span><strong>{safePercent.toFixed(1)}% · {fmtMs(effective.duration_recorded_ms)}</strong></div>
+       <div className="progress-track"><div className="progress-fill" style={{ width: `${safePercent}%` }} /></div>
+     </div>
+   );
+@@ -114,8 +232,12 @@ function App() {
+   const [view, setView] = useState<ViewMode>("events");
+   const [expandedIds, setExpandedIds] = useState<string[]>([]);
+   const [selected, setSelected] = useState<Session | null>(null);
++  const [selectedVideo, setSelectedVideo] = useState<VideoSession | null>(null);
++  const [videoRuns, setVideoRuns] = useState<VideoRun[]>([]);
++  const [videoSegments, setVideoSegments] = useState<VideoSegment[]>([]);
+   const [messages, setMessages] = useState<Message[]>([]);
+   const [progressBySession, setProgressBySession] = useState<Record<string, CaptureProgress>>({});
++  const [videoProgressBySession, setVideoProgressBySession] = useState<Record<string, VideoCaptureProgress>>({});
+   const [position, setPosition] = useState(0);
+   const [playing, setPlaying] = useState(false);
+   const [seekText, setSeekText] = useState("00:00:00");
+@@ -129,6 +251,7 @@ function App() {
+       const data = await res.json();
+       setEvents(data.items || []);
+       setProgressBySession({});
++      setVideoProgressBySession({});
+       setError(null);
+     } catch (e) {
+       setError(String(e));
+@@ -153,6 +276,7 @@ function App() {
+   }
+ 
+   async function openSession(session: Session) {
++    setSelectedVideo(null);
+     setSelected(session);
+     setPosition(0);
+     setPlaying(false);
+@@ -167,6 +291,28 @@ function App() {
+     }
+   }
+ 
++  async function openVideoSession(session: VideoSession) {
++    setSelected(null);
++    setSelectedVideo(session);
++    try {
++      const [detailRes, runsRes, segmentsRes] = await Promise.all([
++        fetch(`${API}/api/v1/video-sessions/${session.id}`, { cache: "no-store" }),
++        fetch(`${API}/api/v1/video-sessions/${session.id}/runs`, { cache: "no-store" }),
++        fetch(`${API}/api/v1/video-sessions/${session.id}/segments?page_size=500`, { cache: "no-store" }),
++      ]);
++      if (!detailRes.ok) throw new Error(await detailRes.text());
++      if (!runsRes.ok) throw new Error(await runsRes.text());
++      if (!segmentsRes.ok) throw new Error(await segmentsRes.text());
++      const [detail, runs, segments] = await Promise.all([detailRes.json(), runsRes.json(), segmentsRes.json()]);
++      setSelectedVideo(detail);
++      setVideoRuns(runs.items || []);
++      setVideoSegments(segments.items || []);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    }
++  }
++
+   async function moveToTrash(session: Session) {
+     if (isCaptureBusy(session)) {
+       setError("Идущую или приостановленную запись нельзя удалить: сначала остановите сбор.");
+@@ -183,7 +329,7 @@ function App() {
+           chat_sessions: event.chat_sessions.filter((item) => item.id !== session.id),
+           chat_sessions_count: event.chat_sessions.filter((item) => item.id !== session.id).length,
+         }))
+-        .filter((event) => event.chat_sessions_count > 0));
++        .filter((event) => event.chat_sessions_count > 0 || event.video_sessions_count > 0));
+       if (selected?.id === session.id) setSelected(null);
+       setError(null);
+     } catch (e) {
+@@ -235,21 +381,28 @@ function App() {
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [view]);
+ 
+-  const monitoredIds = useMemo(
++  const monitoredChatIds = useMemo(
+     () => view === "events"
+       ? events.flatMap((event) => event.chat_sessions).filter(isCaptureBusy).map((session) => session.id)
+       : [],
+     [events, view]
+   );
+-  const monitoredKey = monitoredIds.join(",");
++  const monitoredVideoIds = useMemo(
++    () => view === "events"
++      ? events.flatMap((event) => event.video_sessions).filter(isVideoBusy).map((session) => session.id)
++      : [],
++    [events, view]
++  );
++  const monitoredKey = `c:${monitoredChatIds.join(",")}|v:${monitoredVideoIds.join(",")}`;
+ 
+   useEffect(() => {
+-    if (!monitoredKey) return;
++    if (monitoredChatIds.length === 0 && monitoredVideoIds.length === 0) return;
+ 
+     let cancelled = false;
+     let timer: number | undefined;
+     let inFlight: AbortController | null = null;
+-    const ids = monitoredKey.split(",");
++    const chatIds = [...monitoredChatIds];
++    const videoIds = [...monitoredVideoIds];
+ 
+     const schedule = () => {
+       if (!cancelled) timer = window.setTimeout(poll, PROGRESS_POLL_MS);
+@@ -265,22 +418,27 @@ function App() {
+       inFlight = new AbortController();
+       try {
+         const params = new URLSearchParams();
+-        ids.forEach((id) => params.append("session_id", id));
+-        const res = await fetch(`${API}/api/v1/sessions/capture-progress?${params.toString()}`, {
++        chatIds.forEach((id) => params.append("chat_session_id", id));
++        videoIds.forEach((id) => params.append("video_session_id", id));
++        const res = await fetch(`${API}/api/v1/capture/progress?${params.toString()}`, {
+           signal: inFlight.signal,
+           cache: "no-store",
+         });
+         if (!res.ok) throw new Error(await res.text());
+         const data = await res.json();
+-        const updates = (data.items || []) as CaptureProgress[];
+         if (cancelled) return;
+ 
+-        const updatesById = Object.fromEntries(updates.map((item) => [item.session_id, item]));
+-        setProgressBySession((current) => ({ ...current, ...updatesById }));
++        const chatUpdates = (data.chat || []) as CaptureProgress[];
++        const videoUpdates = (data.video || []) as VideoCaptureProgress[];
++        const chatById = Object.fromEntries(chatUpdates.map((item) => [item.session_id, item]));
++        const videoById = Object.fromEntries(videoUpdates.map((item) => [item.session_id, item]));
++        setProgressBySession((current) => ({ ...current, ...chatById }));
++        setVideoProgressBySession((current) => ({ ...current, ...videoById }));
++
+         setEvents((current) => current.map((event) => ({
+           ...event,
+           chat_sessions: event.chat_sessions.map((session) => {
+-            const update = updatesById[session.id];
++            const update = chatById[session.id];
+             return update ? {
+               ...session,
+               status: update.status,
+@@ -290,18 +448,30 @@ function App() {
+               progress_percent: update.percent,
+             } : session;
+           }),
++          video_sessions: event.video_sessions.map((session) => {
++            const update = videoById[session.id];
++            return update ? {
++              ...session,
++              status: update.status,
++              completeness_status: update.completeness_status,
++              duration_recorded_ms: update.duration_recorded_ms,
++              coverage_end_ms: update.coverage_end_ms,
++              required_end_ms: update.required_end_ms,
++              gap_count: update.gap_count,
++              last_error: update.last_error,
++              progress_percent: update.percent,
++            } : session;
++          }),
+         })));
+         setSelected((current) => {
+           if (!current) return current;
+-          const update = updatesById[current.id];
+-          return update ? {
+-            ...current,
+-            status: update.status,
+-            completeness_status: update.completeness_status,
+-            source_duration_ms: update.source_duration_ms,
+-            coverage_end_ms: update.coverage_end_ms,
+-            progress_percent: update.percent,
+-          } : current;
++          const update = chatById[current.id];
++          return update ? { ...current, ...update, progress_percent: update.percent } : current;
++        });
++        setSelectedVideo((current) => {
++          if (!current) return current;
++          const update = videoById[current.id];
++          return update ? { ...current, ...update, progress_percent: update.percent } : current;
+         });
+       } catch (e) {
+         if (!(e instanceof DOMException && e.name === "AbortError")) {
+@@ -319,6 +489,8 @@ function App() {
+       if (timer !== undefined) window.clearTimeout(timer);
+       inFlight?.abort();
+     };
++    // arrays are encoded in monitoredKey so polling restarts only when active ids change.
++    // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [monitoredKey]);
+ 
+   useEffect(() => {
+@@ -349,6 +521,58 @@ function App() {
+     [messages, position]
+   );
+ 
++  if (selectedVideo) {
++    const progress = videoProgressBySession[selectedVideo.id];
++    return (
++      <main>
++        <button className="link" onClick={() => setSelectedVideo(null)}>← Events</button>
++        <header className="detail-header">
++          <div>
++            <h1>Video Manager · core</h1>
++            <p className="muted">{selectedVideo.metadata?.media_type?.toUpperCase() || "VIDEO"} · {selectedVideo.status} · {selectedVideo.completeness_status}</p>
++          </div>
++          <div className="actions">
++            <button onClick={() => openVideoSession(selectedVideo)}>Обновить</button>
++          </div>
++        </header>
++        <VideoProgressBar session={selectedVideo} progress={progress} />
++        {selectedVideo.last_error && <div className="error">{selectedVideo.last_error}</div>}
++        <section className="video-overview">
++          <div><span>Записано</span><strong>{fmtMs(selectedVideo.duration_recorded_ms)}</strong></div>
++          <div><span>Сегментов</span><strong>{selectedVideo.segment_count || videoSegments.length}</strong></div>
++          <div><span>Размер</span><strong>{fmtBytes(selectedVideo.bytes || videoSegments.reduce((sum, item) => sum + item.bytes, 0))}</strong></div>
++          <div><span>Gaps</span><strong>{selectedVideo.gap_count}</strong></div>
++        </section>
++        <section className="video-block">
++          <div className="section-label">RUNS</div>
++          {videoRuns.length === 0 ? <div className="empty-child">Run ещё не создан</div> : (
++            <div className="table-wrap"><table><thead><tr><th>#</th><th>Status</th><th>Resume</th><th>Segments</th><th>Exit</th><th>Reason</th></tr></thead><tbody>
++              {videoRuns.map((run) => <tr key={run.id}>
++                <td>{run.run_no}</td><td>{run.status}</td><td>{fmtMs(run.resume_source_offset_ms)}</td>
++                <td>{run.first_segment_no ?? "—"}–{run.last_segment_no ?? "—"}</td>
++                <td>{run.streamlink_exit_code ?? "—"}/{run.ffmpeg_exit_code ?? "—"}</td><td>{run.close_reason || "—"}</td>
++              </tr>)}
++            </tbody></table></div>
++          )}
++        </section>
++        <section className="video-block">
++          <div className="section-label">SEGMENTS · spool</div>
++          <p className="muted small">На этом этапе показываются только реально закрытые MPEG-TS сегменты. Archive handoff будет отдельным следующим gate.</p>
++          {videoSegments.length === 0 ? <div className="empty-child">Закрытых сегментов пока нет</div> : (
++            <div className="table-wrap"><table><thead><tr><th>Segment</th><th>Run</th><th>Timeline</th><th>Duration</th><th>Bytes</th><th>Storage</th><th>Integrity</th></tr></thead><tbody>
++              {videoSegments.map((segment) => <tr key={segment.id}>
++                <td>#{segment.segment_no}</td><td>{segment.video_run_id}</td>
++                <td>{fmtMs(segment.timeline_start_ms)}–{fmtMs(segment.timeline_end_ms)}</td>
++                <td>{fmtMs(segment.duration_ms)}</td><td>{fmtBytes(segment.bytes)}</td>
++                <td>{segment.storage_state}</td><td>{segment.integrity_state}</td>
++              </tr>)}
++            </tbody></table></div>
++          )}
++        </section>
++      </main>
++    );
++  }
++
+   if (selected) {
+     const total = selected.source_duration_ms || Math.max(1, ...messages.map((m) => m.timeline_offset_ms));
+     const isTrash = view === "trash";
+@@ -376,25 +600,13 @@ function App() {
+           <button onClick={() => setPlaying(true)}>Play</button>
+           <button onClick={() => setPlaying(false)}>Pause</button>
+           <button onClick={() => { setPlaying(false); setPosition(0); }}>Stop</button>
+-          <input
+-            type="range"
+-            min={0}
+-            max={Math.max(1, total)}
+-            value={Math.min(position, total)}
+-            onChange={(e) => setPosition(Number(e.target.value))}
+-          />
++          <input min={0} max={Math.max(1, total)} type="range" value={Math.min(position, total)} onChange={(e) => setPosition(Number(e.target.value))} />
+           <input value={seekText} onChange={(e) => setSeekText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && seekByText()} aria-label="HH:MM:SS seek" />
+           <button onClick={seekByText}>Seek</button>
+           <strong>{fmtMs(position)} / {fmtMs(total)}</strong>
+         </section>
+         <section className="chat">
+-          {visible.map((m) => (
+-            <div key={m.id} className="message">
+-              <span className="time">{fmtMs(m.timeline_offset_ms)}</span>
+-              <b>{m.chatter_name || m.chatter_login || "unknown"}</b>
+-              <span>{m.message_text}</span>
+-            </div>
+-          ))}
++          {visible.map((m) => <div key={m.id} className="message"><span className="time">{fmtMs(m.timeline_offset_ms)}</span><b>{m.chatter_name || m.chatter_login || "unknown"}</b><span>{m.message_text}</span></div>)}
+         </section>
+       </main>
+     );
+@@ -405,7 +617,7 @@ function App() {
+       <header>
+         <div>
+           <h1>StreamHub</h1>
+-          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : "Twitch Events · Chat sessions"}</p>
++          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : "Twitch Events · Chat + Video sessions"}</p>
+         </div>
+         <div className="actions">
+           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
+@@ -426,51 +638,51 @@ function App() {
+                   <button className="event-summary" onClick={() => toggleEvent(event.id)} aria-expanded={expanded}>
+                     <div className="event-chevron">{expanded ? "▼" : "▶"}</div>
+                     <div className="event-main">
+-                      <div className="row">
+-                        <strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong>
+-                        <span className="event-type">{event.media_type.toUpperCase()}</span>
+-                      </div>
++                      <div className="row"><strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong><span className="event-type">{event.media_type.toUpperCase()}</span></div>
+                       <div className="event-title">{event.title || (event.media_type === "vod" ? `VOD ${event.external_key.split(":").pop()}` : "LIVE stream")}</div>
+-                      <div className="row muted event-meta">
+-                        <span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span>
+-                        <span>{event.media_type === "vod" ? fmtMs(event.source_duration_ms) : "LIVE"}</span>
+-                      </div>
++                      <div className="row muted event-meta"><span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span><span>{event.media_type === "vod" ? fmtMs(event.source_duration_ms) : "LIVE"}</span></div>
+                     </div>
+                     <div className="event-badges">
+                       <span>Chat: {event.chat_sessions_count}</span>
++                      <span>Video: {event.video_sessions_count}</span>
+                       {event.metadata?.identity_state && event.metadata.identity_state !== "canonical" && <span>legacy identity</span>}
+-                      {event.active_chat_sessions_count > 0 && <span className="active-badge">active {event.active_chat_sessions_count}</span>}
++                      {event.active_chat_sessions_count > 0 && <span className="active-badge">chat active</span>}
++                      {event.active_video_sessions_count > 0 && <span className="active-badge">video active</span>}
+                     </div>
+                   </button>
+ 
+                   {expanded && (
+                     <div className="event-children">
+                       <div className="section-label">CHAT SESSIONS</div>
+-                      {event.chat_sessions.length === 0 ? (
+-                        <div className="empty-child">Нет активных Chat sessions</div>
+-                      ) : event.chat_sessions.map((session, index) => (
++                      {event.chat_sessions.length === 0 ? <div className="empty-child">Chat sessions нет</div> : event.chat_sessions.map((session, index) => (
+                         <div className="session-row" key={session.id}>
+                           <div className="session-number">#{index + 1}</div>
+                           <div className="session-info">
+-                            <div className="session-status-line">
+-                              <strong>{session.status}</strong>
+-                              <span>{session.completeness_status}</span>
+-                              <span>{(session.message_count || 0).toLocaleString()} сообщений</span>
+-                            </div>
++                            <div className="session-status-line"><strong>{session.status}</strong><span>{session.completeness_status}</span><span>{(session.message_count || 0).toLocaleString()} сообщений</span></div>
+                             <div className="muted session-date">{new Date(session.created_at).toLocaleString()}</div>
+                             <ProgressBar session={session} progress={progressBySession[session.id]} />
+                           </div>
+                           <div className="session-actions">
+                             <button onClick={() => openSession(session)}>Открыть</button>
+-                            <button
+-                              className="danger subtle"
+-                              disabled={actionId === session.id || isCaptureBusy(session)}
+-                              title={isCaptureBusy(session) ? "Сначала остановите сбор" : "Переместить в корзину"}
+-                              onClick={() => moveToTrash(session)}
+-                            >
+-                              В корзину
+-                            </button>
++                            <button className="danger subtle" disabled={actionId === session.id || isCaptureBusy(session)} title={isCaptureBusy(session) ? "Сначала остановите сбор" : "Переместить в корзину"} onClick={() => moveToTrash(session)}>В корзину</button>
++                          </div>
++                        </div>
++                      ))}
++
++                      <div className="section-label video-section-label">VIDEO SESSIONS</div>
++                      {event.video_sessions.length === 0 ? <div className="empty-child">Video sessions нет</div> : event.video_sessions.map((session, index) => (
++                        <div className="session-row video-session-row" key={session.id}>
++                          <div className="session-number">#{index + 1}</div>
++                          <div className="session-info">
++                            <div className="session-status-line">
++                              <strong>{session.status}</strong><span>{session.completeness_status}</span>
++                              <span>{fmtMs(session.duration_recorded_ms)}</span><span>{session.segment_count || 0} seg</span><span>{fmtBytes(session.bytes || 0)}</span>
++                            </div>
++                            <div className="muted session-date">{new Date(session.created_at).toLocaleString()} · gaps {session.gap_count}</div>
++                            <VideoProgressBar session={session} progress={videoProgressBySession[session.id]} />
++                            {session.last_error && <div className="inline-warning">{session.last_error}</div>}
+                           </div>
++                          <div className="session-actions"><button onClick={() => openVideoSession(session)}>Video Manager</button></div>
+                         </div>
+                       ))}
+                     </div>
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 77e7f94..a46252c 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -71,3 +71,19 @@ button:disabled { cursor: not-allowed; opacity: .5; }
+   .session-row { grid-template-columns: 32px minmax(0, 1fr); }
+   .session-actions { grid-column: 2; justify-content: flex-start; }
+ }
++
++.video-section-label { margin-top: 18px; padding-top: 14px; border-top: 1px solid #eceff3; }
++.video-session-row { background: #fbfcfd; margin: 0 -8px; padding-left: 8px; padding-right: 8px; }
++.inline-warning { margin-top: 7px; color: #8b5b14; font-size: 12px; overflow-wrap: anywhere; }
++.video-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
++.video-overview > div { display: flex; flex-direction: column; gap: 5px; padding: 14px; background: white; border: 1px solid #d7dbe2; border-radius: 12px; }
++.video-overview span { color: #6b7280; font-size: 12px; }
++.video-overview strong { font-size: 17px; font-variant-numeric: tabular-nums; }
++.video-block { margin-top: 18px; padding: 16px; background: white; border: 1px solid #d7dbe2; border-radius: 12px; }
++.small { font-size: 12px; }
++.table-wrap { width: 100%; overflow-x: auto; }
++table { width: 100%; border-collapse: collapse; font-size: 12px; }
++th, td { padding: 8px 10px; border-bottom: 1px solid #eceff3; text-align: left; white-space: nowrap; }
++th { color: #6b7280; font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
++td { font-variant-numeric: tabular-nums; }
++@media (max-width: 760px) { .video-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 127deda..b33d7b2 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -80,6 +80,23 @@ services:
+       timeout: 3s
+       retries: 20
+ 
++  video-recorder:
++    build:
++      context: .
++      dockerfile: apps/video_recorder/Dockerfile
++    env_file: .env
++    restart: unless-stopped
++    volumes:
++      - streamhub_video_spool:/spool
++    depends_on:
++      migrate:
++        condition: service_completed_successfully
++    healthcheck:
++      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health/ready')"]
++      interval: 5s
++      timeout: 3s
++      retries: 30
++
+   api:
+     build:
+       context: .
+@@ -107,3 +124,4 @@ services:
+ 
+ volumes:
+   streamhub_mysql:
++  streamhub_video_spool:
+diff --git a/migrations/versions/0003_video_capture_core.py b/migrations/versions/0003_video_capture_core.py
+new file mode 100644
+index 0000000..7fde8f6
+--- /dev/null
++++ b/migrations/versions/0003_video_capture_core.py
+@@ -0,0 +1,150 @@
++"""video capture core domain
++
++Revision ID: 0003_video_capture_core
++Revises: 0002_event_domain
++Create Date: 2026-10-01
++
++This vertical migration introduces only the Video session/run/segment/gap data
++needed by the first end-to-end recorder UI. Parts/build queue arrive in the next
++user-testable increment.
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0003_video_capture_core"
++down_revision = "0002_event_domain"
++branch_labels = None
++depends_on = None
++
++DT = mysql.DATETIME(fsp=6)
++UUID = sa.BINARY(16)
++
++
++def upgrade() -> None:
++    op.create_table(
++        "video_sessions",
++        sa.Column("id", UUID, primary_key=True),
++        sa.Column("event_id", UUID, sa.ForeignKey("media_events.id", ondelete="RESTRICT"), nullable=False),
++        sa.Column("status", sa.String(32), nullable=False, server_default="new"),
++        sa.Column("completeness_status", sa.String(32), nullable=False, server_default="pending"),
++        sa.Column("quality", sa.String(32), nullable=False, server_default="best"),
++        sa.Column("recorder_mode", sa.String(32), nullable=False, server_default="direct_hls_copy"),
++        sa.Column("source_url", sa.String(2048), nullable=False),
++        sa.Column("recording_started_at_utc", DT),
++        sa.Column("ended_at_utc", DT),
++        sa.Column("duration_recorded_ms", sa.BigInteger(), nullable=False, server_default="0"),
++        sa.Column("required_start_ms", sa.BigInteger()),
++        sa.Column("required_end_ms", sa.BigInteger()),
++        sa.Column("coverage_start_ms", sa.BigInteger()),
++        sa.Column("coverage_end_ms", sa.BigInteger()),
++        sa.Column("gap_count", sa.Integer(), nullable=False, server_default="0"),
++        sa.Column("last_error", mysql.LONGTEXT()),
++        sa.Column("last_activity_at_utc", DT),
++        sa.Column("stop_reason", sa.String(64)),
++        sa.Column("metadata_json", mysql.JSON()),
++        sa.Column("deleted_at_utc", DT),
++        sa.Column("created_at", DT, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++        sa.Column("updated_at", DT, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++        mysql_charset="utf8mb4",
++    )
++    for name, cols in [
++        ("ix_video_sessions_event_id", ["event_id"]),
++        ("ix_video_sessions_status", ["status"]),
++        ("ix_video_sessions_completeness_status", ["completeness_status"]),
++        ("ix_video_sessions_last_activity_at_utc", ["last_activity_at_utc"]),
++        ("ix_video_sessions_deleted_at_utc", ["deleted_at_utc"]),
++    ]:
++        op.create_index(name, "video_sessions", cols)
++
++    op.create_table(
++        "video_runs",
++        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
++        sa.Column("video_session_id", UUID, sa.ForeignKey("video_sessions.id", ondelete="CASCADE"), nullable=False),
++        sa.Column("run_no", sa.Integer(), nullable=False),
++        sa.Column("status", sa.String(32), nullable=False),
++        sa.Column("started_at_utc", DT, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++        sa.Column("ended_at_utc", DT),
++        sa.Column("resume_source_offset_ms", sa.BigInteger()),
++        sa.Column("first_segment_no", sa.Integer()),
++        sa.Column("last_segment_no", sa.Integer()),
++        sa.Column("streamlink_exit_code", sa.Integer()),
++        sa.Column("ffmpeg_exit_code", sa.Integer()),
++        sa.Column("close_reason", sa.String(64)),
++        sa.Column("last_error", mysql.LONGTEXT()),
++        sa.UniqueConstraint("video_session_id", "run_no", name="uq_video_run_session_no"),
++        mysql_charset="utf8mb4",
++    )
++    op.create_index("ix_video_runs_video_session_id", "video_runs", ["video_session_id"])
++    op.create_index("ix_video_runs_status", "video_runs", ["status"])
++
++    op.create_table(
++        "video_segments",
++        sa.Column("id", sa.BigInteger().with_variant(mysql.BIGINT(unsigned=True), "mysql"), primary_key=True, autoincrement=True),
++        sa.Column("video_session_id", UUID, sa.ForeignKey("video_sessions.id", ondelete="CASCADE"), nullable=False),
++        sa.Column("video_run_id", sa.BigInteger(), sa.ForeignKey("video_runs.id", ondelete="CASCADE"), nullable=False),
++        sa.Column("segment_no", sa.Integer(), nullable=False),
++        sa.Column("file_name", sa.String(255), nullable=False),
++        sa.Column("relative_path", sa.String(512), nullable=False),
++        sa.Column("timeline_start_ms", sa.BigInteger(), nullable=False),
++        sa.Column("timeline_end_ms", sa.BigInteger(), nullable=False),
++        sa.Column("source_media_start_ms", sa.BigInteger()),
++        sa.Column("source_media_end_ms", sa.BigInteger()),
++        sa.Column("duration_ms", sa.Integer(), nullable=False),
++        sa.Column("bytes", sa.BigInteger(), nullable=False),
++        sa.Column("mime_type", sa.String(64), nullable=False, server_default="video/mp2t"),
++        sa.Column("storage_state", sa.String(24), nullable=False, server_default="spool"),
++        sa.Column("integrity_state", sa.String(24), nullable=False, server_default="size_verified"),
++        sa.Column("sha256", sa.String(64)),
++        sa.Column("closed_at_utc", DT, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++        sa.Column("created_at", DT, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++        sa.Column("updated_at", DT, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++        sa.UniqueConstraint("video_session_id", "segment_no", name="uq_video_segment_session_no"),
++        mysql_charset="utf8mb4",
++    )
++    op.create_index("ix_video_segments_video_session_id", "video_segments", ["video_session_id"])
++    op.create_index("ix_video_segments_video_run_id", "video_segments", ["video_run_id"])
++    op.create_index("ix_video_segments_storage_state", "video_segments", ["storage_state"])
++
++    op.create_table(
++        "video_gaps",
++        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
++        sa.Column("video_session_id", UUID, sa.ForeignKey("video_sessions.id", ondelete="CASCADE"), nullable=False),
++        sa.Column("after_run_no", sa.Integer()),
++        sa.Column("before_run_no", sa.Integer()),
++        sa.Column("started_at_utc", DT),
++        sa.Column("ended_at_utc", DT),
++        sa.Column("source_start_ms", sa.BigInteger()),
++        sa.Column("source_end_ms", sa.BigInteger()),
++        sa.Column("reason", sa.String(64), nullable=False, server_default="unknown"),
++        sa.Column("resolved", sa.Boolean(), nullable=False, server_default=sa.text("0")),
++        mysql_charset="utf8mb4",
++    )
++    op.create_index("ix_video_gaps_video_session_id", "video_gaps", ["video_session_id"])
++
++    op.add_column("audit_log", sa.Column("event_id", UUID))
++    op.add_column("audit_log", sa.Column("video_session_id", UUID))
++    op.create_foreign_key("fk_audit_log_event_id", "audit_log", "media_events", ["event_id"], ["id"], ondelete="SET NULL")
++    op.create_foreign_key(
++        "fk_audit_log_video_session_id",
++        "audit_log",
++        "video_sessions",
++        ["video_session_id"],
++        ["id"],
++        ondelete="SET NULL",
++    )
++    op.create_index("ix_audit_log_event_id", "audit_log", ["event_id"])
++    op.create_index("ix_audit_log_video_session_id", "audit_log", ["video_session_id"])
++
++
++def downgrade() -> None:
++    op.drop_index("ix_audit_log_video_session_id", table_name="audit_log")
++    op.drop_index("ix_audit_log_event_id", table_name="audit_log")
++    op.drop_constraint("fk_audit_log_video_session_id", "audit_log", type_="foreignkey")
++    op.drop_constraint("fk_audit_log_event_id", "audit_log", type_="foreignkey")
++    op.drop_column("audit_log", "video_session_id")
++    op.drop_column("audit_log", "event_id")
++    for table in ["video_gaps", "video_segments", "video_runs", "video_sessions"]:
++        op.drop_table(table)
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index f46b6a4..874c586 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -207,11 +207,99 @@ class CaptureJob(Base):
+     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+ 
+ 
++class VideoSession(Base):
++    __tablename__ = "video_sessions"
++
++    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
++    event_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("media_events.id", ondelete="RESTRICT"), index=True)
++    status: Mapped[str] = mapped_column(String(32), default="new", index=True)
++    completeness_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
++    quality: Mapped[str] = mapped_column(String(32), default="best")
++    recorder_mode: Mapped[str] = mapped_column(String(32), default="direct_hls_copy")
++    source_url: Mapped[str] = mapped_column(String(2048))
++    recording_started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    ended_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    duration_recorded_ms: Mapped[int] = mapped_column(BigInteger, default=0)
++    required_start_ms: Mapped[int | None] = mapped_column(BigInteger)
++    required_end_ms: Mapped[int | None] = mapped_column(BigInteger)
++    coverage_start_ms: Mapped[int | None] = mapped_column(BigInteger)
++    coverage_end_ms: Mapped[int | None] = mapped_column(BigInteger)
++    gap_count: Mapped[int] = mapped_column(Integer, default=0)
++    last_error: Mapped[str | None] = mapped_column(Text)
++    last_activity_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
++    stop_reason: Mapped[str | None] = mapped_column(String(64))
++    metadata_json: Mapped[dict | None] = mapped_column(JSON)
++    deleted_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
++class VideoRun(Base):
++    __tablename__ = "video_runs"
++    __table_args__ = (UniqueConstraint("video_session_id", "run_no", name="uq_video_run_session_no"),)
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
++    run_no: Mapped[int] = mapped_column(Integer)
++    status: Mapped[str] = mapped_column(String(32), index=True)
++    started_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    ended_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    resume_source_offset_ms: Mapped[int | None] = mapped_column(BigInteger)
++    first_segment_no: Mapped[int | None] = mapped_column(Integer)
++    last_segment_no: Mapped[int | None] = mapped_column(Integer)
++    streamlink_exit_code: Mapped[int | None] = mapped_column(Integer)
++    ffmpeg_exit_code: Mapped[int | None] = mapped_column(Integer)
++    close_reason: Mapped[str | None] = mapped_column(String(64))
++    last_error: Mapped[str | None] = mapped_column(Text)
++
++
++class VideoSegment(Base):
++    __tablename__ = "video_segments"
++    __table_args__ = (UniqueConstraint("video_session_id", "segment_no", name="uq_video_segment_session_no"),)
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
++    video_run_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("video_runs.id", ondelete="CASCADE"), index=True)
++    segment_no: Mapped[int] = mapped_column(Integer)
++    file_name: Mapped[str] = mapped_column(String(255))
++    relative_path: Mapped[str] = mapped_column(String(512))
++    timeline_start_ms: Mapped[int] = mapped_column(BigInteger)
++    timeline_end_ms: Mapped[int] = mapped_column(BigInteger)
++    source_media_start_ms: Mapped[int | None] = mapped_column(BigInteger)
++    source_media_end_ms: Mapped[int | None] = mapped_column(BigInteger)
++    duration_ms: Mapped[int] = mapped_column(Integer)
++    bytes: Mapped[int] = mapped_column(BigInteger)
++    mime_type: Mapped[str] = mapped_column(String(64), default="video/mp2t")
++    storage_state: Mapped[str] = mapped_column(String(24), default="spool", index=True)
++    integrity_state: Mapped[str] = mapped_column(String(24), default="size_verified")
++    sha256: Mapped[str | None] = mapped_column(String(64))
++    closed_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
++class VideoGap(Base):
++    __tablename__ = "video_gaps"
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
++    after_run_no: Mapped[int | None] = mapped_column(Integer)
++    before_run_no: Mapped[int | None] = mapped_column(Integer)
++    started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    ended_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    source_start_ms: Mapped[int | None] = mapped_column(BigInteger)
++    source_end_ms: Mapped[int | None] = mapped_column(BigInteger)
++    reason: Mapped[str] = mapped_column(String(64), default="unknown")
++    resolved: Mapped[bool] = mapped_column(Boolean, default=False)
++
++
+ class AuditLog(Base):
+     __tablename__ = "audit_log"
+ 
+     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    event_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), ForeignKey("media_events.id", ondelete="SET NULL"), index=True)
+     session_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), ForeignKey("sessions.id", ondelete="SET NULL"), index=True)
++    video_session_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="SET NULL"), index=True)
+     action: Mapped[str] = mapped_column(String(64), index=True)
+     payload_json: Mapped[dict | None] = mapped_column(JSON)
+     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+diff --git a/packages/python_common/streamhub_common/settings.py b/packages/python_common/streamhub_common/settings.py
+index 91dc416..2a7f922 100644
+--- a/packages/python_common/streamhub_common/settings.py
++++ b/packages/python_common/streamhub_common/settings.py
+@@ -31,6 +31,14 @@ class Settings(BaseSettings):
+ 
+     chat_ingest_base_url: str = Field(default="http://chat-ingest:8001", alias="CHAT_INGEST_BASE_URL")
+     twitch_adapter_base_url: str = Field(default="http://twitch-adapter:8002", alias="TWITCH_ADAPTER_BASE_URL")
++    video_recorder_base_url: str = Field(default="http://video-recorder:8003", alias="VIDEO_RECORDER_BASE_URL")
++
++    video_spool_root: str = Field(default="/spool", alias="VIDEO_SPOOL_ROOT")
++    video_segment_seconds: int = Field(default=10, ge=4, alias="VIDEO_SEGMENT_SECONDS")
++    video_stream_quality: str = Field(default="best", alias="VIDEO_STREAM_QUALITY")
++    video_reconnect_seconds: float = Field(default=5.0, ge=1.0, alias="VIDEO_RECONNECT_SECONDS")
++    video_stream_timeout_seconds: int = Field(default=90, ge=15, alias="VIDEO_STREAM_TIMEOUT_SECONDS")
++    video_stop_timeout_seconds: int = Field(default=20, ge=5, alias="VIDEO_STOP_TIMEOUT_SECONDS")
+ 
+     twitch_client_id: str = Field(alias="TWITCH_CLIENT_ID")
+     twitch_client_secret: str | None = Field(default=None, alias="TWITCH_CLIENT_SECRET")
+diff --git a/tests/test_repo_guards.py b/tests/test_repo_guards.py
+index d69ec4d..ea445d7 100644
+--- a/tests/test_repo_guards.py
++++ b/tests/test_repo_guards.py
+@@ -37,8 +37,9 @@ def test_web_progress_poll_is_batched_slow_and_visibility_aware():
+     source = (root / "apps/web/src/main.tsx").read_text()
+     assert "PROGRESS_POLL_MS = 5000" in source
+     assert 'document.visibilityState !== "visible"' in source
+-    assert 'params.append("session_id", id)' in source
+-    assert "/sessions/capture-progress" in source
++    assert 'params.append("chat_session_id", id)' in source
++    assert 'params.append("video_session_id", id)' in source
++    assert "/capture/progress" in source
+ 
+ 
+ def test_permanent_purge_removes_session_scoped_traces():
+@@ -72,7 +73,8 @@ def test_extension_uses_backend_context_state_and_no_autostart():
+     root = Path(__file__).resolve().parents[1]
+     popup = (root / "apps/chrome_extension/popup.js").read_text()
+     popup_html = (root / "apps/chrome_extension/popup.html").read_text()
+-    assert "/api/v1/collector/context-status" in popup
++    assert "/api/v1/capture/context-status" in popup
++    assert "/api/v1/capture/start" in popup
+     assert "/stop-all" in popup
+     assert "autostart" not in popup.lower()
+     assert "autostart" not in popup_html.lower()
+@@ -83,3 +85,61 @@ def test_start_is_serialized_per_event_in_backend():
+     source = (root / "apps/api/app/routers/sessions.py").read_text()
+     assert ".with_for_update()" in source
+     assert "active chat session already exists for event" in source
++
++
++def test_video_recorder_core_is_lossless_segmented_and_internal_only():
++    root = Path(__file__).resolve().parents[1]
++    source = (root / "apps/video_recorder/app/main.py").read_text()
++    commands = (root / "apps/video_recorder/app/commands.py").read_text()
++    dockerfile = (root / "apps/video_recorder/Dockerfile").read_text()
++    compose = (root / "docker-compose.yml").read_text()
++    assert '"-c",\n        "copy"' in commands
++    assert "temp_file+program_date_time+independent_segments+discont_start" in commands
++    assert "streamlink" in dockerfile.lower()
++    assert "ffmpeg" in dockerfile.lower()
++    assert "shell=True" not in source
++    block = compose.split("  video-recorder:", 1)[1].split("\n  api:", 1)[0]
++    assert "ports:" not in block
++    assert "streamhub_video_spool:/spool" in block
++    api_block = compose.split("  api:", 1)[1].split("\n  web:", 1)[0]
++    assert "video-recorder:" not in api_block
++
++
++def test_video_capture_vertical_slice_is_exposed_in_extension_and_web():
++    root = Path(__file__).resolve().parents[1]
++    popup = (root / "apps/chrome_extension/popup.js").read_text()
++    popup_html = (root / "apps/chrome_extension/popup.html").read_text()
++    web = (root / "apps/web/src/main.tsx").read_text()
++    assert 'id="chat-toggle"' in popup_html
++    assert 'id="video-toggle"' in popup_html
++    assert "/api/v1/capture/start" in popup
++    assert "/api/v1/video-sessions/" in popup
++    assert "Video Manager" in web
++    assert "VIDEO SESSIONS" in web
++    assert "SEGMENTS · spool" in web
++
++
++def test_video_only_start_does_not_require_vod_integrity():
++    root = Path(__file__).resolve().parents[1]
++    source = (root / "apps/api/app/routers/capture.py").read_text()
++    assert 'if payload.capture.chat:' in source
++    assert 'elif payload.mode == "vod" and not payload.twitch_integrity:' in source
++    assert 'if payload.capture.video:' in source
++
++
++def test_video_schema_migration_is_additive_after_event_domain():
++    root = Path(__file__).resolve().parents[1]
++    source = (root / "migrations/versions/0003_video_capture_core.py").read_text()
++    assert 'down_revision = "0002_event_domain"' in source
++    for table in ("video_sessions", "video_runs", "video_segments", "video_gaps"):
++        assert f'"{table}"' in source
++    assert 'drop_table("sessions")' not in source
++    assert 'drop_table("chat_messages")' not in source
++
++
++def test_capture_progress_is_one_batched_request_every_five_seconds():
++    root = Path(__file__).resolve().parents[1]
++    source = (root / "apps/web/src/main.tsx").read_text()
++    assert "PROGRESS_POLL_MS = 5000" in source
++    assert source.count("/api/v1/capture/progress?") == 1
++    assert 'document.visibilityState !== "visible"' in source
+diff --git a/tests/test_video_capture_core.py b/tests/test_video_capture_core.py
+new file mode 100644
+index 0000000..2abc9c0
+--- /dev/null
++++ b/tests/test_video_capture_core.py
+@@ -0,0 +1,79 @@
++from __future__ import annotations
++
++import importlib.util
++import sys
++from pathlib import Path
++
++
++def load_video_commands_module():
++    root = Path(__file__).resolve().parents[1]
++    path = root / "apps/video_recorder/app/commands.py"
++    spec = importlib.util.spec_from_file_location("streamhub_test_video_commands", path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_video_recorder_commands_are_lossless_and_resume_only_vod():
++    module = load_video_commands_module()
++    vod_command = module.build_streamlink_command(
++        media_type="vod",
++        source_url="https://www.twitch.tv/videos/123",
++        quality="best",
++        resume_source_offset_ms=12_345,
++        stream_timeout_seconds=90,
++    )
++    assert vod_command[-2:] == ["https://www.twitch.tv/videos/123", "best"]
++    offset_index = vod_command.index("--hls-start-offset")
++    assert vod_command[offset_index + 1] == "12.345"
++
++    live_command = module.build_streamlink_command(
++        media_type="live",
++        source_url="https://www.twitch.tv/example",
++        quality="best",
++        resume_source_offset_ms=12_345,
++        stream_timeout_seconds=90,
++    )
++    assert "--hls-start-offset" not in live_command
++
++    ffmpeg_command = module.build_ffmpeg_command(
++        segments_dir=Path("/spool/session/segments"),
++        runs_dir=Path("/spool/session/runs"),
++        run_no=2,
++        start_number=17,
++        segment_seconds=10,
++    )
++    codec_index = ffmpeg_command.index("-c")
++    assert ffmpeg_command[codec_index + 1] == "copy"
++    flags_index = ffmpeg_command.index("-hls_flags")
++    assert "temp_file" in ffmpeg_command[flags_index + 1]
++    assert ffmpeg_command[-1].endswith("run_000002.m3u8")
++    assert any("seg_%06d.ts" in value for value in ffmpeg_command)
++
++    assert module.segment_no_from_name("seg_000017.ts") == 17
++    assert module.segment_no_from_name("seg_000018.ts.tmp") == 18
++    assert module.segment_no_from_name("other.ts") is None
++
++
++def test_video_metadata_resolution_can_use_app_credentials_without_chat_oauth():
++    root = Path(__file__).resolve().parents[1]
++    source = (root / "apps/twitch_adapter/app/main.py").read_text()
++    assert '"grant_type": "client_credentials"' in source
++    assert "async def load_metadata_access_token()" in source
++    resolver = source.split('async def resolve_twitch_metadata(payload: MetadataResolveRequest)', 1)[1]
++    assert "metadata_token = await load_metadata_access_token()" in resolver
++    assert "load_runtime_twitch_auth()" not in resolver.split("@app.post(\"/internal/v1/vod-fetches\"", 1)[0]
++
++
++def test_stage2_video_schema_is_additive_and_does_not_touch_chat_tables():
++    root = Path(__file__).resolve().parents[1]
++    source = (root / "migrations/versions/0003_video_capture_core.py").read_text()
++    assert 'down_revision = "0002_event_domain"' in source
++    for table in ("video_sessions", "video_runs", "video_segments", "video_gaps"):
++        assert f'"{table}"' in source
++    upgrade = source.split("def upgrade() -> None:", 1)[1].split("def downgrade() -> None:", 1)[0]
++    assert 'drop_table("sessions")' not in upgrade
++    assert 'drop_table("chat_messages")' not in upgrade
++    assert 'alter_column("sessions"' not in upgrade

@@ -9,9 +9,10 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
-from streamhub_common.models import ChatMessage, MediaEvent, Session
+from streamhub_common.models import ChatMessage, MediaEvent, Session, VideoSegment, VideoSession
 
 from .sessions import ACTIVE_CAPTURE_SESSION_STATUSES, capture_progress_percent, session_dict, stop_capture_row
+from .video import ACTIVE_VIDEO_STATUSES, stop_video_capture_row, video_progress_percent, video_session_dict
 
 router = APIRouter(prefix="/api/v1", tags=["events"])
 
@@ -84,15 +85,57 @@ async def _chat_summaries_by_event(db: AsyncSession, event_ids: list[uuid.UUID])
     return grouped
 
 
-def _event_payload(event: MediaEvent, chat_sessions: list[dict]) -> dict:
-    active_count = sum(1 for session in chat_sessions if session["status"] in ACTIVE_CAPTURE_SESSION_STATUSES)
+async def _video_summaries_by_event(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[dict]]:
+    if not event_ids:
+        return {}
+    sessions = (
+        await db.execute(
+            select(VideoSession)
+            .where(VideoSession.event_id.in_(event_ids), VideoSession.deleted_at_utc.is_(None))
+            .order_by(VideoSession.event_id, VideoSession.created_at.asc())
+        )
+    ).scalars().all()
+    if not sessions:
+        return {}
+
+    ids = [row.id for row in sessions]
+    aggregate_rows = (
+        await db.execute(
+            select(
+                VideoSegment.video_session_id,
+                func.count(VideoSegment.id),
+                func.coalesce(func.sum(VideoSegment.bytes), 0),
+            )
+            .where(VideoSegment.video_session_id.in_(ids))
+            .group_by(VideoSegment.video_session_id)
+        )
+    ).all()
+    aggregates = {session_id: (int(count or 0), int(total_bytes or 0)) for session_id, count, total_bytes in aggregate_rows}
+
+    grouped: dict[uuid.UUID, list[dict]] = defaultdict(list)
+    for row in sessions:
+        segment_count, total_bytes = aggregates.get(row.id, (0, 0))
+        payload = video_session_dict(row)
+        payload["segment_count"] = segment_count
+        payload["bytes"] = total_bytes
+        payload["progress_percent"] = video_progress_percent(row)
+        grouped[row.event_id].append(payload)
+    return grouped
+
+
+def _event_payload(event: MediaEvent, chat_sessions: list[dict], video_sessions: list[dict]) -> dict:
+    active_chat_count = sum(1 for session in chat_sessions if session["status"] in ACTIVE_CAPTURE_SESSION_STATUSES)
+    active_video_count = sum(1 for session in video_sessions if session["status"] in ACTIVE_VIDEO_STATUSES)
     return {
         **event_dict(event),
         "chat_sessions": chat_sessions,
+        "video_sessions": video_sessions,
         "chat_sessions_count": len(chat_sessions),
-        "active_chat_sessions_count": active_count,
+        "video_sessions_count": len(video_sessions),
+        "active_chat_sessions_count": active_chat_count,
+        "active_video_sessions_count": active_video_count,
         "has_chat": bool(chat_sessions),
-        "has_video": False,
+        "has_video": bool(video_sessions),
     }
 
 
@@ -111,7 +154,12 @@ async def list_events(
         .where(Session.event_id == MediaEvent.id, Session.deleted_at_utc.is_(None))
         .exists()
     )
-    conditions = [MediaEvent.deleted_at_utc.is_(None), visible_chat_exists]
+    visible_video_exists = (
+        select(VideoSession.id)
+        .where(VideoSession.event_id == MediaEvent.id, VideoSession.deleted_at_utc.is_(None))
+        .exists()
+    )
+    conditions = [MediaEvent.deleted_at_utc.is_(None), visible_chat_exists | visible_video_exists]
     if channel:
         conditions.append(MediaEvent.channel_login == channel)
     if type:
@@ -119,7 +167,7 @@ async def list_events(
     if title:
         conditions.append(MediaEvent.title.like(f"%{title}%"))
     if active is not None:
-        active_exists = (
+        active_chat_exists = (
             select(Session.id)
             .where(
                 Session.event_id == MediaEvent.id,
@@ -128,7 +176,17 @@ async def list_events(
             )
             .exists()
         )
-        conditions.append(active_exists if active else ~active_exists)
+        active_video_exists = (
+            select(VideoSession.id)
+            .where(
+                VideoSession.event_id == MediaEvent.id,
+                VideoSession.deleted_at_utc.is_(None),
+                VideoSession.status.in_(ACTIVE_VIDEO_STATUSES),
+            )
+            .exists()
+        )
+        any_active = active_chat_exists | active_video_exists
+        conditions.append(any_active if active else ~any_active)
 
     where_clause = and_(*conditions)
     total = await db.scalar(select(func.count()).select_from(MediaEvent).where(where_clause))
@@ -142,9 +200,14 @@ async def list_events(
         )
     ).scalars().all()
 
-    summaries = await _chat_summaries_by_event(db, [event.id for event in events])
+    event_ids = [event.id for event in events]
+    chat_summaries = await _chat_summaries_by_event(db, event_ids)
+    video_summaries = await _video_summaries_by_event(db, event_ids)
     return {
-        "items": [_event_payload(event, summaries.get(event.id, [])) for event in events],
+        "items": [
+            _event_payload(event, chat_summaries.get(event.id, []), video_summaries.get(event.id, []))
+            for event in events
+        ],
         "total": int(total or 0),
         "page": page,
         "page_size": page_size,
@@ -156,8 +219,9 @@ async def get_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> 
     event = await db.get(MediaEvent, event_id)
     if event is None or event.deleted_at_utc is not None:
         raise HTTPException(404, "event not found")
-    summaries = await _chat_summaries_by_event(db, [event_id])
-    return _event_payload(event, summaries.get(event_id, []))
+    chat_summaries = await _chat_summaries_by_event(db, [event_id])
+    video_summaries = await _video_summaries_by_event(db, [event_id])
+    return _event_payload(event, chat_summaries.get(event_id, []), video_summaries.get(event_id, []))
 
 
 @router.post("/events/{event_id}/stop-all")
@@ -178,20 +242,45 @@ async def stop_all_event_capture(event_id: uuid.UUID, db: AsyncSession = Depends
         )
     ).scalars().all()
 
-    results = []
+    chat_results = []
     for row in active_rows:
         try:
             await stop_capture_row(db, row, reason="stop_all_user")
-            results.append({"session_id": str(row.id), "result": "stopped", "error": None})
+            chat_results.append({"session_id": str(row.id), "result": "stopped", "error": None})
         except HTTPException as exc:
-            results.append({"session_id": str(row.id), "result": "failed", "error": str(exc.detail)})
+            chat_results.append({"session_id": str(row.id), "result": "failed", "error": str(exc.detail)})
+
+    active_video_rows = (
+        await db.execute(
+            select(VideoSession)
+            .where(
+                VideoSession.event_id == event_id,
+                VideoSession.deleted_at_utc.is_(None),
+                VideoSession.status.in_(ACTIVE_VIDEO_STATUSES),
+            )
+            .order_by(VideoSession.created_at.desc())
+        )
+    ).scalars().all()
+    video_results = []
+    for row in active_video_rows:
+        try:
+            await stop_video_capture_row(db, row, reason="stop_all_user")
+            video_results.append({"session_id": str(row.id), "result": "stopped", "error": None})
+        except HTTPException as exc:
+            video_results.append({"session_id": str(row.id), "result": "failed", "error": str(exc.detail)})
     await db.commit()
     return {
         "event_id": str(event_id),
         "chat": {
             "active_before": len(active_rows),
-            "stopped": sum(1 for item in results if item["result"] == "stopped"),
-            "failed": sum(1 for item in results if item["result"] == "failed"),
-            "results": results,
+            "stopped": sum(1 for item in chat_results if item["result"] == "stopped"),
+            "failed": sum(1 for item in chat_results if item["result"] == "failed"),
+            "results": chat_results,
+        },
+        "video": {
+            "active_before": len(active_video_rows),
+            "stopped": sum(1 for item in video_results if item["result"] == "stopped"),
+            "failed": sum(1 for item in video_results if item["result"] == "failed"),
+            "results": video_results,
         },
     }
