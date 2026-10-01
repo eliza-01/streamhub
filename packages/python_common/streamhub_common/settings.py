@@ -80,6 +80,13 @@ class Settings(BaseSettings):
         return self.database_url.replace("mysql+asyncmy://", "mysql+pymysql://", 1)
 
     @property
+    def twitch_requested_scopes(self) -> str:
+        scopes = self.twitch_device_scopes.split()
+        if self.live_irc_redundancy_enabled:
+            scopes.extend(self.twitch_irc_fallback_scopes.split())
+        return " ".join(dict.fromkeys(scope for scope in scopes if scope))
+
+    @property
     def normalized_legacy_token(self) -> str | None:
         if not self.twitch_legacy_oauth_token:
             return None

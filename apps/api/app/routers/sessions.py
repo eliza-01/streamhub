@@ -17,6 +17,42 @@ from streamhub_common.settings import get_settings
 router = APIRouter(prefix="/api/v1", tags=["sessions"])
 settings = get_settings()
 
+# Deletion is deliberately refused while a collector can still mutate session data.
+# This keeps UI housekeeping completely out of the capture path.
+ACTIVE_CAPTURE_SESSION_STATUSES = frozenset({"arming", "recording", "paused", "reconciling"})
+ACTIVE_CAPTURE_JOB_STATUSES = frozenset({"running", "paused"})
+
+
+def capture_progress_percent(
+    *,
+    media_type: str,
+    status_value: str,
+    completeness_status: str,
+    source_duration_ms: int | None,
+    coverage_end_ms: int | None,
+) -> float | None:
+    """Return a cheap UI progress estimate without touching message/event tables."""
+    if completeness_status == "complete" or status_value == "completed":
+        return 100.0
+    if media_type != "vod" or not source_duration_ms or source_duration_ms <= 0:
+        return None
+    covered = max(0, min(int(coverage_end_ms or 0), int(source_duration_ms)))
+    percent = round((covered / source_duration_ms) * 100.0, 1)
+    # Until end-of-pagination is confirmed, never visually claim 100% complete.
+    return min(percent, 99.9)
+
+
+async def ensure_capture_is_idle_for_delete(db: AsyncSession, row: Session) -> None:
+    if row.status in ACTIVE_CAPTURE_SESSION_STATUSES:
+        raise HTTPException(409, "active or paused capture must be stopped before deleting the session")
+    active_job_id = await db.scalar(
+        select(CaptureJob.id)
+        .where(CaptureJob.session_id == row.id, CaptureJob.status.in_(ACTIVE_CAPTURE_JOB_STATUSES))
+        .limit(1)
+    )
+    if active_job_id is not None:
+        raise HTTPException(409, "capture job must be stopped before deleting the session")
+
 
 class TwitchIntegrityContext(BaseModel):
     client_integrity: str
@@ -177,6 +213,8 @@ async def resume_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_d
     row = await db.get(Session, session_id)
     if not row:
         raise HTTPException(404, "session not found")
+    if row.deleted_at_utc is not None or row.status == "soft_deleted":
+        raise HTTPException(409, "cannot resume a session that is in the trash")
     if row.media_type == "vod":
         await adapter_post(f"/internal/v1/vod-fetches/{session_id}/resume", {})
     else:
@@ -300,6 +338,55 @@ async def list_sessions(
     return {"items": [session_dict(r) for r in rows], "total": int(total or 0), "page": page, "page_size": page_size}
 
 
+@router.get("/sessions/capture-progress")
+async def list_capture_progress(
+    session_id: list[uuid.UUID] | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    # One tiny query for all visible sessions. The web UI polls this no faster
+    # than every 5 seconds and pauses polling while the tab is hidden.
+    ids = list(dict.fromkeys(session_id or []))
+    if len(ids) > 100:
+        raise HTTPException(400, "at most 100 session_id values are allowed")
+    if not ids:
+        return {"items": [], "poll_after_ms": 5000}
+
+    rows = (
+        await db.execute(
+            select(
+                Session.id,
+                Session.media_type,
+                Session.status,
+                Session.completeness_status,
+                Session.source_duration_ms,
+                Session.coverage_end_ms,
+            ).where(Session.id.in_(ids), Session.deleted_at_utc.is_(None))
+        )
+    ).all()
+
+    return {
+        "items": [
+            {
+                "session_id": str(row.id),
+                "media_type": row.media_type,
+                "status": row.status,
+                "completeness_status": row.completeness_status,
+                "source_duration_ms": row.source_duration_ms,
+                "coverage_end_ms": row.coverage_end_ms,
+                "percent": capture_progress_percent(
+                    media_type=row.media_type,
+                    status_value=row.status,
+                    completeness_status=row.completeness_status,
+                    source_duration_ms=row.source_duration_ms,
+                    coverage_end_ms=row.coverage_end_ms,
+                ),
+            }
+            for row in rows
+        ],
+        "poll_after_ms": 5000,
+    }
+
+
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
     row = await db.get(Session, session_id)
@@ -388,6 +475,9 @@ async def soft_delete_session(session_id: uuid.UUID, db: AsyncSession = Depends(
     row = await db.get(Session, session_id)
     if not row:
         raise HTTPException(404, "session not found")
+    if row.deleted_at_utc is not None:
+        return {"ok": True, "already_deleted": True}
+    await ensure_capture_is_idle_for_delete(db, row)
     row.deleted_at_utc = datetime.now(UTC).replace(tzinfo=None)
     row.status = "soft_deleted"
     db.add(AuditLog(session_id=session_id, action="soft_delete", payload_json={}))
@@ -422,6 +512,17 @@ async def purge_session(
         raise HTTPException(404, "session not found")
     if row.deleted_at_utc is None:
         raise HTTPException(409, "session must be soft-deleted first")
-    await db.delete(row)
+    await ensure_capture_is_idle_for_delete(db, row)
+
+    # Hard purge intentionally leaves no session-scoped audit trail. Child
+    # tables are deleted explicitly in the same transaction even though most
+    # FKs also have ON DELETE CASCADE. audit_log uses SET NULL, so it must be
+    # removed before the session row to avoid orphaned traces.
+    await db.execute(delete(AuditLog).where(AuditLog.session_id == session_id))
+    await db.execute(delete(ChatEvent).where(ChatEvent.session_id == session_id))
+    await db.execute(delete(ChatMessage).where(ChatMessage.session_id == session_id))
+    await db.execute(delete(SessionSegment).where(SessionSegment.session_id == session_id))
+    await db.execute(delete(CaptureJob).where(CaptureJob.session_id == session_id))
+    await db.execute(delete(Session).where(Session.id == session_id))
     await db.commit()
     return {"ok": True, "purged": True}

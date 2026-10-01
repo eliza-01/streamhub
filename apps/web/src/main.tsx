@@ -11,6 +11,8 @@ type Session = {
   title?: string | null;
   created_at: string;
   source_duration_ms?: number | null;
+  coverage_end_ms?: number | null;
+  deleted_at_utc?: string | null;
 };
 
 type Message = {
@@ -21,7 +23,22 @@ type Message = {
   message_text: string;
 };
 
+type CaptureProgress = {
+  session_id: string;
+  media_type: "live" | "vod";
+  status: string;
+  completeness_status: string;
+  source_duration_ms?: number | null;
+  coverage_end_ms?: number | null;
+  percent?: number | null;
+};
+
+type ViewMode = "sessions" | "trash";
+
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
+const PROGRESS_POLL_MS = 5000;
+const CAPTURE_BUSY_STATUSES = new Set(["arming", "recording", "paused", "reconciling"]);
+const CAPTURE_BUSY_COMPLETENESS = new Set(["collecting", "verifying"]);
 
 function fmtMs(ms?: number | null) {
   if (ms == null) return "—";
@@ -32,21 +49,64 @@ function fmtMs(ms?: number | null) {
   return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
 }
 
+function isCaptureBusy(session: Session) {
+  return CAPTURE_BUSY_STATUSES.has(session.status) || CAPTURE_BUSY_COMPLETENESS.has(session.completeness_status);
+}
+
+function localProgressPercent(session: Session): number | null {
+  if (session.completeness_status === "complete" || session.status === "completed") return 100;
+  if (session.media_type !== "vod" || !session.source_duration_ms || session.source_duration_ms <= 0) return null;
+  const covered = Math.max(0, Math.min(session.coverage_end_ms || 0, session.source_duration_ms));
+  return Math.min(99.9, Math.round((covered / session.source_duration_ms) * 1000) / 10);
+}
+
+function ProgressBar({ session, progress }: { session: Session; progress?: CaptureProgress }) {
+  const percent = progress?.percent ?? localProgressPercent(session);
+  const status = progress?.status || session.status;
+  if (!isCaptureBusy({ ...session, status, completeness_status: progress?.completeness_status || session.completeness_status })) {
+    return null;
+  }
+
+  if (percent == null) {
+    return (
+      <div className="capture-progress" aria-label="Сбор идет, процент недоступен">
+        <div className="capture-progress-head"><span>Сбор идет</span><strong>LIVE</strong></div>
+        <div className="progress-track indeterminate"><div className="progress-fill" /></div>
+      </div>
+    );
+  }
+
+  const safePercent = Math.max(0, Math.min(100, percent));
+  return (
+    <div className="capture-progress" aria-label={`Прогресс сбора ${safePercent.toFixed(1)}%`}>
+      <div className="capture-progress-head"><span>Сбор</span><strong>{safePercent.toFixed(1)}%</strong></div>
+      <div className="progress-track">
+        <div className="progress-fill" style={{ width: `${safePercent}%` }} />
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [view, setView] = useState<ViewMode>("sessions");
   const [selected, setSelected] = useState<Session | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [progressBySession, setProgressBySession] = useState<Record<string, CaptureProgress>>({});
   const [position, setPosition] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [seekText, setSeekText] = useState("00:00:00");
   const [error, setError] = useState<string | null>(null);
+  const [actionId, setActionId] = useState<string | null>(null);
 
-  async function loadSessions() {
+  async function loadSessions(targetView: ViewMode = view) {
     try {
-      const res = await fetch(`${API}/api/v1/sessions?page_size=100`);
+      const deleted = targetView === "trash" ? "true" : "false";
+      const res = await fetch(`${API}/api/v1/sessions?page_size=100&deleted=${deleted}`);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setSessions(data.items || []);
+      setProgressBySession({});
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -57,12 +117,154 @@ function App() {
     setSelected(session);
     setPosition(0);
     setPlaying(false);
-    const res = await fetch(`${API}/api/v1/sessions/${session.id}/messages?from_ms=0&limit=2000`);
-    const data = await res.json();
-    setMessages(data.items || []);
+    try {
+      const res = await fetch(`${API}/api/v1/sessions/${session.id}/messages?from_ms=0&limit=2000`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setMessages(data.items || []);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
-  useEffect(() => { loadSessions(); }, []);
+  async function moveToTrash(session: Session) {
+    if (isCaptureBusy(session)) {
+      setError("Идущую или приостановленную запись нельзя удалить: сначала остановите сбор.");
+      return;
+    }
+    if (!window.confirm("Переместить эту сессию в корзину?")) return;
+    setActionId(session.id);
+    try {
+      const res = await fetch(`${API}/api/v1/sessions/${session.id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      setSessions((current) => current.filter((item) => item.id !== session.id));
+      if (selected?.id === session.id) setSelected(null);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function restoreSession(session: Session) {
+    setActionId(session.id);
+    try {
+      const res = await fetch(`${API}/api/v1/sessions/${session.id}/restore`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      setSessions((current) => current.filter((item) => item.id !== session.id));
+      if (selected?.id === session.id) setSelected(null);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function purgeSession(session: Session) {
+    if (!window.confirm("Удалить сессию безвозвратно вместе со всеми сообщениями, событиями и журналом этой сессии?")) return;
+    setActionId(session.id);
+    try {
+      const res = await fetch(`${API}/api/v1/deleted/sessions/${session.id}?permanent=true`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      setSessions((current) => current.filter((item) => item.id !== session.id));
+      if (selected?.id === session.id) setSelected(null);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  useEffect(() => {
+    loadSessions(view);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
+
+  const monitoredIds = useMemo(
+    () => view === "sessions" ? sessions.filter(isCaptureBusy).map((session) => session.id) : [],
+    [sessions, view]
+  );
+  const monitoredKey = monitoredIds.join(",");
+
+  useEffect(() => {
+    if (!monitoredKey) return;
+
+    let cancelled = false;
+    let timer: number | undefined;
+    let inFlight: AbortController | null = null;
+    const ids = monitoredKey.split(",");
+
+    const schedule = () => {
+      if (!cancelled) timer = window.setTimeout(poll, PROGRESS_POLL_MS);
+    };
+
+    const poll = async () => {
+      if (cancelled) return;
+      if (document.visibilityState !== "visible") {
+        schedule();
+        return;
+      }
+
+      inFlight = new AbortController();
+      try {
+        const params = new URLSearchParams();
+        ids.forEach((id) => params.append("session_id", id));
+        const res = await fetch(`${API}/api/v1/sessions/capture-progress?${params.toString()}`, {
+          signal: inFlight.signal,
+          cache: "no-store",
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        const updates = (data.items || []) as CaptureProgress[];
+        if (cancelled) return;
+
+        setProgressBySession((current) => {
+          const next = { ...current };
+          updates.forEach((item) => { next[item.session_id] = item; });
+          return next;
+        });
+        setSessions((current) => current.map((session) => {
+          const update = updates.find((item) => item.session_id === session.id);
+          return update ? {
+            ...session,
+            status: update.status,
+            completeness_status: update.completeness_status,
+            source_duration_ms: update.source_duration_ms,
+            coverage_end_ms: update.coverage_end_ms,
+          } : session;
+        }));
+        setSelected((current) => {
+          if (!current) return current;
+          const update = updates.find((item) => item.session_id === current.id);
+          return update ? {
+            ...current,
+            status: update.status,
+            completeness_status: update.completeness_status,
+            source_duration_ms: update.source_duration_ms,
+            coverage_end_ms: update.coverage_end_ms,
+          } : current;
+        });
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) {
+          console.warn("capture progress poll failed", e);
+        }
+      } finally {
+        inFlight = null;
+        schedule();
+      }
+    };
+
+    timer = window.setTimeout(poll, 1000);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      inFlight?.abort();
+    };
+  }, [monitoredKey]);
 
   useEffect(() => {
     if (!playing || !selected) return;
@@ -94,11 +296,27 @@ function App() {
 
   if (selected) {
     const total = selected.source_duration_ms || Math.max(1, ...messages.map((m) => m.timeline_offset_ms));
+    const isTrash = view === "trash";
     return (
       <main>
-        <button className="link" onClick={() => setSelected(null)}>← Сессии</button>
-        <h1>{selected.channel_login || "Twitch"}</h1>
-        <p className="muted">{selected.title || "Без названия"} · {selected.media_type.toUpperCase()} · {selected.completeness_status}</p>
+        <button className="link" onClick={() => setSelected(null)}>← {isTrash ? "Корзина" : "Сессии"}</button>
+        <header className="detail-header">
+          <div>
+            <h1>{selected.channel_login || "Twitch"}</h1>
+            <p className="muted">{selected.title || "Без названия"} · {selected.media_type.toUpperCase()} · {selected.completeness_status}</p>
+          </div>
+          <div className="actions">
+            {isTrash ? (
+              <>
+                <button disabled={actionId === selected.id} onClick={() => restoreSession(selected)}>Восстановить</button>
+                <button className="danger" disabled={actionId === selected.id} onClick={() => purgeSession(selected)}>Удалить навсегда</button>
+              </>
+            ) : (
+              <button className="danger" disabled={actionId === selected.id || isCaptureBusy(selected)} onClick={() => moveToTrash(selected)}>В корзину</button>
+            )}
+          </div>
+        </header>
+        {!isTrash && <ProgressBar session={selected} progress={progressBySession[selected.id]} />}
         <section className="player-controls">
           <button onClick={() => setPlaying(true)}>Play</button>
           <button onClick={() => setPlaying(false)}>Pause</button>
@@ -132,19 +350,44 @@ function App() {
       <header>
         <div>
           <h1>StreamHub</h1>
-          <p className="muted">Сессии Twitch-чата</p>
+          <p className="muted">{view === "trash" ? "Корзина сессий" : "Сессии Twitch-чата"}</p>
         </div>
-        <button onClick={loadSessions}>Обновить</button>
+        <div className="actions">
+          <button className={view === "sessions" ? "active-tab" : ""} onClick={() => setView("sessions")}>Сессии</button>
+          <button className={view === "trash" ? "active-tab" : ""} onClick={() => setView("trash")}>Корзина</button>
+          <button onClick={() => loadSessions(view)}>Обновить</button>
+        </div>
       </header>
       {error && <div className="error">{error}</div>}
+      {sessions.length === 0 && <div className="empty">{view === "trash" ? "Корзина пуста" : "Сессий пока нет"}</div>}
       <section className="grid">
-        {sessions.map((s) => (
-          <button className="card" key={s.id} onClick={() => openSession(s)}>
-            <div className="row"><strong>{s.channel_login || "Twitch"}</strong><span>{s.media_type.toUpperCase()}</span></div>
-            <div className="title">{s.title || "Без названия"}</div>
-            <div className="row muted"><span>{s.status}</span><span>{s.completeness_status}</span></div>
-            <div className="row muted"><span>{new Date(s.created_at).toLocaleString()}</span><span>{fmtMs(s.source_duration_ms)}</span></div>
-          </button>
+        {sessions.map((session) => (
+          <article className="card" key={session.id}>
+            <button className="card-main" onClick={() => openSession(session)}>
+              <div className="row"><strong>{session.channel_login || "Twitch"}</strong><span>{session.media_type.toUpperCase()}</span></div>
+              <div className="title">{session.title || "Без названия"}</div>
+              <div className="row muted"><span>{session.status}</span><span>{session.completeness_status}</span></div>
+              <div className="row muted"><span>{new Date(session.created_at).toLocaleString()}</span><span>{fmtMs(session.source_duration_ms)}</span></div>
+              {view === "sessions" && <ProgressBar session={session} progress={progressBySession[session.id]} />}
+            </button>
+            <div className="card-actions">
+              {view === "trash" ? (
+                <>
+                  <button disabled={actionId === session.id} onClick={() => restoreSession(session)}>Восстановить</button>
+                  <button className="danger" disabled={actionId === session.id} onClick={() => purgeSession(session)}>Удалить навсегда</button>
+                </>
+              ) : (
+                <button
+                  className="danger subtle"
+                  disabled={actionId === session.id || isCaptureBusy(session)}
+                  title={isCaptureBusy(session) ? "Сначала остановите сбор" : "Переместить в корзину"}
+                  onClick={() => moveToTrash(session)}
+                >
+                  В корзину
+                </button>
+              )}
+            </div>
+          </article>
         ))}
       </section>
     </main>
