@@ -1,27 +1,38 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 import subprocess
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from streamhub_common.db import SessionLocal
 from streamhub_common.logging import configure_logging
-from streamhub_common.models import VideoGap, VideoRun, VideoSegment, VideoSession
+from streamhub_common.models import StorageOutputSetting, VideoGap, VideoRun, VideoSegment, VideoSession
 from streamhub_common.security import require_internal_token
 from streamhub_common.settings import get_settings
 
 from app.commands import build_ffmpeg_command, build_streamlink_command, segment_no_from_name
+from app.storage import (
+    ArchiveCopyError,
+    archive_segment_relative_path,
+    atomic_copy_verified,
+    atomic_write_text,
+    directory_is_writable,
+    ensure_archive_dirs,
+    safe_archive_session_root,
+)
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -40,6 +51,38 @@ def safe_session_root(session_id: uuid.UUID) -> Path:
     candidate.relative_to(root)
     return candidate
 
+
+
+
+def enabled_output_roots() -> dict[str, Path]:
+    roots = {"root1": Path(settings.video_output_root_1)}
+    if settings.video_output_root_2_enabled:
+        roots["root2"] = Path(settings.video_output_root_2)
+    if settings.video_output_root_3_enabled:
+        roots["root3"] = Path(settings.video_output_root_3)
+    return roots
+
+
+def normalize_output_subdir(value: str | None) -> PurePosixPath:
+    raw = (value or "streamhub").strip().replace("\\", "/")
+    path = PurePosixPath(raw)
+    if not raw or path.is_absolute() or any(part in {"", ".", ".."} or ":" in part for part in path.parts):
+        raise ValueError(f"unsafe output subdirectory: {value!r}")
+    return path
+
+
+def session_output_base(metadata: dict | None) -> Path:
+    metadata = metadata or {}
+    key = str(metadata.get("output_root_key") or "root1")
+    roots = enabled_output_roots()
+    root = roots.get(key)
+    if root is None:
+        raise ValueError(f"video output root is not enabled: {key}")
+    root = root.resolve()
+    subdir = normalize_output_subdir(metadata.get("output_subdir"))
+    candidate = (root / Path(*subdir.parts)).resolve()
+    candidate.relative_to(root)
+    return candidate
 
 def ensure_spool_dirs(session_id: uuid.UUID) -> tuple[Path, Path, Path]:
     root = safe_session_root(session_id)
@@ -92,6 +135,7 @@ async def max_segment_no(session_id: uuid.UUID) -> int:
         value = await db.scalar(
             select(func.max(VideoSegment.segment_no)).where(VideoSegment.video_session_id == session_id)
         )
+        session = await db.get(VideoSession, session_id)
     db_max = int(value or 0)
     segments_dir, _runs_dir, _logs_dir = ensure_spool_dirs(session_id)
     spool_max = 0
@@ -99,7 +143,18 @@ async def max_segment_no(session_id: uuid.UUID) -> int:
         number = segment_no_from_name(path.name)
         if number is not None:
             spool_max = max(spool_max, number)
-    return max(db_max, spool_max)
+
+    archive_max = 0
+    if session is not None:
+        archive_dir = safe_archive_session_root(
+            session_output_base(session.metadata_json), session.event_id, session_id
+        ) / "segments"
+        if archive_dir.exists():
+            for path in archive_dir.glob("seg_*.ts"):
+                number = segment_no_from_name(path.name)
+                if number is not None:
+                    archive_max = max(archive_max, number)
+    return max(db_max, spool_max, archive_max)
 
 
 async def next_run_no(session_id: uuid.UUID) -> int:
@@ -236,10 +291,499 @@ async def index_closed_segments(session_id: uuid.UUID, run_id: int, run_no: int)
 
     if created:
         await build_spool_playlist(session_id)
+        archive_wakeup.set()
     return created
 
 
+@dataclass(frozen=True)
+class ArchiveCandidate:
+    segment_id: int
+    session_id: uuid.UUID
+    event_id: uuid.UUID
+    file_name: str
+    expected_bytes: int
+    output_root_key: str
+    output_subdir: str
 
+
+archive_wakeup = asyncio.Event()
+archive_shutdown = asyncio.Event()
+archive_metadata_lock = asyncio.Lock()
+
+
+def archive_source_path(candidate: ArchiveCandidate) -> Path:
+    return safe_session_root(candidate.session_id) / "segments" / candidate.file_name
+
+
+def candidate_output_base(candidate: ArchiveCandidate) -> Path:
+    return session_output_base({
+        "output_root_key": candidate.output_root_key,
+        "output_subdir": candidate.output_subdir,
+    })
+
+
+def archive_final_path(candidate: ArchiveCandidate) -> Path:
+    segments_dir, _runs_dir, _parts_dir, _logs_dir = ensure_archive_dirs(
+        candidate_output_base(candidate), candidate.event_id, candidate.session_id
+    )
+    return segments_dir / candidate.file_name
+
+
+def iso_utc(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+async def claim_archive_batch() -> list[ArchiveCandidate]:
+    terminal_statuses = {"completed", "failed", "soft_deleted"}
+    async with SessionLocal() as db:
+        output_setting = await db.get(StorageOutputSetting, 1)
+        batch_size = int(
+            output_setting.batch_segments if output_setting is not None else settings.video_archive_batch_segments
+        )
+        grouped = (
+            await db.execute(
+                select(
+                    VideoSession.id,
+                    VideoSession.event_id,
+                    VideoSession.status,
+                    func.count(VideoSegment.id).label("spool_count"),
+                    func.min(VideoSegment.closed_at_utc).label("oldest_closed"),
+                )
+                .join(VideoSegment, VideoSegment.video_session_id == VideoSession.id)
+                .where(
+                    VideoSegment.storage_state == "spool",
+                    VideoSession.deleted_at_utc.is_(None),
+                )
+                .group_by(
+                    VideoSession.id,
+                    VideoSession.event_id,
+                    VideoSession.status,
+                )
+                .order_by(func.min(VideoSegment.closed_at_utc), VideoSession.id)
+                .limit(50)
+            )
+        ).all()
+
+        selected = None
+        for row in grouped:
+            if int(row.spool_count or 0) >= batch_size or row.status in terminal_statuses:
+                selected = row
+                break
+        if selected is None:
+            await db.rollback()
+            return []
+
+        selected_session = await db.get(VideoSession, selected.id)
+        if selected_session is None:
+            await db.rollback()
+            return []
+        metadata = selected_session.metadata_json or {}
+        output_root_key = str(metadata.get("output_root_key") or "root1")
+        output_subdir = str(metadata.get("output_subdir") or "streamhub")
+        segments = (
+            await db.execute(
+                select(VideoSegment)
+                .where(
+                    VideoSegment.video_session_id == selected.id,
+                    VideoSegment.storage_state == "spool",
+                )
+                .order_by(VideoSegment.segment_no)
+                .with_for_update(skip_locked=True)
+                .limit(batch_size)
+            )
+        ).scalars().all()
+        if not segments:
+            await db.rollback()
+            return []
+
+        candidates: list[ArchiveCandidate] = []
+        for segment in segments:
+            segment.storage_state = "copying"
+            segment.archive_attempts = int(segment.archive_attempts or 0) + 1
+            segment.archive_last_error = None
+            candidates.append(
+                ArchiveCandidate(
+                    segment_id=segment.id,
+                    session_id=segment.video_session_id,
+                    event_id=selected.event_id,
+                    file_name=segment.file_name,
+                    expected_bytes=int(segment.bytes),
+                    output_root_key=output_root_key,
+                    output_subdir=output_subdir,
+                )
+            )
+        await db.commit()
+        return candidates
+
+
+async def mark_archive_failure(candidate: ArchiveCandidate, error: Exception) -> None:
+    source = archive_source_path(candidate)
+    final = archive_final_path(candidate)
+    async with SessionLocal() as db:
+        row = await db.get(VideoSegment, candidate.segment_id)
+        if row is None or row.storage_state == "archive_ready":
+            return
+        if not source.exists() and not final.exists():
+            row.storage_state = "missing"
+            row.integrity_state = "failed"
+        else:
+            row.storage_state = "spool"
+        row.archive_last_error = str(error)[:4000]
+        await db.commit()
+    logger.warning(
+        "archive handoff failed session=%s segment=%s error=%s",
+        candidate.session_id,
+        candidate.file_name,
+        error,
+    )
+
+
+def cleanup_spool_copy_after_commit(candidate: ArchiveCandidate) -> None:
+    source = archive_source_path(candidate)
+    final = archive_final_path(candidate)
+    if not source.exists():
+        return
+    if not final.exists() or final.stat().st_size != candidate.expected_bytes:
+        raise ArchiveCopyError(f"archive final missing during spool cleanup: {candidate.file_name}")
+    if source.stat().st_size != candidate.expected_bytes:
+        raise ArchiveCopyError(f"spool size changed before cleanup: {candidate.file_name}")
+    source.unlink()
+
+
+async def archive_rows_for_session(session_id: uuid.UUID):
+    async with SessionLocal() as db:
+        session = await db.get(VideoSession, session_id)
+        if session is None:
+            return None, [], []
+        runs = (
+            await db.execute(
+                select(VideoRun).where(VideoRun.video_session_id == session_id).order_by(VideoRun.run_no)
+            )
+        ).scalars().all()
+        rows = (
+            await db.execute(
+                select(VideoSegment, VideoRun.run_no)
+                .join(VideoRun, VideoRun.id == VideoSegment.video_run_id)
+                .where(VideoSegment.video_session_id == session_id)
+                .order_by(VideoSegment.segment_no)
+            )
+        ).all()
+        return session, runs, rows
+
+
+def playlist_text(rows: list[tuple[VideoSegment, int]], *, finished: bool, run_relative: bool = False) -> str:
+    if not rows:
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+        if finished:
+            lines.append("#EXT-X-ENDLIST")
+        return "\n".join(lines) + "\n"
+    target_duration = max(1, max((segment.duration_ms + 999) // 1000 for segment, _run_no in rows))
+    first_segment = rows[0][0].segment_no
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        f"#EXT-X-TARGETDURATION:{target_duration}",
+        f"#EXT-X-MEDIA-SEQUENCE:{first_segment}",
+    ]
+    previous_run = None
+    for segment, run_no in rows:
+        if previous_run is not None and run_no != previous_run:
+            lines.append("#EXT-X-DISCONTINUITY")
+        lines.append(f"#EXTINF:{segment.duration_ms / 1000:.3f},")
+        prefix = "../segments" if run_relative else "segments"
+        lines.append(f"{prefix}/{segment.file_name}")
+        previous_run = run_no
+    if finished:
+        lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
+
+
+async def refresh_archive_metadata(session_id: uuid.UUID) -> None:
+    async with archive_metadata_lock:
+        session, runs, rows = await archive_rows_for_session(session_id)
+        if session is None:
+            return
+        output_base = session_output_base(session.metadata_json)
+        root = safe_archive_session_root(output_base, session.event_id, session.id)
+        _segments_dir, runs_dir, _parts_dir, _logs_dir = ensure_archive_dirs(
+            output_base, session.event_id, session.id
+        )
+        ready_rows = [(segment, run_no) for segment, run_no in rows if segment.storage_state == "archive_ready"]
+        terminal = session.status in {"completed", "failed", "soft_deleted"}
+        all_ready = len(ready_rows) == len(rows)
+        atomic_write_text(root / "recording.m3u8", playlist_text(ready_rows, finished=terminal and all_ready))
+
+        run_by_no = {run.run_no: run for run in runs}
+        for run_no, run in run_by_no.items():
+            all_for_run = [(segment, n) for segment, n in rows if n == run_no]
+            ready_for_run = [(segment, n) for segment, n in ready_rows if n == run_no]
+            run_finished = run.status not in {"starting", "running"} and len(all_for_run) == len(ready_for_run)
+            atomic_write_text(
+                runs_dir / f"run_{run_no:06d}.m3u8",
+                playlist_text(ready_for_run, finished=run_finished, run_relative=True),
+            )
+
+        state_counts: dict[str, int] = {}
+        state_bytes: dict[str, int] = {}
+        for segment, _run_no in rows:
+            state_counts[segment.storage_state] = state_counts.get(segment.storage_state, 0) + 1
+            state_bytes[segment.storage_state] = state_bytes.get(segment.storage_state, 0) + int(segment.bytes)
+
+        metadata = session.metadata_json or {}
+        manifest = {
+            "schema_version": 1,
+            "event_id": str(session.event_id),
+            "video_session_id": str(session.id),
+            "media_type": metadata.get("media_type"),
+            "source_ids": {
+                "video_external_id": metadata.get("video_external_id"),
+                "stream_external_id": metadata.get("stream_external_id"),
+                "channel_login": metadata.get("channel_login"),
+            },
+            "quality": session.quality,
+            "recorder_mode": session.recorder_mode,
+            "status": session.status,
+            "completeness_status": session.completeness_status,
+            "recording_started_at_utc": iso_utc(session.recording_started_at_utc),
+            "ended_at_utc": iso_utc(session.ended_at_utc),
+            "required_start_ms": session.required_start_ms,
+            "required_end_ms": session.required_end_ms,
+            "coverage_start_ms": session.coverage_start_ms,
+            "coverage_end_ms": session.coverage_end_ms,
+            "duration_recorded_ms": session.duration_recorded_ms,
+            "segment_count": len(rows),
+            "archive_ready_count": len(ready_rows),
+            "storage_counts": state_counts,
+            "storage_bytes": state_bytes,
+            "runs": [
+                {
+                    "run_no": run.run_no,
+                    "status": run.status,
+                    "started_at_utc": iso_utc(run.started_at_utc),
+                    "ended_at_utc": iso_utc(run.ended_at_utc),
+                    "resume_source_offset_ms": run.resume_source_offset_ms,
+                    "first_segment_no": run.first_segment_no,
+                    "last_segment_no": run.last_segment_no,
+                    "close_reason": run.close_reason,
+                }
+                for run in runs
+            ],
+            "updated_at_utc": iso_utc(utcnow_naive()),
+        }
+        atomic_write_text(root / "session.json", json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+async def maybe_cleanup_terminal_spool(session_id: uuid.UUID) -> None:
+    async with SessionLocal() as db:
+        session = await db.get(VideoSession, session_id)
+        if session is None or session.status not in {"completed", "failed", "soft_deleted"}:
+            return
+        pending = await db.scalar(
+            select(func.count(VideoSegment.id)).where(
+                VideoSegment.video_session_id == session_id,
+                VideoSegment.storage_state != "archive_ready",
+            )
+        )
+        event_id = session.event_id
+    if int(pending or 0) != 0:
+        return
+
+    await refresh_archive_metadata(session_id)
+    spool_root = safe_session_root(session_id)
+    source_log = spool_root / "logs" / "recorder.log"
+    if source_log.exists():
+        output_base = session_output_base(session.metadata_json)
+        _segments, _runs, _parts, archive_logs = ensure_archive_dirs(
+            output_base, event_id, session_id
+        )
+        try:
+            await asyncio.to_thread(
+                atomic_copy_verified,
+                source_log,
+                archive_logs / "recorder.log",
+                expected_bytes=source_log.stat().st_size,
+                min_free_bytes=0,
+            )
+        except Exception:
+            logger.exception("failed archiving recorder log session=%s", session_id)
+            return
+    try:
+        await asyncio.to_thread(shutil.rmtree, spool_root)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.exception("failed removing completed spool session=%s", session_id)
+
+
+async def process_archive_batch(candidates: list[ArchiveCandidate]) -> None:
+    if not candidates:
+        return
+    copied: dict[int, str] = {}
+    for candidate in candidates:
+        result = await asyncio.to_thread(
+            atomic_copy_verified,
+            archive_source_path(candidate),
+            archive_final_path(candidate),
+            expected_bytes=candidate.expected_bytes,
+            min_free_bytes=settings.video_archive_min_free_bytes,
+        )
+        copied[candidate.segment_id] = result.sha256
+
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(VideoSegment).where(VideoSegment.id.in_([candidate.segment_id for candidate in candidates]))
+            )
+        ).scalars().all()
+        by_id = {row.id: row for row in rows}
+        now = utcnow_naive()
+        for candidate in candidates:
+            row = by_id.get(candidate.segment_id)
+            if row is None:
+                raise RuntimeError(f"video segment disappeared during archive batch: {candidate.segment_id}")
+            row.storage_state = "archive_ready"
+            row.integrity_state = "hashed"
+            row.sha256 = copied[candidate.segment_id]
+            row.relative_path = str(
+                PurePosixPath(candidate.output_subdir)
+                / archive_segment_relative_path(candidate.event_id, candidate.session_id, candidate.file_name)
+            )
+            row.archived_at_utc = now
+            row.archive_last_error = None
+        await db.commit()
+
+    # One DB commit releases the whole batch. Only after every copied segment is
+    # durable and every row is archive_ready do we reclaim spool space.
+    for candidate in candidates:
+        try:
+            await asyncio.to_thread(cleanup_spool_copy_after_commit, candidate)
+        except Exception:
+            logger.exception(
+                "archive batch committed but spool cleanup is pending session=%s segment=%s",
+                candidate.session_id,
+                candidate.file_name,
+            )
+
+    session_id = candidates[0].session_id
+    try:
+        await refresh_archive_metadata(session_id)
+        await maybe_cleanup_terminal_spool(session_id)
+    except Exception:
+        logger.exception("failed refreshing archive metadata session=%s", session_id)
+
+
+async def storage_worker_loop(worker_no: int) -> None:
+    while not archive_shutdown.is_set():
+        archive_wakeup.clear()
+        candidates = await claim_archive_batch()
+        if not candidates:
+            try:
+                await asyncio.wait_for(archive_wakeup.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        try:
+            await process_archive_batch(candidates)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            for candidate in candidates:
+                await mark_archive_failure(candidate, exc)
+            try:
+                await asyncio.wait_for(archive_shutdown.wait(), timeout=settings.video_archive_retry_seconds)
+            except asyncio.TimeoutError:
+                pass
+    logger.info("storage worker stopped worker=%s", worker_no)
+
+
+async def recover_archive_handoff() -> None:
+    async with SessionLocal() as db:
+        await db.execute(
+            update(VideoSegment)
+            .where(VideoSegment.storage_state == "copying")
+            .values(storage_state="spool", archive_last_error="recovered interrupted archive copy")
+        )
+        await db.commit()
+
+    spool_root = Path(settings.video_spool_root)
+    if spool_root.exists():
+        for session_dir in spool_root.iterdir():
+            if not session_dir.is_dir():
+                continue
+            try:
+                session_id = uuid.UUID(session_dir.name)
+            except ValueError:
+                continue
+            source_files = [path.name for path in (session_dir / "segments").glob("seg_*.ts")]
+            candidates: list[ArchiveCandidate] = []
+            async with SessionLocal() as db:
+                session = await db.get(VideoSession, session_id)
+                if session is not None and source_files:
+                    rows = (
+                        await db.execute(
+                            select(VideoSegment).where(
+                                VideoSegment.video_session_id == session_id,
+                                VideoSegment.file_name.in_(source_files),
+                                VideoSegment.storage_state == "archive_ready",
+                            )
+                        )
+                    ).scalars().all()
+                    metadata = session.metadata_json or {}
+                    candidates = [
+                        ArchiveCandidate(
+                            segment_id=segment.id,
+                            session_id=session_id,
+                            event_id=session.event_id,
+                            file_name=segment.file_name,
+                            expected_bytes=int(segment.bytes),
+                            output_root_key=str(metadata.get("output_root_key") or "root1"),
+                            output_subdir=str(metadata.get("output_subdir") or "streamhub"),
+                        )
+                        for segment in rows
+                    ]
+
+            for candidate in candidates:
+                try:
+                    await asyncio.to_thread(cleanup_spool_copy_after_commit, candidate)
+                except Exception:
+                    logger.exception(
+                        "archive recovery could not clean spool session=%s segment=%s",
+                        candidate.session_id,
+                        candidate.file_name,
+                    )
+            try:
+                await refresh_archive_metadata(session_id)
+                await maybe_cleanup_terminal_spool(session_id)
+            except Exception:
+                logger.exception("archive recovery metadata failed session=%s", session_id)
+    archive_wakeup.set()
+
+
+async def storage_watchdog_loop() -> None:
+    while not archive_shutdown.is_set():
+        try:
+            free_bytes = shutil.disk_usage(Path(settings.video_spool_root)).free
+            if settings.video_spool_min_free_bytes and free_bytes < settings.video_spool_min_free_bytes:
+                logger.error(
+                    "video spool below safety threshold free=%s threshold=%s",
+                    free_bytes,
+                    settings.video_spool_min_free_bytes,
+                )
+                for worker in list(workers.values()):
+                    if not worker.stop_event.is_set():
+                        await worker.request_stop("storage_full")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("video storage watchdog failed")
+        try:
+            await asyncio.wait_for(archive_shutdown.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 class RecorderWorker:
@@ -441,7 +985,10 @@ class RecorderWorker:
             session.status = "completed"
             session.ended_at_utc = utcnow_naive()
             session.stop_reason = self.stop_reason
-            if self.request.media_type == "live" and not session.gap_count and not session.last_error:
+            if self.stop_reason == "storage_full":
+                session.completeness_status = "incomplete"
+                session.last_error = "video spool reached the configured free-space safety threshold"
+            elif self.request.media_type == "live" and not session.gap_count and not session.last_error:
                 session.completeness_status = "complete"
                 session.required_end_ms = session.coverage_end_ms
             else:
@@ -449,6 +996,12 @@ class RecorderWorker:
             session.last_activity_at_utc = utcnow_naive()
             await db.commit()
         await build_spool_playlist(self.request.session_id, finished=True)
+        archive_wakeup.set()
+        try:
+            await refresh_archive_metadata(self.request.session_id)
+            await maybe_cleanup_terminal_spool(self.request.session_id)
+        except Exception:
+            logger.exception("failed final archive metadata session=%s", self.request.session_id)
 
     async def finalize_vod_eof(self) -> None:
         async with SessionLocal() as db:
@@ -467,6 +1020,12 @@ class RecorderWorker:
             session.last_activity_at_utc = utcnow_naive()
             await db.commit()
         await build_spool_playlist(self.request.session_id, finished=True)
+        archive_wakeup.set()
+        try:
+            await refresh_archive_metadata(self.request.session_id)
+            await maybe_cleanup_terminal_spool(self.request.session_id)
+        except Exception:
+            logger.exception("failed final archive metadata session=%s", self.request.session_id)
 
     async def run(self) -> None:
         previous_run_no = await self.reconcile_previous_runs()
@@ -616,6 +1175,15 @@ async def recover_active_sessions() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     Path(settings.video_spool_root).mkdir(parents=True, exist_ok=True)
+    for output_root in enabled_output_roots().values():
+        output_root.mkdir(parents=True, exist_ok=True)
+    archive_shutdown.clear()
+    await recover_archive_handoff()
+    storage_tasks = [
+        asyncio.create_task(storage_worker_loop(worker_no), name=f"video-storage-{worker_no}")
+        for worker_no in range(1, settings.video_storage_copy_workers + 1)
+    ]
+    watchdog = asyncio.create_task(storage_watchdog_loop(), name="video-storage-watchdog")
     recovery = asyncio.create_task(recover_active_sessions())
     try:
         yield
@@ -626,6 +1194,12 @@ async def lifespan(_app: FastAPI):
                 await worker.request_stop("service_shutdown")
             except Exception:
                 logger.exception("failed stopping video worker session=%s", worker.request.session_id)
+        archive_shutdown.set()
+        archive_wakeup.set()
+        watchdog.cancel()
+        for task in storage_tasks:
+            task.cancel()
+        await asyncio.gather(watchdog, *storage_tasks, return_exceptions=True)
 
 
 app = FastAPI(title="StreamHub Video Recorder", version="0.1.0", lifespan=lifespan)
@@ -639,21 +1213,38 @@ async def health_live() -> dict[str, str]:
 @app.get("/health/ready")
 async def health_ready() -> dict:
     missing = [name for name in ("streamlink", "ffmpeg", "ffprobe") if shutil.which(name) is None]
-    root = Path(settings.video_spool_root)
-    root.mkdir(parents=True, exist_ok=True)
-    writable = os.access(root, os.W_OK)
-    if missing or not writable:
-        raise HTTPException(503, detail={"missing": missing, "spool_writable": writable})
+    spool_root = Path(settings.video_spool_root)
+    output_roots = enabled_output_roots()
+    spool_writable = directory_is_writable(spool_root)
+    output_writable = {key: directory_is_writable(path) for key, path in output_roots.items()}
+    if missing or not spool_writable or not all(output_writable.values()):
+        raise HTTPException(
+            503,
+            detail={
+                "missing": missing,
+                "spool_writable": spool_writable,
+                "output_writable": output_writable,
+            },
+        )
     try:
         async with SessionLocal() as db:
             await db.scalar(select(func.count()).select_from(VideoSession))
     except Exception as exc:
         raise HTTPException(503, detail=f"database unavailable: {exc}") from exc
-    return {"status": "ready", "spool_root": str(root)}
+    return {
+        "status": "ready",
+        "spool_root": str(spool_root),
+        "output_roots": {key: str(path) for key, path in output_roots.items()},
+        "storage_copy_workers": settings.video_storage_copy_workers,
+        "archive_batch_segments": settings.video_archive_batch_segments,
+    }
 
 
 @app.post("/internal/v1/video-sessions", dependencies=[Depends(require_internal_token)])
 async def start_video_session(payload: VideoStartRequest) -> dict:
+    spool_free = shutil.disk_usage(Path(settings.video_spool_root)).free
+    if settings.video_spool_min_free_bytes and spool_free < settings.video_spool_min_free_bytes:
+        raise HTTPException(507, "video spool is below the configured free-space safety threshold")
     async with SessionLocal() as db:
         row = await db.get(VideoSession, payload.session_id)
         if row is None:

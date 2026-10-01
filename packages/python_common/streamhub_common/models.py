@@ -273,6 +273,9 @@ class VideoSegment(Base):
     storage_state: Mapped[str] = mapped_column(String(24), default="spool", index=True)
     integrity_state: Mapped[str] = mapped_column(String(24), default="size_verified")
     sha256: Mapped[str | None] = mapped_column(String(64))
+    archive_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    archive_last_error: Mapped[str | None] = mapped_column(Text)
+    archived_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
     closed_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -291,6 +294,16 @@ class VideoGap(Base):
     source_end_ms: Mapped[int | None] = mapped_column(BigInteger)
     reason: Mapped[str] = mapped_column(String(64), default="unknown")
     resolved: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class StorageOutputSetting(Base):
+    __tablename__ = "storage_output_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    output_root_key: Mapped[str] = mapped_column(String(32), default="root1")
+    output_subdir: Mapped[str] = mapped_column(String(512), default="streamhub")
+    batch_segments: Mapped[int] = mapped_column(Integer, default=100)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class AuditLog(Base):

@@ -32,7 +32,7 @@ docker compose up --build
 
 On the first MySQL 8.4 startup (especially Docker Desktop on Windows), initializing a brand-new volume can take several minutes. The Compose healthcheck includes a 5-minute `start_period` so dependent services do not fail while MySQL is still creating its data files.
 
-If the previous first-start attempt created a partial development volume, reset it once before retrying:
+If the previous first-start attempt created a partial development volume and there is no unarchived video in `streamhub_video_spool`, reset it once before retrying:
 
 ```bash
 docker compose down -v --remove-orphans
@@ -67,7 +67,7 @@ make test
 make lint
 ```
 
-To reset the development database completely:
+To reset the development database and named volumes completely **only when no unarchived video remains in spool**:
 
 ```bash
 docker compose down -v
@@ -80,6 +80,7 @@ apps/
   api/               public API/session service
   chat_ingest/       isolated normalization/dedup/storage service
   twitch_adapter/    Twitch provider adapter and VOD worker
+  video_recorder/     Streamlink/FFmpeg capture + spool/archive handoff
   web/               React/Vite UI
   chrome_extension/  Manifest V3 control client
 packages/
@@ -90,3 +91,33 @@ docker-compose.yml
 .env                  local secrets, gitignored
 .env.example          safe template
 ```
+
+## v1.3 video storage handoff
+
+`video-recorder` writes closed MPEG-TS segments to the Docker named volume `streamhub_video_spool` first. A backend storage worker performs a two-phase handoff to the selected physical output root mounted under `/outputs/*`:
+
+1. copy the closed spool segment to a unique `.partial-*` file;
+2. flush/fsync and verify size + SHA-256 read-back;
+3. atomically publish the final `seg_XXXXXX.ts` with `os.replace`;
+4. commit `video_segments.storage_state=archive_ready` and the archive-relative path;
+5. only after that DB commit, delete the spool copy.
+
+The recorder uses a bounded Docker spool plus an explicit physical output root. `VIDEO_OUTPUT_ROOT_1_HOST` is required and must be an absolute host path outside the project/Docker storage (Windows example: `D:/StreamHub/output`). There is no relative-path fallback. Web → **Хранилище** selects the directory inside that mounted disk/root. A Video session snapshots that choice at Start, so changing the default never moves an active session mid-recording.
+
+The UI shows `VIDEO_OUTPUT_ROOT_1_LABEL`, so set it to a human-readable disk label such as `D: output`. Additional roots stay disabled until an explicit absolute bind mount is added for them; this avoids Docker silently creating project-local fallback directories.
+
+Closed segments are released from spool in verified batches (`VIDEO_ARCHIVE_BATCH_SEGMENTS`, default `100`). While recording, a batch is copied to the selected physical output, SHA-256 read-back is verified, the batch is committed as `archive_ready`, and only then are those spool copies removed. Stop/EOF flushes the final remainder smaller than the batch size.
+```text
+<selected output root>/<web subdir>/
+  twitch/events/<event_id>/video/<video_session_id>/
+    session.json
+    recording.m3u8
+    runs/run_000001.m3u8
+    segments/seg_000001.ts
+    parts/
+    logs/recorder.log
+```
+
+The storage worker is restart-idempotent at the important crash points: interrupted `copying` rows return to `spool`; an already published final segment can be verified and committed after restart; and an `archive_ready` row with a leftover spool copy is cleaned up only after the archive file is verified.
+
+**Do not use `docker compose down -v` while uncommitted video exists in spool.** `-v` deletes the named spool volume. Physical output roots are bind mounts and are separate from Compose named volumes.

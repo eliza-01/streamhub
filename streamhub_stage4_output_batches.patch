@@ -1,0 +1,1065 @@
+diff --git a/.env.example b/.env.example
+index 4990eaf..e3a118f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -149,13 +149,20 @@ VOD_REPLAY_REQUIRE_END_OF_PAGINATION=true
+ VOD_REPLAY_DOM_FALLBACK_CAN_MARK_COMPLETE=false
+ 
+ # -----------------------------------------------------------------------------
+-# v1.3 — Video Recorder + spool/archive
++# v1.3 — Video Recorder + spool/output
+ # -----------------------------------------------------------------------------
+ VIDEO_RECORDER_BASE_URL=http://video-recorder:8003
+-# Physical host archive. Compose mounts this path into video-recorder as /recordings.
+-# Override with an absolute Windows path if desired, for example C:/StreamHub/recordings.
+-RECORDINGS_ROOT_HOST=./recordings
+-RECORDINGS_ROOT=/recordings
++# Physical output roots exposed to the recorder. Configure host paths here once;
++# Web UI chooses one enabled root plus a subdirectory for new Video sessions.
++VIDEO_OUTPUT_ROOT_1_HOST=./output
++VIDEO_OUTPUT_ROOT_1_LABEL=project output
++VIDEO_OUTPUT_ROOT_2_HOST=./output-root2
++VIDEO_OUTPUT_ROOT_2_LABEL=root2
++VIDEO_OUTPUT_ROOT_2_ENABLED=false
++VIDEO_OUTPUT_ROOT_3_HOST=./output-root3
++VIDEO_OUTPUT_ROOT_3_LABEL=root3
++VIDEO_OUTPUT_ROOT_3_ENABLED=false
++VIDEO_ARCHIVE_BATCH_SEGMENTS=100
+ VIDEO_SPOOL_ROOT=/spool
+ VIDEO_SEGMENT_SECONDS=10
+ VIDEO_STREAM_QUALITY=best
+diff --git a/.gitignore b/.gitignore
+index 196f4e1..0b8212f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,6 +13,8 @@ coverage/
+ .vscode/
+ .idea/
+ 
+-# Local backend-managed video archive (physical host files)
+-recordings/*
+-!recordings/.gitkeep
++# Local backend-managed video output (physical host files)
++output/*
++output-root2/*
++output-root3/*
++!output/.gitkeep
+diff --git a/README.md b/README.md
+index 7a3f233..1caf219 100644
+--- a/README.md
++++ b/README.md
+@@ -94,7 +94,7 @@ docker-compose.yml
+ 
+ ## v1.3 video storage handoff
+ 
+-`video-recorder` writes closed MPEG-TS segments to the Docker named volume `streamhub_video_spool` first. A backend storage worker then performs a two-phase handoff to the physical archive mounted at `/recordings`:
++`video-recorder` writes closed MPEG-TS segments to the Docker named volume `streamhub_video_spool` first. A backend storage worker performs a two-phase handoff to the selected physical output root mounted under `/outputs/*`:
+ 
+ 1. copy the closed spool segment to a unique `.partial-*` file;
+ 2. flush/fsync and verify size + SHA-256 read-back;
+@@ -102,10 +102,11 @@ docker-compose.yml
+ 4. commit `video_segments.storage_state=archive_ready` and the archive-relative path;
+ 5. only after that DB commit, delete the spool copy.
+ 
+-The default host archive is `./recordings`. Set `RECORDINGS_ROOT_HOST` in `.env` to an absolute host path when the archive should live on another disk. Archive layout is UUID-stable:
++The recorder now uses a bounded Docker spool plus one or more host output roots. The first root defaults to `./output`; configure host paths with `VIDEO_OUTPUT_ROOT_1_HOST` (and optional root 2/3), then select the enabled root and a relative output directory from Web → **Хранилище**. A Video session snapshots that choice at Start, so changing the default never moves an active session mid-recording.
+ 
++Closed segments are released from spool in verified batches (`VIDEO_ARCHIVE_BATCH_SEGMENTS`, default `100`). While recording, a batch is copied to the selected physical output, SHA-256 read-back is verified, the batch is committed as `archive_ready`, and only then are those spool copies removed. Stop/EOF flushes the final remainder smaller than the batch size.
+ ```text
+-recordings/
++<selected output root>/<web subdir>/
+   twitch/events/<event_id>/video/<video_session_id>/
+     session.json
+     recording.m3u8
+@@ -117,4 +118,4 @@ recordings/
+ 
+ The storage worker is restart-idempotent at the important crash points: interrupted `copying` rows return to `spool`; an already published final segment can be verified and committed after restart; and an `archive_ready` row with a leftover spool copy is cleaned up only after the archive file is verified.
+ 
+-**Do not use `docker compose down -v` while unarchived video exists in spool.** `-v` deletes the named spool volume. The physical `RECORDINGS_ROOT_HOST` bind mount is separate and is not a Compose named volume.
++**Do not use `docker compose down -v` while uncommitted video exists in spool.** `-v` deletes the named spool volume. Physical output roots are bind mounts and are separate from Compose named volumes.
+diff --git a/apps/api/app/main.py b/apps/api/app/main.py
+index df8a57a..562312a 100644
+--- a/apps/api/app/main.py
++++ b/apps/api/app/main.py
+@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from streamhub_common.logging import configure_logging
+ from streamhub_common.settings import get_settings
+ 
+-from .routers import auth, capture, events, sessions, video
++from .routers import auth, capture, events, sessions, storage, video
+ 
+ settings = get_settings()
+ configure_logging(settings.log_level)
+@@ -36,4 +36,5 @@ app.include_router(sessions.router)
+ app.include_router(events.router)
+ app.include_router(capture.router)
+ app.include_router(video.router)
++app.include_router(storage.router)
+ app.include_router(auth.router)
+diff --git a/apps/api/app/routers/capture.py b/apps/api/app/routers/capture.py
+index 3c5b3c6..b911c95 100644
+--- a/apps/api/app/routers/capture.py
++++ b/apps/api/app/routers/capture.py
+@@ -10,7 +10,7 @@ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from streamhub_common.db import get_db
+-from streamhub_common.models import AuditLog, MediaEvent, Session, VideoSession
++from streamhub_common.models import AuditLog, MediaEvent, Session, StorageOutputSetting, VideoSession
+ from streamhub_common.settings import get_settings
+ 
+ from ..event_domain import resolve_or_create_media_event
+@@ -158,6 +158,10 @@ async def start_video_for_event(payload: CaptureStartRequest, event: MediaEvent,
+         await db.rollback()
+         return mode_result(requested=True, result="failed", error="canonical Twitch source URL is missing")
+ 
++    output_setting = await db.get(StorageOutputSetting, 1)
++    output_root_key = output_setting.output_root_key if output_setting is not None else "root1"
++    output_subdir = output_setting.output_subdir if output_setting is not None else "streamhub"
++
+     now = datetime.now(UTC).replace(tzinfo=None)
+     video_session_id = uuid.uuid4()
+     session = VideoSession(
+@@ -180,6 +184,8 @@ async def start_video_for_event(payload: CaptureStartRequest, event: MediaEvent,
+             "video_external_id": payload.video_external_id,
+             "stream_external_id": payload.stream_external_id,
+             "channel_login": payload.channel_login,
++            "output_root_key": output_root_key,
++            "output_subdir": output_subdir,
+             "stage": "video_capture_core",
+         },
+     )
+@@ -194,7 +200,12 @@ async def start_video_for_event(payload: CaptureStartRequest, event: MediaEvent,
+             event_id=event_id,
+             video_session_id=video_session_id,
+             action="video_start_requested",
+-            payload_json={"media_type": payload.mode, "quality": quality},
++            payload_json={
++                "media_type": payload.mode,
++                "quality": quality,
++                "output_root_key": output_root_key,
++                "output_subdir": output_subdir,
++            },
+         )
+     )
+     await db.commit()
+diff --git a/apps/api/app/routers/storage.py b/apps/api/app/routers/storage.py
+new file mode 100644
+index 0000000..5a2cc98
+--- /dev/null
++++ b/apps/api/app/routers/storage.py
+@@ -0,0 +1,90 @@
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from pathlib import PurePosixPath
++
++from fastapi import APIRouter, Depends, HTTPException
++from pydantic import BaseModel, Field
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from streamhub_common.db import get_db
++from streamhub_common.models import StorageOutputSetting
++from streamhub_common.settings import get_settings
++
++router = APIRouter(prefix="/api/v1/storage", tags=["storage"])
++settings = get_settings()
++
++
++class OutputSettingsUpdate(BaseModel):
++    output_root_key: str
++    output_subdir: str
++    batch_segments: int = Field(default=100, ge=1, le=1000)
++
++
++def available_output_roots() -> list[dict[str, str]]:
++    roots = [
++        {"key": "root1", "label": settings.video_output_root_1_label},
++    ]
++    if settings.video_output_root_2_enabled:
++        roots.append({"key": "root2", "label": settings.video_output_root_2_label})
++    if settings.video_output_root_3_enabled:
++        roots.append({"key": "root3", "label": settings.video_output_root_3_label})
++    return roots
++
++
++def normalize_output_subdir(value: str) -> str:
++    raw = value.strip().replace("\\", "/")
++    if not raw:
++        raise HTTPException(400, "output subdirectory is required")
++    path = PurePosixPath(raw)
++    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
++        raise HTTPException(400, "output subdirectory must be a safe relative path")
++    if any(":" in part for part in path.parts):
++        raise HTTPException(400, "drive letters belong to the configured output root, not the subdirectory")
++    return path.as_posix()
++
++
++async def get_or_create_output_setting(db: AsyncSession) -> StorageOutputSetting:
++    row = await db.get(StorageOutputSetting, 1)
++    if row is None:
++        row = StorageOutputSetting(
++            id=1,
++            output_root_key="root1",
++            output_subdir="streamhub",
++            batch_segments=settings.video_archive_batch_segments,
++        )
++        db.add(row)
++        await db.commit()
++        await db.refresh(row)
++    return row
++
++
++def payload(row: StorageOutputSetting) -> dict:
++    roots = available_output_roots()
++    return {
++        "output_root_key": row.output_root_key,
++        "output_subdir": row.output_subdir,
++        "roots": roots,
++        "batch_segments": int(row.batch_segments or settings.video_archive_batch_segments),
++        "applies_to": "new_video_sessions",
++    }
++
++
++@router.get("/output-settings")
++async def read_output_settings(db: AsyncSession = Depends(get_db)) -> dict:
++    return payload(await get_or_create_output_setting(db))
++
++
++@router.put("/output-settings")
++async def update_output_settings(body: OutputSettingsUpdate, db: AsyncSession = Depends(get_db)) -> dict:
++    roots = {item["key"] for item in available_output_roots()}
++    if body.output_root_key not in roots:
++        raise HTTPException(400, "output root is not enabled")
++    row = await get_or_create_output_setting(db)
++    row.output_root_key = body.output_root_key
++    row.output_subdir = normalize_output_subdir(body.output_subdir)
++    row.batch_segments = body.batch_segments
++    row.updated_at = datetime.now(UTC).replace(tzinfo=None)
++    await db.commit()
++    await db.refresh(row)
++    return payload(row)
+diff --git a/apps/api/app/routers/video.py b/apps/api/app/routers/video.py
+index 2ec88e6..20fdece 100644
+--- a/apps/api/app/routers/video.py
++++ b/apps/api/app/routers/video.py
+@@ -158,11 +158,16 @@ async def get_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(ge
+         state: {"segments": int(count or 0), "bytes": int(size or 0)}
+         for state, count, size in state_rows
+     }
++    metadata = row.metadata_json or {}
++    output_subdir = str(metadata.get("output_subdir") or "streamhub").strip("/\\")
++    relative_root = f"{output_subdir}/twitch/events/{row.event_id}/video/{row.id}"
+     return {
+         **video_session_dict(row),
+         "segment_count": int(segment_count or 0),
+         "bytes": int(total_bytes or 0),
+-        "archive_relative_root": f"twitch/events/{row.event_id}/video/{row.id}",
++        "output_root_key": str(metadata.get("output_root_key") or "root1"),
++        "output_subdir": output_subdir,
++        "archive_relative_root": relative_root,
+         "storage_summary": storage_summary,
+     }
+ 
+diff --git a/apps/video_recorder/app/main.py b/apps/video_recorder/app/main.py
+index 6f431f9..867a1db 100644
+--- a/apps/video_recorder/app/main.py
++++ b/apps/video_recorder/app/main.py
+@@ -10,7 +10,7 @@ import uuid
+ from contextlib import asynccontextmanager
+ from dataclasses import dataclass
+ from datetime import UTC, datetime
+-from pathlib import Path
++from pathlib import Path, PurePosixPath
+ from typing import Literal
+ 
+ from fastapi import Depends, FastAPI, HTTPException
+@@ -19,7 +19,7 @@ from sqlalchemy import func, select, update
+ 
+ from streamhub_common.db import SessionLocal
+ from streamhub_common.logging import configure_logging
+-from streamhub_common.models import VideoGap, VideoRun, VideoSegment, VideoSession
++from streamhub_common.models import StorageOutputSetting, VideoGap, VideoRun, VideoSegment, VideoSession
+ from streamhub_common.security import require_internal_token
+ from streamhub_common.settings import get_settings
+ 
+@@ -52,6 +52,38 @@ def safe_session_root(session_id: uuid.UUID) -> Path:
+     return candidate
+ 
+ 
++
++
++def enabled_output_roots() -> dict[str, Path]:
++    roots = {"root1": Path(settings.video_output_root_1)}
++    if settings.video_output_root_2_enabled:
++        roots["root2"] = Path(settings.video_output_root_2)
++    if settings.video_output_root_3_enabled:
++        roots["root3"] = Path(settings.video_output_root_3)
++    return roots
++
++
++def normalize_output_subdir(value: str | None) -> PurePosixPath:
++    raw = (value or "streamhub").strip().replace("\\", "/")
++    path = PurePosixPath(raw)
++    if not raw or path.is_absolute() or any(part in {"", ".", ".."} or ":" in part for part in path.parts):
++        raise ValueError(f"unsafe output subdirectory: {value!r}")
++    return path
++
++
++def session_output_base(metadata: dict | None) -> Path:
++    metadata = metadata or {}
++    key = str(metadata.get("output_root_key") or "root1")
++    roots = enabled_output_roots()
++    root = roots.get(key)
++    if root is None:
++        raise ValueError(f"video output root is not enabled: {key}")
++    root = root.resolve()
++    subdir = normalize_output_subdir(metadata.get("output_subdir"))
++    candidate = (root / Path(*subdir.parts)).resolve()
++    candidate.relative_to(root)
++    return candidate
++
+ def ensure_spool_dirs(session_id: uuid.UUID) -> tuple[Path, Path, Path]:
+     root = safe_session_root(session_id)
+     segments = root / "segments"
+@@ -115,7 +147,7 @@ async def max_segment_no(session_id: uuid.UUID) -> int:
+     archive_max = 0
+     if session is not None:
+         archive_dir = safe_archive_session_root(
+-            Path(settings.recordings_root), session.event_id, session_id
++            session_output_base(session.metadata_json), session.event_id, session_id
+         ) / "segments"
+         if archive_dir.exists():
+             for path in archive_dir.glob("seg_*.ts"):
+@@ -270,6 +302,8 @@ class ArchiveCandidate:
+     event_id: uuid.UUID
+     file_name: str
+     expected_bytes: int
++    output_root_key: str
++    output_subdir: str
+ 
+ 
+ archive_wakeup = asyncio.Event()
+@@ -281,9 +315,16 @@ def archive_source_path(candidate: ArchiveCandidate) -> Path:
+     return safe_session_root(candidate.session_id) / "segments" / candidate.file_name
+ 
+ 
++def candidate_output_base(candidate: ArchiveCandidate) -> Path:
++    return session_output_base({
++        "output_root_key": candidate.output_root_key,
++        "output_subdir": candidate.output_subdir,
++    })
++
++
+ def archive_final_path(candidate: ArchiveCandidate) -> Path:
+     segments_dir, _runs_dir, _parts_dir, _logs_dir = ensure_archive_dirs(
+-        Path(settings.recordings_root), candidate.event_id, candidate.session_id
++        candidate_output_base(candidate), candidate.event_id, candidate.session_id
+     )
+     return segments_dir / candidate.file_name
+ 
+@@ -296,36 +337,87 @@ def iso_utc(value: datetime | None) -> str | None:
+     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+ 
+ 
+-async def claim_archive_candidate() -> ArchiveCandidate | None:
++async def claim_archive_batch() -> list[ArchiveCandidate]:
++    terminal_statuses = {"completed", "failed", "soft_deleted"}
+     async with SessionLocal() as db:
+-        result = await db.execute(
+-            select(VideoSegment, VideoSession.event_id)
+-            .join(VideoSession, VideoSession.id == VideoSegment.video_session_id)
+-            .where(
+-                VideoSegment.storage_state == "spool",
+-                VideoSession.deleted_at_utc.is_(None),
+-            )
+-            .order_by(VideoSegment.archive_attempts, VideoSegment.closed_at_utc, VideoSegment.id)
+-            .with_for_update(skip_locked=True)
+-            .limit(1)
++        output_setting = await db.get(StorageOutputSetting, 1)
++        batch_size = int(
++            output_setting.batch_segments if output_setting is not None else settings.video_archive_batch_segments
+         )
+-        item = result.first()
+-        if item is None:
++        grouped = (
++            await db.execute(
++                select(
++                    VideoSession.id,
++                    VideoSession.event_id,
++                    VideoSession.status,
++                    func.count(VideoSegment.id).label("spool_count"),
++                    func.min(VideoSegment.closed_at_utc).label("oldest_closed"),
++                )
++                .join(VideoSegment, VideoSegment.video_session_id == VideoSession.id)
++                .where(
++                    VideoSegment.storage_state == "spool",
++                    VideoSession.deleted_at_utc.is_(None),
++                )
++                .group_by(
++                    VideoSession.id,
++                    VideoSession.event_id,
++                    VideoSession.status,
++                )
++                .order_by(func.min(VideoSegment.closed_at_utc), VideoSession.id)
++                .limit(50)
++            )
++        ).all()
++
++        selected = None
++        for row in grouped:
++            if int(row.spool_count or 0) >= batch_size or row.status in terminal_statuses:
++                selected = row
++                break
++        if selected is None:
+             await db.rollback()
+-            return None
+-        segment, event_id = item
+-        segment.storage_state = "copying"
+-        segment.archive_attempts = int(segment.archive_attempts or 0) + 1
+-        segment.archive_last_error = None
+-        candidate = ArchiveCandidate(
+-            segment_id=segment.id,
+-            session_id=segment.video_session_id,
+-            event_id=event_id,
+-            file_name=segment.file_name,
+-            expected_bytes=int(segment.bytes),
+-        )
++            return []
++
++        selected_session = await db.get(VideoSession, selected.id)
++        if selected_session is None:
++            await db.rollback()
++            return []
++        metadata = selected_session.metadata_json or {}
++        output_root_key = str(metadata.get("output_root_key") or "root1")
++        output_subdir = str(metadata.get("output_subdir") or "streamhub")
++        segments = (
++            await db.execute(
++                select(VideoSegment)
++                .where(
++                    VideoSegment.video_session_id == selected.id,
++                    VideoSegment.storage_state == "spool",
++                )
++                .order_by(VideoSegment.segment_no)
++                .with_for_update(skip_locked=True)
++                .limit(batch_size)
++            )
++        ).scalars().all()
++        if not segments:
++            await db.rollback()
++            return []
++
++        candidates: list[ArchiveCandidate] = []
++        for segment in segments:
++            segment.storage_state = "copying"
++            segment.archive_attempts = int(segment.archive_attempts or 0) + 1
++            segment.archive_last_error = None
++            candidates.append(
++                ArchiveCandidate(
++                    segment_id=segment.id,
++                    session_id=segment.video_session_id,
++                    event_id=selected.event_id,
++                    file_name=segment.file_name,
++                    expected_bytes=int(segment.bytes),
++                    output_root_key=output_root_key,
++                    output_subdir=output_subdir,
++                )
++            )
+         await db.commit()
+-        return candidate
++        return candidates
+ 
+ 
+ async def mark_archive_failure(candidate: ArchiveCandidate, error: Exception) -> None:
+@@ -415,9 +507,10 @@ async def refresh_archive_metadata(session_id: uuid.UUID) -> None:
+         session, runs, rows = await archive_rows_for_session(session_id)
+         if session is None:
+             return
+-        root = safe_archive_session_root(Path(settings.recordings_root), session.event_id, session.id)
++        output_base = session_output_base(session.metadata_json)
++        root = safe_archive_session_root(output_base, session.event_id, session.id)
+         _segments_dir, runs_dir, _parts_dir, _logs_dir = ensure_archive_dirs(
+-            Path(settings.recordings_root), session.event_id, session.id
++            output_base, session.event_id, session.id
+         )
+         ready_rows = [(segment, run_no) for segment, run_no in rows if segment.storage_state == "archive_ready"]
+         terminal = session.status in {"completed", "failed", "soft_deleted"}
+@@ -503,8 +596,9 @@ async def maybe_cleanup_terminal_spool(session_id: uuid.UUID) -> None:
+     spool_root = safe_session_root(session_id)
+     source_log = spool_root / "logs" / "recorder.log"
+     if source_log.exists():
++        output_base = session_output_base(session.metadata_json)
+         _segments, _runs, _parts, archive_logs = ensure_archive_dirs(
+-            Path(settings.recordings_root), event_id, session_id
++            output_base, event_id, session_id
+         )
+         try:
+             await asyncio.to_thread(
+@@ -525,65 +619,80 @@ async def maybe_cleanup_terminal_spool(session_id: uuid.UUID) -> None:
+         logger.exception("failed removing completed spool session=%s", session_id)
+ 
+ 
+-async def process_archive_candidate(candidate: ArchiveCandidate) -> None:
+-    source = archive_source_path(candidate)
+-    final = archive_final_path(candidate)
+-    result = await asyncio.to_thread(
+-        atomic_copy_verified,
+-        source,
+-        final,
+-        expected_bytes=candidate.expected_bytes,
+-        min_free_bytes=settings.video_archive_min_free_bytes,
+-    )
+-    relative_path = str(
+-        archive_segment_relative_path(candidate.event_id, candidate.session_id, candidate.file_name)
+-    )
++async def process_archive_batch(candidates: list[ArchiveCandidate]) -> None:
++    if not candidates:
++        return
++    copied: dict[int, str] = {}
++    for candidate in candidates:
++        result = await asyncio.to_thread(
++            atomic_copy_verified,
++            archive_source_path(candidate),
++            archive_final_path(candidate),
++            expected_bytes=candidate.expected_bytes,
++            min_free_bytes=settings.video_archive_min_free_bytes,
++        )
++        copied[candidate.segment_id] = result.sha256
++
+     async with SessionLocal() as db:
+-        row = await db.get(VideoSegment, candidate.segment_id)
+-        if row is None:
+-            return
+-        if row.storage_state != "archive_ready":
++        rows = (
++            await db.execute(
++                select(VideoSegment).where(VideoSegment.id.in_([candidate.segment_id for candidate in candidates]))
++            )
++        ).scalars().all()
++        by_id = {row.id: row for row in rows}
++        now = utcnow_naive()
++        for candidate in candidates:
++            row = by_id.get(candidate.segment_id)
++            if row is None:
++                raise RuntimeError(f"video segment disappeared during archive batch: {candidate.segment_id}")
+             row.storage_state = "archive_ready"
+             row.integrity_state = "hashed"
+-            row.sha256 = result.sha256
+-            row.relative_path = relative_path
+-            row.archived_at_utc = utcnow_naive()
++            row.sha256 = copied[candidate.segment_id]
++            row.relative_path = str(
++                PurePosixPath(candidate.output_subdir)
++                / archive_segment_relative_path(candidate.event_id, candidate.session_id, candidate.file_name)
++            )
++            row.archived_at_utc = now
+             row.archive_last_error = None
+-            await db.commit()
++        await db.commit()
+ 
+-    # The DB commit is the release barrier. The spool copy is removed only after
+-    # archive_ready is durable, so a crash at any earlier point keeps source data.
+-    try:
+-        await asyncio.to_thread(cleanup_spool_copy_after_commit, candidate)
+-    except Exception:
+-        logger.exception(
+-            "archive committed but spool cleanup is pending session=%s segment=%s",
+-            candidate.session_id,
+-            candidate.file_name,
+-        )
++    # One DB commit releases the whole batch. Only after every copied segment is
++    # durable and every row is archive_ready do we reclaim spool space.
++    for candidate in candidates:
++        try:
++            await asyncio.to_thread(cleanup_spool_copy_after_commit, candidate)
++        except Exception:
++            logger.exception(
++                "archive batch committed but spool cleanup is pending session=%s segment=%s",
++                candidate.session_id,
++                candidate.file_name,
++            )
++
++    session_id = candidates[0].session_id
+     try:
+-        await refresh_archive_metadata(candidate.session_id)
+-        await maybe_cleanup_terminal_spool(candidate.session_id)
++        await refresh_archive_metadata(session_id)
++        await maybe_cleanup_terminal_spool(session_id)
+     except Exception:
+-        logger.exception("failed refreshing archive metadata session=%s", candidate.session_id)
++        logger.exception("failed refreshing archive metadata session=%s", session_id)
+ 
+ 
+ async def storage_worker_loop(worker_no: int) -> None:
+     while not archive_shutdown.is_set():
+         archive_wakeup.clear()
+-        candidate = await claim_archive_candidate()
+-        if candidate is None:
++        candidates = await claim_archive_batch()
++        if not candidates:
+             try:
+                 await asyncio.wait_for(archive_wakeup.wait(), timeout=2.0)
+             except asyncio.TimeoutError:
+                 pass
+             continue
+         try:
+-            await process_archive_candidate(candidate)
++            await process_archive_batch(candidates)
+         except asyncio.CancelledError:
+             raise
+         except Exception as exc:
+-            await mark_archive_failure(candidate, exc)
++            for candidate in candidates:
++                await mark_archive_failure(candidate, exc)
+             try:
+                 await asyncio.wait_for(archive_shutdown.wait(), timeout=settings.video_archive_retry_seconds)
+             except asyncio.TimeoutError:
+@@ -623,6 +732,7 @@ async def recover_archive_handoff() -> None:
+                             )
+                         )
+                     ).scalars().all()
++                    metadata = session.metadata_json or {}
+                     candidates = [
+                         ArchiveCandidate(
+                             segment_id=segment.id,
+@@ -630,6 +740,8 @@ async def recover_archive_handoff() -> None:
+                             event_id=session.event_id,
+                             file_name=segment.file_name,
+                             expected_bytes=int(segment.bytes),
++                            output_root_key=str(metadata.get("output_root_key") or "root1"),
++                            output_subdir=str(metadata.get("output_subdir") or "streamhub"),
+                         )
+                         for segment in rows
+                     ]
+@@ -1063,7 +1175,8 @@ async def recover_active_sessions() -> None:
+ @asynccontextmanager
+ async def lifespan(_app: FastAPI):
+     Path(settings.video_spool_root).mkdir(parents=True, exist_ok=True)
+-    Path(settings.recordings_root).mkdir(parents=True, exist_ok=True)
++    for output_root in enabled_output_roots().values():
++        output_root.mkdir(parents=True, exist_ok=True)
+     archive_shutdown.clear()
+     await recover_archive_handoff()
+     storage_tasks = [
+@@ -1101,16 +1214,16 @@ async def health_live() -> dict[str, str]:
+ async def health_ready() -> dict:
+     missing = [name for name in ("streamlink", "ffmpeg", "ffprobe") if shutil.which(name) is None]
+     spool_root = Path(settings.video_spool_root)
+-    archive_root = Path(settings.recordings_root)
++    output_roots = enabled_output_roots()
+     spool_writable = directory_is_writable(spool_root)
+-    archive_writable = directory_is_writable(archive_root)
+-    if missing or not spool_writable or not archive_writable:
++    output_writable = {key: directory_is_writable(path) for key, path in output_roots.items()}
++    if missing or not spool_writable or not all(output_writable.values()):
+         raise HTTPException(
+             503,
+             detail={
+                 "missing": missing,
+                 "spool_writable": spool_writable,
+-                "archive_writable": archive_writable,
++                "output_writable": output_writable,
+             },
+         )
+     try:
+@@ -1121,8 +1234,9 @@ async def health_ready() -> dict:
+     return {
+         "status": "ready",
+         "spool_root": str(spool_root),
+-        "archive_root": str(archive_root),
++        "output_roots": {key: str(path) for key, path in output_roots.items()},
+         "storage_copy_workers": settings.video_storage_copy_workers,
++        "archive_batch_segments": settings.video_archive_batch_segments,
+     }
+ 
+ 
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 8e3b6f8..5149d3b 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -37,16 +37,36 @@ type VideoSession = {
+   last_error?: string | null;
+   last_activity_at_utc?: string | null;
+   stop_reason?: string | null;
+-  metadata?: { media_type?: "live" | "vod"; channel_login?: string | null } | null;
++  metadata?: {
++    media_type?: "live" | "vod";
++    channel_login?: string | null;
++    output_root_key?: string;
++    output_subdir?: string;
++  } | null;
+   created_at: string;
+   updated_at: string;
+   progress_percent?: number | null;
+   segment_count?: number;
+   bytes?: number;
+   archive_relative_root?: string;
++  output_root_key?: string;
++  output_subdir?: string;
+   storage_summary?: Record<string, { segments: number; bytes: number }>;
+ };
+ 
++type OutputRoot = {
++  key: string;
++  label: string;
++};
++
++type OutputSettings = {
++  output_root_key: string;
++  output_subdir: string;
++  roots: OutputRoot[];
++  batch_segments: number;
++  applies_to: string;
++};
++
+ type VideoRun = {
+   id: number;
+   run_no: number;
+@@ -135,7 +155,7 @@ type VideoCaptureProgress = {
+   percent?: number | null;
+ };
+ 
+-type ViewMode = "events" | "trash";
++type ViewMode = "events" | "trash" | "storage";
+ 
+ const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
+ const PROGRESS_POLL_MS = 5000;
+@@ -249,6 +269,11 @@ function App() {
+   const [seekText, setSeekText] = useState("00:00:00");
+   const [error, setError] = useState<string | null>(null);
+   const [actionId, setActionId] = useState<string | null>(null);
++  const [outputSettings, setOutputSettings] = useState<OutputSettings | null>(null);
++  const [outputRootKey, setOutputRootKey] = useState("root1");
++  const [outputSubdir, setOutputSubdir] = useState("streamhub");
++  const [outputBatchSegments, setOutputBatchSegments] = useState(100);
++  const [savingOutput, setSavingOutput] = useState(false);
+ 
+   async function loadEvents() {
+     try {
+@@ -264,6 +289,47 @@ function App() {
+     }
+   }
+ 
++  async function loadOutputSettings() {
++    try {
++      const res = await fetch(`${API}/api/v1/storage/output-settings`, { cache: "no-store" });
++      if (!res.ok) throw new Error(await res.text());
++      const data = await res.json() as OutputSettings;
++      setOutputSettings(data);
++      setOutputRootKey(data.output_root_key);
++      setOutputSubdir(data.output_subdir);
++      setOutputBatchSegments(data.batch_segments);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    }
++  }
++
++  async function saveOutputSettings() {
++    setSavingOutput(true);
++    try {
++      const res = await fetch(`${API}/api/v1/storage/output-settings`, {
++        method: "PUT",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          output_root_key: outputRootKey,
++          output_subdir: outputSubdir,
++          batch_segments: outputBatchSegments,
++        }),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      const data = await res.json() as OutputSettings;
++      setOutputSettings(data);
++      setOutputRootKey(data.output_root_key);
++      setOutputSubdir(data.output_subdir);
++      setOutputBatchSegments(data.batch_segments);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setSavingOutput(false);
++    }
++  }
++
+   async function loadTrash() {
+     try {
+       const res = await fetch(`${API}/api/v1/sessions?page_size=100&deleted=true`, { cache: "no-store" });
+@@ -278,6 +344,7 @@ function App() {
+ 
+   async function loadCurrentView(targetView: ViewMode = view) {
+     if (targetView === "events") await loadEvents();
++    else if (targetView === "storage") await loadOutputSettings();
+     else await loadTrash();
+   }
+ 
+@@ -536,7 +603,7 @@ function App() {
+         <button className="link" onClick={() => setSelectedVideo(null)}>← Events</button>
+         <header className="detail-header">
+           <div>
+-            <h1>Video Manager · archive</h1>
++            <h1>Video Manager · output</h1>
+             <p className="muted">{selectedVideo.metadata?.media_type?.toUpperCase() || "VIDEO"} · {selectedVideo.status} · {selectedVideo.completeness_status}</p>
+           </div>
+           <div className="actions">
+@@ -549,12 +616,12 @@ function App() {
+           <div><span>Записано</span><strong>{fmtMs(selectedVideo.duration_recorded_ms)}</strong></div>
+           <div><span>Сегментов</span><strong>{selectedVideo.segment_count || videoSegments.length}</strong></div>
+           <div><span>Размер</span><strong>{fmtBytes(selectedVideo.bytes || videoSegments.reduce((sum, item) => sum + item.bytes, 0))}</strong></div>
+-          <div><span>Archive ready</span><strong>{archiveReady}</strong></div>
++          <div><span>Output ready</span><strong>{archiveReady}</strong></div>
+           <div><span>Spool backlog</span><strong>{spoolPending}</strong></div>
+           <div><span>Gaps</span><strong>{selectedVideo.gap_count}</strong></div>
+         </section>
+         {selectedVideo.archive_relative_root && (
+-          <p className="muted small archive-root">Archive: <code>{selectedVideo.archive_relative_root}</code></p>
++          <p className="muted small archive-root">Output: <code>{selectedVideo.archive_relative_root}</code></p>
+         )}
+         <section className="video-block">
+           <div className="section-label">RUNS</div>
+@@ -569,8 +636,8 @@ function App() {
+           )}
+         </section>
+         <section className="video-block">
+-          <div className="section-label">SEGMENTS · spool → archive</div>
+-          <p className="muted small">Закрытый segment сначала живёт в Docker spool. Backend публикует immutable копию в физический archive и удаляет spool только после DB commit.</p>
++          <div className="section-label">SEGMENTS · spool → output</div>
++          <p className="muted small">Закрытый segment сначала живёт в Docker spool. Backend переносит закрытые segments пачками в физический output. Spool очищается только после проверки всей пачки и DB commit.</p>
+           {videoSegments.length === 0 ? <div className="empty-child">Закрытых сегментов пока нет</div> : (
+             <div className="table-wrap"><table><thead><tr><th>Segment</th><th>Run</th><th>Timeline</th><th>Duration</th><th>Bytes</th><th>Storage</th><th>Integrity</th><th>Archived</th><th>Path / error</th></tr></thead><tbody>
+               {videoSegments.map((segment) => <tr key={segment.id}>
+@@ -632,11 +699,12 @@ function App() {
+       <header>
+         <div>
+           <h1>StreamHub</h1>
+-          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : "Twitch Events · Chat + Video sessions"}</p>
++          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : view === "storage" ? "Video output · spool batches" : "Twitch Events · Chat + Video sessions"}</p>
+         </div>
+         <div className="actions">
+           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
+           <button className={view === "trash" ? "active-tab" : ""} onClick={() => setView("trash")}>Корзина</button>
++          <button className={view === "storage" ? "active-tab" : ""} onClick={() => setView("storage")}>Хранилище</button>
+           <button onClick={() => loadCurrentView(view)}>Обновить</button>
+         </div>
+       </header>
+@@ -707,6 +775,41 @@ function App() {
+             })}
+           </section>
+         </>
++      ) : view === "storage" ? (
++        <section className="storage-panel">
++          <div className="section-label">VIDEO OUTPUT</div>
++          {!outputSettings ? <div className="empty-child">Загрузка настроек…</div> : (
++            <>
++              <p className="muted">Настройка применяется к новым Video sessions. Уже идущая session продолжает писать в output, выбранный при её старте.</p>
++              <label className="storage-field">
++                <span>Диск / разрешённый output root</span>
++                <select value={outputRootKey} onChange={(e) => setOutputRootKey(e.target.value)}>
++                  {outputSettings.roots.map((root) => <option key={root.key} value={root.key}>{root.label}</option>)}
++                </select>
++              </label>
++              <label className="storage-field">
++                <span>Каталог внутри root</span>
++                <input value={outputSubdir} onChange={(e) => setOutputSubdir(e.target.value)} placeholder="streamhub" />
++              </label>
++              <label className="storage-field">
++                <span>Сегментов в пачке</span>
++                <input
++                  type="number"
++                  min={1}
++                  max={1000}
++                  value={outputBatchSegments}
++                  onChange={(e) => setOutputBatchSegments(Math.max(1, Math.min(1000, Number(e.target.value) || 1)))}
++                />
++              </label>
++              <div className="storage-note">
++                После копирования и SHA-256 проверки вся пачка фиксируется как archive_ready и удаляется из Docker spool. При Stop/EOF остаток меньше batch тоже переносится. Для рабочего режима оставляем 100; для короткой проверки можно временно поставить 5.
++              </div>
++              <div className="actions storage-actions">
++                <button disabled={savingOutput} onClick={saveOutputSettings}>{savingOutput ? "Сохраняю…" : "Сохранить output"}</button>
++              </div>
++            </>
++          )}
++        </section>
+       ) : (
+         <>
+           {trashSessions.length === 0 && <div className="empty">Корзина пуста</div>}
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 56ad0e7..478ea7b 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -90,3 +90,9 @@ td { font-variant-numeric: tabular-nums; }
+ .archive-root { margin: -6px 0 18px; overflow-wrap: anywhere; }
+ .path-cell { max-width: 420px; white-space: normal; overflow-wrap: anywhere; }
+ .inline-error { color: #a11919; }
++.storage-panel { margin-top: 22px; padding: 18px; background: white; border: 1px solid #d7dbe2; border-radius: 12px; }
++.storage-field { display: grid; gap: 7px; margin-top: 14px; max-width: 680px; }
++.storage-field span { font-size: 12px; font-weight: 700; color: #4b5563; }
++.storage-field input, .storage-field select { width: 100%; border: 1px solid #d7dbe2; border-radius: 10px; padding: 10px 12px; background: white; }
++.storage-note { margin-top: 16px; padding: 12px; border: 1px solid #eceff3; border-radius: 10px; background: #fafbfc; color: #4b5563; line-height: 1.5; }
++.storage-actions { margin-top: 16px; justify-content: flex-start; }
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 7aee45a..2268a0e 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -89,8 +89,14 @@ services:
+     volumes:
+       - streamhub_video_spool:/spool
+       - type: bind
+-        source: ${RECORDINGS_ROOT_HOST:-./recordings}
+-        target: /recordings
++        source: ${VIDEO_OUTPUT_ROOT_1_HOST:-./output}
++        target: /outputs/root1
++      - type: bind
++        source: ${VIDEO_OUTPUT_ROOT_2_HOST:-./output-root2}
++        target: /outputs/root2
++      - type: bind
++        source: ${VIDEO_OUTPUT_ROOT_3_HOST:-./output-root3}
++        target: /outputs/root3
+     depends_on:
+       migrate:
+         condition: service_completed_successfully
+diff --git a/migrations/versions/0005_storage_output_batches.py b/migrations/versions/0005_storage_output_batches.py
+new file mode 100644
+index 0000000..9e83033
+--- /dev/null
++++ b/migrations/versions/0005_storage_output_batches.py
+@@ -0,0 +1,39 @@
++"""storage output selection and batched spool handoff
++
++Revision ID: 0005_storage_output_batches
++Revises: 0004_video_spool_archive
++Create Date: 2026-10-01
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0005_storage_output_batches"
++down_revision = "0004_video_spool_archive"
++branch_labels = None
++depends_on = None
++
++DT = mysql.DATETIME(fsp=6)
++
++
++def upgrade() -> None:
++    op.create_table(
++        "storage_output_settings",
++        sa.Column("id", sa.Integer(), primary_key=True),
++        sa.Column("output_root_key", sa.String(length=32), nullable=False, server_default="root1"),
++        sa.Column("output_subdir", sa.String(length=512), nullable=False, server_default="streamhub"),
++        sa.Column("batch_segments", sa.Integer(), nullable=False, server_default="100"),
++        sa.Column("updated_at", DT, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++    )
++    op.execute(
++        sa.text(
++            "insert into storage_output_settings (id, output_root_key, output_subdir, batch_segments) "
++            "values (1, 'root1', 'streamhub', 100)"
++        )
++    )
++
++
++def downgrade() -> None:
++    op.drop_table("storage_output_settings")
+diff --git a/recordings/.gitkeep b/output/.gitkeep
+similarity index 100%
+rename from recordings/.gitkeep
+rename to output/.gitkeep
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index 661bac7..5ce0af8 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -296,6 +296,16 @@ class VideoGap(Base):
+     resolved: Mapped[bool] = mapped_column(Boolean, default=False)
+ 
+ 
++class StorageOutputSetting(Base):
++    __tablename__ = "storage_output_settings"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
++    output_root_key: Mapped[str] = mapped_column(String(32), default="root1")
++    output_subdir: Mapped[str] = mapped_column(String(512), default="streamhub")
++    batch_segments: Mapped[int] = mapped_column(Integer, default=100)
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
+ class AuditLog(Base):
+     __tablename__ = "audit_log"
+ 
+diff --git a/packages/python_common/streamhub_common/settings.py b/packages/python_common/streamhub_common/settings.py
+index 4812ca9..86a7c41 100644
+--- a/packages/python_common/streamhub_common/settings.py
++++ b/packages/python_common/streamhub_common/settings.py
+@@ -33,11 +33,19 @@ class Settings(BaseSettings):
+     twitch_adapter_base_url: str = Field(default="http://twitch-adapter:8002", alias="TWITCH_ADAPTER_BASE_URL")
+     video_recorder_base_url: str = Field(default="http://video-recorder:8003", alias="VIDEO_RECORDER_BASE_URL")
+ 
+-    recordings_root: str = Field(default="/recordings", alias="RECORDINGS_ROOT")
++    video_output_root_1: str = Field(default="/outputs/root1", alias="VIDEO_OUTPUT_ROOT_1")
++    video_output_root_1_label: str = Field(default="root1", alias="VIDEO_OUTPUT_ROOT_1_LABEL")
++    video_output_root_2: str = Field(default="/outputs/root2", alias="VIDEO_OUTPUT_ROOT_2")
++    video_output_root_2_label: str = Field(default="root2", alias="VIDEO_OUTPUT_ROOT_2_LABEL")
++    video_output_root_2_enabled: bool = Field(default=False, alias="VIDEO_OUTPUT_ROOT_2_ENABLED")
++    video_output_root_3: str = Field(default="/outputs/root3", alias="VIDEO_OUTPUT_ROOT_3")
++    video_output_root_3_label: str = Field(default="root3", alias="VIDEO_OUTPUT_ROOT_3_LABEL")
++    video_output_root_3_enabled: bool = Field(default=False, alias="VIDEO_OUTPUT_ROOT_3_ENABLED")
+     video_spool_root: str = Field(default="/spool", alias="VIDEO_SPOOL_ROOT")
+     video_segment_seconds: int = Field(default=10, ge=4, alias="VIDEO_SEGMENT_SECONDS")
+     video_storage_copy_workers: int = Field(default=1, ge=1, le=4, alias="VIDEO_STORAGE_COPY_WORKERS")
+     video_archive_retry_seconds: float = Field(default=5.0, ge=1.0, alias="VIDEO_ARCHIVE_RETRY_SECONDS")
++    video_archive_batch_segments: int = Field(default=100, ge=1, le=1000, alias="VIDEO_ARCHIVE_BATCH_SEGMENTS")
+     video_spool_min_free_bytes: int = Field(default=536870912, ge=0, alias="VIDEO_SPOOL_MIN_FREE_BYTES")
+     video_archive_min_free_bytes: int = Field(default=1073741824, ge=0, alias="VIDEO_ARCHIVE_MIN_FREE_BYTES")
+     video_stream_quality: str = Field(default="best", alias="VIDEO_STREAM_QUALITY")
+diff --git a/tests/test_video_archive_handoff.py b/tests/test_video_archive_handoff.py
+index 1340bda..7c11c28 100644
+--- a/tests/test_video_archive_handoff.py
++++ b/tests/test_video_archive_handoff.py
+@@ -91,16 +91,16 @@ def test_stage4_migration_and_compose_are_additive():
+     assert '"archived_at_utc"' in migration
+     assert 'drop_table("sessions")' not in migration
+     assert 'drop_table("chat_messages")' not in migration
+-    assert "RECORDINGS_ROOT_HOST:-./recordings" in compose
+-    assert "target: /recordings" in compose
+-    assert 'alias="RECORDINGS_ROOT"' in settings
++    assert "VIDEO_OUTPUT_ROOT_1_HOST:-./output" in compose
++    assert "target: /outputs/root1" in compose
++    assert 'alias="VIDEO_OUTPUT_ROOT_1"' in settings
+     assert 'alias="VIDEO_STORAGE_COPY_WORKERS"' in settings
+ 
+ 
+-def test_spool_release_happens_only_after_archive_ready_commit_in_source():
++def test_spool_release_happens_only_after_batch_archive_ready_commit_in_source():
+     root = Path(__file__).resolve().parents[1]
+     source = (root / "apps/video_recorder/app/main.py").read_text()
+-    function = source.split("async def process_archive_candidate", 1)[1].split(
++    function = source.split("async def process_archive_batch", 1)[1].split(
+         "async def storage_worker_loop", 1
+     )[0]
+ 
+@@ -108,4 +108,21 @@ def test_spool_release_happens_only_after_archive_ready_commit_in_source():
+     cleanup_at = function.index("cleanup_spool_copy_after_commit")
+     assert commit_at < cleanup_at
+     assert 'row.storage_state = "archive_ready"' in function
+-    assert 'row.relative_path = relative_path' in function
++    assert "for candidate in candidates" in function
++
++
++def test_stage5_output_settings_and_batch_size_are_wired():
++    root = Path(__file__).resolve().parents[1]
++    migration = (root / "migrations/versions/0005_storage_output_batches.py").read_text()
++    recorder = (root / "apps/video_recorder/app/main.py").read_text()
++    api = (root / "apps/api/app/routers/storage.py").read_text()
++    web = (root / "apps/web/src/main.tsx").read_text()
++
++    assert 'down_revision = "0004_video_spool_archive"' in migration
++    assert '"storage_output_settings"' in migration
++    assert "video_archive_batch_segments" in recorder
++    assert "claim_archive_batch" in recorder
++    assert 'prefix="/api/v1/storage"' in api
++    assert "output-settings" in api
++    assert "Хранилище" in web
++    assert "batch_segments" in web

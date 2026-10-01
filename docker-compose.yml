@@ -88,6 +88,9 @@ services:
     restart: unless-stopped
     volumes:
       - streamhub_video_spool:/spool
+      - type: bind
+        source: ${VIDEO_OUTPUT_ROOT_1_HOST:?set VIDEO_OUTPUT_ROOT_1_HOST in .env to an absolute host path, e.g. D:/StreamHub/output}
+        target: /outputs/root1
     depends_on:
       migrate:
         condition: service_completed_successfully

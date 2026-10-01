@@ -37,12 +37,34 @@ type VideoSession = {
   last_error?: string | null;
   last_activity_at_utc?: string | null;
   stop_reason?: string | null;
-  metadata?: { media_type?: "live" | "vod"; channel_login?: string | null } | null;
+  metadata?: {
+    media_type?: "live" | "vod";
+    channel_login?: string | null;
+    output_root_key?: string;
+    output_subdir?: string;
+  } | null;
   created_at: string;
   updated_at: string;
   progress_percent?: number | null;
   segment_count?: number;
   bytes?: number;
+  archive_relative_root?: string;
+  output_root_key?: string;
+  output_subdir?: string;
+  storage_summary?: Record<string, { segments: number; bytes: number }>;
+};
+
+type OutputRoot = {
+  key: string;
+  label: string;
+};
+
+type OutputSettings = {
+  output_root_key: string;
+  output_subdir: string;
+  roots: OutputRoot[];
+  batch_segments: number;
+  applies_to: string;
 };
 
 type VideoRun = {
@@ -74,6 +96,10 @@ type VideoSegment = {
   bytes: number;
   storage_state: string;
   integrity_state: string;
+  sha256?: string | null;
+  archive_attempts: number;
+  archive_last_error?: string | null;
+  archived_at_utc?: string | null;
   closed_at_utc: string;
 };
 
@@ -129,7 +155,7 @@ type VideoCaptureProgress = {
   percent?: number | null;
 };
 
-type ViewMode = "events" | "trash";
+type ViewMode = "events" | "trash" | "storage";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
 const PROGRESS_POLL_MS = 5000;
@@ -243,6 +269,11 @@ function App() {
   const [seekText, setSeekText] = useState("00:00:00");
   const [error, setError] = useState<string | null>(null);
   const [actionId, setActionId] = useState<string | null>(null);
+  const [outputSettings, setOutputSettings] = useState<OutputSettings | null>(null);
+  const [outputRootKey, setOutputRootKey] = useState("root1");
+  const [outputSubdir, setOutputSubdir] = useState("streamhub");
+  const [outputBatchSegments, setOutputBatchSegments] = useState(100);
+  const [savingOutput, setSavingOutput] = useState(false);
 
   async function loadEvents() {
     try {
@@ -255,6 +286,47 @@ function App() {
       setError(null);
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  async function loadOutputSettings() {
+    try {
+      const res = await fetch(`${API}/api/v1/storage/output-settings`, { cache: "no-store" });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json() as OutputSettings;
+      setOutputSettings(data);
+      setOutputRootKey(data.output_root_key);
+      setOutputSubdir(data.output_subdir);
+      setOutputBatchSegments(data.batch_segments);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function saveOutputSettings() {
+    setSavingOutput(true);
+    try {
+      const res = await fetch(`${API}/api/v1/storage/output-settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          output_root_key: outputRootKey,
+          output_subdir: outputSubdir,
+          batch_segments: outputBatchSegments,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json() as OutputSettings;
+      setOutputSettings(data);
+      setOutputRootKey(data.output_root_key);
+      setOutputSubdir(data.output_subdir);
+      setOutputBatchSegments(data.batch_segments);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingOutput(false);
     }
   }
 
@@ -272,6 +344,7 @@ function App() {
 
   async function loadCurrentView(targetView: ViewMode = view) {
     if (targetView === "events") await loadEvents();
+    else if (targetView === "storage") await loadOutputSettings();
     else await loadTrash();
   }
 
@@ -523,12 +596,14 @@ function App() {
 
   if (selectedVideo) {
     const progress = videoProgressBySession[selectedVideo.id];
+    const archiveReady = selectedVideo.storage_summary?.archive_ready?.segments || 0;
+    const spoolPending = (selectedVideo.storage_summary?.spool?.segments || 0) + (selectedVideo.storage_summary?.copying?.segments || 0);
     return (
       <main>
         <button className="link" onClick={() => setSelectedVideo(null)}>← Events</button>
         <header className="detail-header">
           <div>
-            <h1>Video Manager · core</h1>
+            <h1>Video Manager · output</h1>
             <p className="muted">{selectedVideo.metadata?.media_type?.toUpperCase() || "VIDEO"} · {selectedVideo.status} · {selectedVideo.completeness_status}</p>
           </div>
           <div className="actions">
@@ -541,8 +616,13 @@ function App() {
           <div><span>Записано</span><strong>{fmtMs(selectedVideo.duration_recorded_ms)}</strong></div>
           <div><span>Сегментов</span><strong>{selectedVideo.segment_count || videoSegments.length}</strong></div>
           <div><span>Размер</span><strong>{fmtBytes(selectedVideo.bytes || videoSegments.reduce((sum, item) => sum + item.bytes, 0))}</strong></div>
+          <div><span>Output ready</span><strong>{archiveReady}</strong></div>
+          <div><span>Spool backlog</span><strong>{spoolPending}</strong></div>
           <div><span>Gaps</span><strong>{selectedVideo.gap_count}</strong></div>
         </section>
+        {selectedVideo.archive_relative_root && (
+          <p className="muted small archive-root">Output: <code>{selectedVideo.archive_relative_root}</code></p>
+        )}
         <section className="video-block">
           <div className="section-label">RUNS</div>
           {videoRuns.length === 0 ? <div className="empty-child">Run ещё не создан</div> : (
@@ -556,15 +636,17 @@ function App() {
           )}
         </section>
         <section className="video-block">
-          <div className="section-label">SEGMENTS · spool</div>
-          <p className="muted small">На этом этапе показываются только реально закрытые MPEG-TS сегменты. Archive handoff будет отдельным следующим gate.</p>
+          <div className="section-label">SEGMENTS · spool → output</div>
+          <p className="muted small">Закрытый segment сначала живёт в Docker spool. Backend переносит закрытые segments пачками в физический output. Spool очищается только после проверки всей пачки и DB commit.</p>
           {videoSegments.length === 0 ? <div className="empty-child">Закрытых сегментов пока нет</div> : (
-            <div className="table-wrap"><table><thead><tr><th>Segment</th><th>Run</th><th>Timeline</th><th>Duration</th><th>Bytes</th><th>Storage</th><th>Integrity</th></tr></thead><tbody>
+            <div className="table-wrap"><table><thead><tr><th>Segment</th><th>Run</th><th>Timeline</th><th>Duration</th><th>Bytes</th><th>Storage</th><th>Integrity</th><th>Archived</th><th>Path / error</th></tr></thead><tbody>
               {videoSegments.map((segment) => <tr key={segment.id}>
                 <td>#{segment.segment_no}</td><td>{segment.video_run_id}</td>
                 <td>{fmtMs(segment.timeline_start_ms)}–{fmtMs(segment.timeline_end_ms)}</td>
                 <td>{fmtMs(segment.duration_ms)}</td><td>{fmtBytes(segment.bytes)}</td>
                 <td>{segment.storage_state}</td><td>{segment.integrity_state}</td>
+                <td>{segment.archived_at_utc ? new Date(segment.archived_at_utc).toLocaleString() : "—"}</td>
+                <td className="path-cell">{segment.archive_last_error ? <span className="inline-error">{segment.archive_last_error}</span> : <code>{segment.relative_path}</code>}</td>
               </tr>)}
             </tbody></table></div>
           )}
@@ -617,11 +699,12 @@ function App() {
       <header>
         <div>
           <h1>StreamHub</h1>
-          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : "Twitch Events · Chat + Video sessions"}</p>
+          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : view === "storage" ? "Video output · spool batches" : "Twitch Events · Chat + Video sessions"}</p>
         </div>
         <div className="actions">
           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
           <button className={view === "trash" ? "active-tab" : ""} onClick={() => setView("trash")}>Корзина</button>
+          <button className={view === "storage" ? "active-tab" : ""} onClick={() => setView("storage")}>Хранилище</button>
           <button onClick={() => loadCurrentView(view)}>Обновить</button>
         </div>
       </header>
@@ -692,6 +775,41 @@ function App() {
             })}
           </section>
         </>
+      ) : view === "storage" ? (
+        <section className="storage-panel">
+          <div className="section-label">VIDEO OUTPUT</div>
+          {!outputSettings ? <div className="empty-child">Загрузка настроек…</div> : (
+            <>
+              <p className="muted">Диск задаётся абсолютным путём в .env; здесь выбирается разрешённый root и каталог внутри него. Настройка применяется только к новым Video sessions.</p>
+              <label className="storage-field">
+                <span>Диск / output root из .env</span>
+                <select value={outputRootKey} onChange={(e) => setOutputRootKey(e.target.value)}>
+                  {outputSettings.roots.map((root) => <option key={root.key} value={root.key}>{root.label}</option>)}
+                </select>
+              </label>
+              <label className="storage-field">
+                <span>Каталог внутри root</span>
+                <input value={outputSubdir} onChange={(e) => setOutputSubdir(e.target.value)} placeholder="streamhub" />
+              </label>
+              <label className="storage-field">
+                <span>Сегментов в пачке</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={outputBatchSegments}
+                  onChange={(e) => setOutputBatchSegments(Math.max(1, Math.min(1000, Number(e.target.value) || 1)))}
+                />
+              </label>
+              <div className="storage-note">
+                После копирования и SHA-256 проверки вся пачка фиксируется как archive_ready и удаляется из Docker spool. При Stop/EOF остаток меньше batch тоже переносится. Для рабочего режима оставляем 100; для короткой проверки можно временно поставить 5.
+              </div>
+              <div className="actions storage-actions">
+                <button disabled={savingOutput} onClick={saveOutputSettings}>{savingOutput ? "Сохраняю…" : "Сохранить output"}</button>
+              </div>
+            </>
+          )}
+        </section>
       ) : (
         <>
           {trashSessions.length === 0 && <div className="empty">Корзина пуста</div>}

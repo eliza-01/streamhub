@@ -12,3 +12,5 @@ coverage/
 *.log
 .vscode/
 .idea/
+
+# Video output is an absolute host bind mount configured in .env, not a project-local directory.

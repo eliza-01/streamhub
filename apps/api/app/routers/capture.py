@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
-from streamhub_common.models import AuditLog, MediaEvent, Session, VideoSession
+from streamhub_common.models import AuditLog, MediaEvent, Session, StorageOutputSetting, VideoSession
 from streamhub_common.settings import get_settings
 
 from ..event_domain import resolve_or_create_media_event
@@ -158,6 +158,10 @@ async def start_video_for_event(payload: CaptureStartRequest, event: MediaEvent,
         await db.rollback()
         return mode_result(requested=True, result="failed", error="canonical Twitch source URL is missing")
 
+    output_setting = await db.get(StorageOutputSetting, 1)
+    output_root_key = output_setting.output_root_key if output_setting is not None else "root1"
+    output_subdir = output_setting.output_subdir if output_setting is not None else "streamhub"
+
     now = datetime.now(UTC).replace(tzinfo=None)
     video_session_id = uuid.uuid4()
     session = VideoSession(
@@ -180,6 +184,8 @@ async def start_video_for_event(payload: CaptureStartRequest, event: MediaEvent,
             "video_external_id": payload.video_external_id,
             "stream_external_id": payload.stream_external_id,
             "channel_login": payload.channel_login,
+            "output_root_key": output_root_key,
+            "output_subdir": output_subdir,
             "stage": "video_capture_core",
         },
     )
@@ -194,7 +200,12 @@ async def start_video_for_event(payload: CaptureStartRequest, event: MediaEvent,
             event_id=event_id,
             video_session_id=video_session_id,
             action="video_start_requested",
-            payload_json={"media_type": payload.mode, "quality": quality},
+            payload_json={
+                "media_type": payload.mode,
+                "quality": quality,
+                "output_root_key": output_root_key,
+                "output_subdir": output_subdir,
+            },
         )
     )
     await db.commit()

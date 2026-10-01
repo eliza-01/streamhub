@@ -143,10 +143,32 @@ async def get_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(ge
             )
         )
     ).one()
+    state_rows = (
+        await db.execute(
+            select(
+                VideoSegment.storage_state,
+                func.count(VideoSegment.id),
+                func.coalesce(func.sum(VideoSegment.bytes), 0),
+            )
+            .where(VideoSegment.video_session_id == session_id)
+            .group_by(VideoSegment.storage_state)
+        )
+    ).all()
+    storage_summary = {
+        state: {"segments": int(count or 0), "bytes": int(size or 0)}
+        for state, count, size in state_rows
+    }
+    metadata = row.metadata_json or {}
+    output_subdir = str(metadata.get("output_subdir") or "streamhub").strip("/\\")
+    relative_root = f"{output_subdir}/twitch/events/{row.event_id}/video/{row.id}"
     return {
         **video_session_dict(row),
         "segment_count": int(segment_count or 0),
         "bytes": int(total_bytes or 0),
+        "output_root_key": str(metadata.get("output_root_key") or "root1"),
+        "output_subdir": output_subdir,
+        "archive_relative_root": relative_root,
+        "storage_summary": storage_summary,
     }
 
 
@@ -217,6 +239,10 @@ async def list_video_segments(
                 "bytes": segment.bytes,
                 "storage_state": segment.storage_state,
                 "integrity_state": segment.integrity_state,
+                "sha256": segment.sha256,
+                "archive_attempts": segment.archive_attempts,
+                "archive_last_error": segment.archive_last_error,
+                "archived_at_utc": segment.archived_at_utc,
                 "closed_at_utc": segment.closed_at_utc,
             }
             for segment in segments
