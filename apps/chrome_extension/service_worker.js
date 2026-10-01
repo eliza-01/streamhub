@@ -1,6 +1,5 @@
 const DEFAULT_STATE = {
   apiBaseUrl: "http://localhost:18741",
-  autostart: false,
   activeSessionId: null,
   activeSessionMode: null,
   activeSessionTabId: null

@@ -21,10 +21,40 @@ from sqlalchemy.dialects.mysql import BINARY as MYSQL_BINARY, DATETIME
 from .db import Base, UUIDBinary
 
 
+class MediaEvent(Base):
+    __tablename__ = "media_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    platform: Mapped[str] = mapped_column(String(32), default="twitch", index=True)
+    media_type: Mapped[str] = mapped_column(String(16), index=True)
+    external_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    channel_external_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    channel_login: Mapped[str | None] = mapped_column(String(255), index=True)
+    channel_display_name: Mapped[str | None] = mapped_column(String(255))
+    stream_external_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    video_external_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    title: Mapped[str | None] = mapped_column(String(1024))
+    category_id: Mapped[str | None] = mapped_column(String(64))
+    category_name: Mapped[str | None] = mapped_column(String(255))
+    source_started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    source_duration_ms: Mapped[int | None] = mapped_column(BigInteger)
+    source_url: Mapped[str | None] = mapped_column(String(2048))
+    related_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="SET NULL"), index=True
+    )
+    metadata_json: Mapped[dict | None] = mapped_column(JSON)
+    deleted_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Session(Base):
     __tablename__ = "sessions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
     platform: Mapped[str] = mapped_column(String(32), default="twitch", index=True)
     media_type: Mapped[str] = mapped_column(String(16), index=True)
     status: Mapped[str] = mapped_column(String(32), default="new", index=True)

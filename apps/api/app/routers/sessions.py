@@ -11,8 +11,10 @@ from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
-from streamhub_common.models import AuditLog, CaptureJob, ChatEvent, ChatMessage, Session, SessionSegment
+from streamhub_common.models import AuditLog, CaptureJob, ChatEvent, ChatMessage, MediaEvent, Session, SessionSegment
 from streamhub_common.settings import get_settings
+
+from ..event_domain import resolve_or_create_media_event
 
 router = APIRouter(prefix="/api/v1", tags=["sessions"])
 settings = get_settings()
@@ -84,6 +86,12 @@ class SessionStartRequest(BaseModel):
     twitch_integrity: TwitchIntegrityContext | None = None
 
 
+class CollectorContextRequest(BaseModel):
+    mode: Literal["live", "vod"]
+    channel_login: str | None = None
+    video_external_id: str | None = None
+
+
 class StopRequest(BaseModel):
     reason: str = "stop_user"
 
@@ -91,6 +99,7 @@ class StopRequest(BaseModel):
 def session_dict(row: Session) -> dict:
     return {
         "id": str(row.id),
+        "event_id": str(row.event_id),
         "platform": row.platform,
         "media_type": row.media_type,
         "status": row.status,
@@ -128,6 +137,73 @@ async def adapter_post(path: str, payload: dict) -> dict:
     return response.json()
 
 
+async def resolve_live_metadata(channel_login: str) -> tuple[dict, datetime | None]:
+    resolved = await adapter_post(
+        "/internal/v1/metadata/resolve",
+        {"mode": "live", "channel_login": channel_login},
+    )
+    if not resolved.get("stream_external_id"):
+        raise HTTPException(status_code=502, detail="Twitch metadata resolver returned no stream id")
+    started_at = None
+    if resolved.get("source_started_at_utc"):
+        started_at = datetime.fromisoformat(str(resolved["source_started_at_utc"]).replace("Z", "+00:00"))
+    return resolved, started_at
+
+
+async def stop_capture_row(db: AsyncSession, row: Session, *, reason: str) -> None:
+    if row.media_type == "vod":
+        await adapter_post(f"/internal/v1/vod-fetches/{row.id}/stop", {"reason": reason})
+    else:
+        await adapter_post(f"/internal/v1/live-collectors/{row.id}/stop", {"reason": reason})
+    if row.completeness_status != "complete":
+        row.status = "stopped_incomplete"
+        row.completeness_status = "incomplete"
+    row.recording_ended_at_utc = datetime.now(UTC).replace(tzinfo=None)
+    db.add(AuditLog(session_id=row.id, action="manual_stop", payload_json={"reason": reason}))
+
+
+@router.post("/collector/context-status")
+async def collector_context_status(payload: CollectorContextRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    if payload.mode == "vod":
+        if not payload.video_external_id:
+            raise HTTPException(400, "video_external_id is required for VOD")
+        external_key = f"twitch:vod:{payload.video_external_id}"
+        resolved_stream_external_id = None
+    else:
+        if not payload.channel_login:
+            raise HTTPException(400, "channel_login is required for LIVE")
+        resolved, _started_at = await resolve_live_metadata(payload.channel_login)
+        resolved_stream_external_id = str(resolved["stream_external_id"])
+        external_key = f"twitch:live:{resolved_stream_external_id}"
+
+    event = await db.scalar(select(MediaEvent).where(MediaEvent.external_key == external_key))
+    if event is None:
+        return {
+            "event": None,
+            "active_session": None,
+            "active_sessions_count": 0,
+            "resolved_stream_external_id": resolved_stream_external_id,
+        }
+
+    active_rows = (
+        await db.execute(
+            select(Session)
+            .where(
+                Session.event_id == event.id,
+                Session.deleted_at_utc.is_(None),
+                Session.status.in_(ACTIVE_CAPTURE_SESSION_STATUSES),
+            )
+            .order_by(Session.created_at.desc())
+        )
+    ).scalars().all()
+    return {
+        "event": {"id": str(event.id), "external_key": event.external_key, "media_type": event.media_type},
+        "active_session": session_dict(active_rows[0]) if active_rows else None,
+        "active_sessions_count": len(active_rows),
+        "resolved_stream_external_id": resolved_stream_external_id,
+    }
+
+
 @router.post("/collector/sessions", status_code=status.HTTP_201_CREATED)
 async def start_session(payload: SessionStartRequest, db: AsyncSession = Depends(get_db)) -> dict:
     if not payload.player_open:
@@ -141,9 +217,64 @@ async def start_session(payload: SessionStartRequest, db: AsyncSession = Depends
         )
     if payload.mode == "live" and not payload.channel_login:
         raise HTTPException(status_code=400, detail="channel_login is required for LIVE")
+    if payload.mode == "live" and not payload.stream_external_id:
+        resolved, resolved_started_at = await resolve_live_metadata(payload.channel_login)
+        payload = payload.model_copy(
+            update={
+                "channel_external_id": resolved.get("channel_external_id") or payload.channel_external_id,
+                "channel_login": resolved.get("channel_login") or payload.channel_login,
+                "channel_display_name": resolved.get("channel_display_name") or payload.channel_display_name,
+                "stream_external_id": str(resolved["stream_external_id"]),
+                "title": resolved.get("title") or payload.title,
+                "category_id": resolved.get("category_id") or payload.category_id,
+                "category_name": resolved.get("category_name") or payload.category_name,
+                "source_started_at_utc": resolved_started_at or payload.source_started_at_utc,
+            }
+        )
 
     now = datetime.now(UTC).replace(tzinfo=None)
+    session_id = uuid.uuid4()
+    event = await resolve_or_create_media_event(
+        db,
+        session_id=session_id,
+        platform=payload.platform,
+        media_type=payload.mode,
+        channel_external_id=payload.channel_external_id,
+        channel_login=payload.channel_login,
+        channel_display_name=payload.channel_display_name,
+        stream_external_id=payload.stream_external_id,
+        video_external_id=payload.video_external_id,
+        title=payload.title,
+        category_id=payload.category_id,
+        category_name=payload.category_name,
+        source_started_at_utc=payload.source_started_at_utc.replace(tzinfo=None) if payload.source_started_at_utc else None,
+        source_duration_ms=payload.duration_ms,
+        page_url=payload.page_url,
+    )
+    # Serialize Start for the same canonical event. The DB row lock is the
+    # invariant; Extension state is only a control-plane convenience.
+    event = (
+        await db.execute(select(MediaEvent).where(MediaEvent.id == event.id).with_for_update())
+    ).scalar_one()
+    active_session = await db.scalar(
+        select(Session)
+        .where(
+            Session.event_id == event.id,
+            Session.deleted_at_utc.is_(None),
+            Session.status.in_(ACTIVE_CAPTURE_SESSION_STATUSES),
+        )
+        .order_by(Session.created_at.desc())
+        .limit(1)
+    )
+    if active_session is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"active chat session already exists for event: {active_session.id}",
+        )
+
     row = Session(
+        id=session_id,
+        event_id=event.id,
         platform=payload.platform,
         media_type=payload.mode,
         status="arming",
@@ -230,15 +361,7 @@ async def stop_session(session_id: uuid.UUID, payload: StopRequest, db: AsyncSes
     row = await db.get(Session, session_id)
     if not row:
         raise HTTPException(404, "session not found")
-    if row.media_type == "vod":
-        await adapter_post(f"/internal/v1/vod-fetches/{session_id}/stop", {"reason": payload.reason})
-    else:
-        await adapter_post(f"/internal/v1/live-collectors/{session_id}/stop", {"reason": payload.reason})
-    if row.completeness_status != "complete":
-        row.status = "stopped_incomplete"
-        row.completeness_status = "incomplete"
-    row.recording_ended_at_utc = datetime.now(UTC).replace(tzinfo=None)
-    db.add(AuditLog(session_id=session_id, action="manual_stop", payload_json={"reason": payload.reason}))
+    await stop_capture_row(db, row, reason=payload.reason)
     await db.commit()
     return session_dict(row)
 
@@ -522,7 +645,13 @@ async def purge_session(
     await db.execute(delete(ChatEvent).where(ChatEvent.session_id == session_id))
     await db.execute(delete(ChatMessage).where(ChatMessage.session_id == session_id))
     await db.execute(delete(SessionSegment).where(SessionSegment.session_id == session_id))
+    event_id = row.event_id
     await db.execute(delete(CaptureJob).where(CaptureJob.session_id == session_id))
     await db.execute(delete(Session).where(Session.id == session_id))
+    remaining_sessions = await db.scalar(
+        select(func.count()).select_from(Session).where(Session.event_id == event_id)
+    )
+    if int(remaining_sessions or 0) == 0:
+        await db.execute(delete(MediaEvent).where(MediaEvent.id == event_id))
     await db.commit()
     return {"ok": True, "purged": True}

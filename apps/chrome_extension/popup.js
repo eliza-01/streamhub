@@ -2,6 +2,8 @@ let context = null;
 let state = null;
 let pollTimer = null;
 let activeTabId = null;
+let currentEventId = null;
+let activeSessionsCount = 0;
 
 const $ = (id) => document.getElementById(id);
 
@@ -12,7 +14,7 @@ function showMessage(text) {
 }
 
 async function getState() {
-  const defaults = { apiBaseUrl: "http://localhost:18741", autostart: false, activeSessionId: null, activeSessionMode: null, activeSessionTabId: null };
+  const defaults = { apiBaseUrl: "http://localhost:18741", activeSessionId: null, activeSessionMode: null, activeSessionTabId: null };
   const stored = await chrome.storage.local.get(Object.keys(defaults));
   const next = { ...defaults, ...stored };
   if (["http://localhost:8000", "http://127.0.0.1:8000"].includes(next.apiBaseUrl)) {
@@ -31,6 +33,17 @@ async function api(path, init = {}) {
   return response.json();
 }
 
+async function persistActiveSession(activeSession) {
+  state.activeSessionId = activeSession?.id || null;
+  state.activeSessionMode = activeSession?.media_type || null;
+  state.activeSessionTabId = activeSession ? activeTabId : null;
+  await chrome.storage.local.set({
+    activeSessionId: state.activeSessionId,
+    activeSessionMode: state.activeSessionMode,
+    activeSessionTabId: state.activeSessionTabId
+  });
+}
+
 function render() {
   const supported = Boolean(context?.supported && context?.player_open);
   $("status").textContent = context?.supported
@@ -40,14 +53,15 @@ function render() {
     context?.channel_login ? `channel: ${context.channel_login}` : null,
     context?.video_id ? `video_id: ${context.video_id}` : null,
     context?.duration_ms != null ? `duration: ${Math.round(context.duration_ms / 1000)}s` : null,
-    state?.activeSessionId ? `session: ${state.activeSessionId}` : "session: none"
+    currentEventId ? `event: ${currentEventId}` : null,
+    state?.activeSessionId ? `session: ${state.activeSessionId}` : "session: none",
+    activeSessionsCount > 1 ? `active sessions: ${activeSessionsCount} (будут остановлены вместе)` : null
   ].filter(Boolean);
   $("details").textContent = parts.join("\n");
   $("start").disabled = !supported || Boolean(state?.activeSessionId);
   $("pause").disabled = !state?.activeSessionId;
   $("resume").disabled = !state?.activeSessionId;
   $("stop").disabled = !state?.activeSessionId;
-  $("autostart").checked = Boolean(state?.autostart);
 }
 
 async function getTwitchIntegrity(tabId) {
@@ -60,6 +74,9 @@ async function refreshContext() {
   activeTabId = tab?.id ?? null;
   if (!tab?.id || !tab.url?.includes("twitch.tv")) {
     context = { supported: false, mode: "unsupported", player_open: false };
+    currentEventId = null;
+    activeSessionsCount = 0;
+    await persistActiveSession(null);
     render();
     return;
   }
@@ -71,9 +88,44 @@ async function refreshContext() {
   render();
 }
 
+async function syncCurrentCollectorStatus({ silent = false } = {}) {
+  if (!context?.supported || !context?.player_open) {
+    currentEventId = null;
+    activeSessionsCount = 0;
+    await persistActiveSession(null);
+    render();
+    return null;
+  }
+  const payload = {
+    mode: context.mode,
+    channel_login: context.channel_login || null,
+    video_external_id: context.video_id || null
+  };
+  try {
+    const result = await api("/api/v1/collector/context-status", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    currentEventId = result.event?.id || null;
+    activeSessionsCount = Number(result.active_sessions_count || 0);
+    await persistActiveSession(result.active_session || null);
+    render();
+    return result;
+  } catch (e) {
+    if (!silent) showMessage(`Ошибка определения текущего сбора: ${e}`);
+    render();
+    return null;
+  }
+}
+
 $("start").addEventListener("click", async () => {
   showMessage("");
   try {
+    const beforeStart = await syncCurrentCollectorStatus({ silent: true });
+    if (beforeStart?.active_session) {
+      showMessage(`Сбор уже идёт: ${beforeStart.active_session.id}`);
+      return;
+    }
     const twitchIntegrity = context.mode === "vod" ? await getTwitchIntegrity(activeTabId) : null;
     if (context.mode === "vod" && !twitchIntegrity?.client_integrity) {
       throw new Error("Twitch Client-Integrity ещё не пойман. Обнови вкладку VOD, подожди несколько секунд и нажми Start снова.");
@@ -89,19 +141,21 @@ $("start").addEventListener("click", async () => {
       twitch_integrity: twitchIntegrity
     };
     const result = await api("/api/v1/collector/sessions", { method: "POST", body: JSON.stringify(payload) });
-    state.activeSessionId = result.id;
-    state.activeSessionMode = result.media_type;
-    state.activeSessionTabId = activeTabId;
-    await chrome.storage.local.set({ activeSessionId: result.id, activeSessionMode: result.media_type, activeSessionTabId: activeTabId });
+    await persistActiveSession(result);
+    currentEventId = result.event_id || currentEventId;
+    activeSessionsCount = 1;
     showMessage(`Запись запущена: ${result.id}`);
     render();
   } catch (e) {
+    if (String(e).includes("409:")) await syncCurrentCollectorStatus({ silent: true });
     showMessage(`Ошибка Start: ${e}`);
   }
 });
 
 $("pause").addEventListener("click", async () => {
   try {
+    await syncCurrentCollectorStatus({ silent: true });
+    if (!state.activeSessionId) throw new Error("для текущего события активной сессии нет");
     await api(`/api/v1/collector/sessions/${state.activeSessionId}/pause`, { method: "POST", body: "{}" });
     showMessage("Pause установлен. Для LIVE данные по ТЗ не должны теряться; VOD останавливается на checkpoint.");
   } catch (e) { showMessage(`Ошибка Pause: ${e}`); }
@@ -109,6 +163,8 @@ $("pause").addEventListener("click", async () => {
 
 $("resume").addEventListener("click", async () => {
   try {
+    await syncCurrentCollectorStatus({ silent: true });
+    if (!state.activeSessionId) throw new Error("для текущего события активной сессии нет");
     if (state.activeSessionMode === "vod" && state.activeSessionTabId != null) {
       const twitchIntegrity = await getTwitchIntegrity(state.activeSessionTabId);
       if (twitchIntegrity?.client_integrity) {
@@ -125,14 +181,26 @@ $("resume").addEventListener("click", async () => {
 $("stop").addEventListener("click", async () => {
   if (!confirm("Остановить запись? Если диапазон ещё не покрыт полностью, сессия останется incomplete.")) return;
   try {
-    await api(`/api/v1/collector/sessions/${state.activeSessionId}/stop`, {
-      method: "POST", body: JSON.stringify({ reason: "stop_user" })
-    });
-    await chrome.storage.local.set({ activeSessionId: null, activeSessionMode: null, activeSessionTabId: null });
-    state.activeSessionId = null;
-    state.activeSessionMode = null;
-    state.activeSessionTabId = null;
-    showMessage("Запись остановлена.");
+    await syncCurrentCollectorStatus({ silent: true });
+    if (!state.activeSessionId) {
+      showMessage("Для текущего события активного сбора уже нет.");
+      return;
+    }
+    let stopped = 1;
+    if (currentEventId) {
+      const result = await api(`/api/v1/events/${currentEventId}/stop-all`, { method: "POST", body: "{}" });
+      stopped = Number(result.chat?.stopped || 0);
+      const failed = Number(result.chat?.failed || 0);
+      if (failed) throw new Error(`не удалось остановить ${failed} активных сессий`);
+    } else {
+      await api(`/api/v1/collector/sessions/${state.activeSessionId}/stop`, {
+        method: "POST", body: JSON.stringify({ reason: "stop_user" })
+      });
+    }
+    currentEventId = null;
+    activeSessionsCount = 0;
+    await persistActiveSession(null);
+    showMessage(`Запись остановлена. Остановлено сессий: ${stopped}.`);
     render();
   } catch (e) { showMessage(`Ошибка Stop: ${e}`); }
 });
@@ -160,21 +228,8 @@ $("auth").addEventListener("click", async () => {
   } catch (e) { showMessage(`Ошибка авторизации: ${e}`); }
 });
 
-$("autostart").addEventListener("change", async (event) => {
-  state.autostart = event.target.checked;
-  await chrome.storage.local.set({ autostart: state.autostart });
-});
-
 (async function init() {
   state = await getState();
   await refreshContext();
-  if (
-    state.activeSessionId &&
-    state.activeSessionTabId == null &&
-    activeTabId != null &&
-    context?.mode === state.activeSessionMode
-  ) {
-    state.activeSessionTabId = activeTabId;
-    await chrome.storage.local.set({ activeSessionTabId: activeTabId });
-  }
+  await syncCurrentCollectorStatus();
 })();

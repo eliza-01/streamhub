@@ -9,7 +9,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import websockets
@@ -108,6 +108,12 @@ class VodStartRequest(BaseModel):
 class LiveStartRequest(BaseModel):
     session_id: uuid.UUID
     channel_login: str
+
+
+class MetadataResolveRequest(BaseModel):
+    mode: Literal["live", "vod"]
+    channel_login: str | None = None
+    video_id: str | None = None
 
 
 class StopRequest(BaseModel):
@@ -1174,6 +1180,61 @@ async def health_live() -> dict[str, str]:
 @app.get("/health/ready")
 async def health_ready() -> dict[str, str]:
     return {"status": "ready"}
+
+
+@app.post("/internal/v1/metadata/resolve", dependencies=[Depends(require_internal_token)])
+async def resolve_twitch_metadata(payload: MetadataResolveRequest) -> dict:
+    try:
+        auth = await load_runtime_twitch_auth()
+        if payload.mode == "live":
+            if not payload.channel_login:
+                raise HTTPException(400, "channel_login is required for LIVE metadata resolution")
+            broadcaster = await resolve_broadcaster(auth, payload.channel_login)
+            stream = await resolve_live_stream(auth, str(broadcaster.get("id") or ""))
+            if stream is None:
+                raise HTTPException(409, "Twitch channel is not live")
+            return {
+                "platform": "twitch",
+                "media_type": "live",
+                "channel_external_id": str(broadcaster.get("id") or "") or None,
+                "channel_login": broadcaster.get("login") or payload.channel_login,
+                "channel_display_name": broadcaster.get("display_name"),
+                "stream_external_id": str(stream.get("id") or "") or None,
+                "title": stream.get("title"),
+                "category_id": stream.get("game_id"),
+                "category_name": stream.get("game_name"),
+                "source_started_at_utc": stream.get("started_at"),
+                "source_url": f"https://www.twitch.tv/{broadcaster.get('login') or payload.channel_login}",
+            }
+        if not payload.video_id:
+            raise HTTPException(400, "video_id is required for VOD metadata resolution")
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                f"{settings.twitch_api_base_url}/videos",
+                params={"id": payload.video_id},
+                headers=helix_headers(auth),
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Twitch Get Videos failed HTTP {response.status_code}: {response.text[:500]}")
+        rows = response.json().get("data") or []
+        if not rows:
+            raise HTTPException(404, "Twitch VOD was not found")
+        video = rows[0]
+        return {
+            "platform": "twitch",
+            "media_type": "vod",
+            "channel_external_id": str(video.get("user_id") or "") or None,
+            "channel_login": video.get("user_login"),
+            "channel_display_name": video.get("user_name"),
+            "video_external_id": str(video.get("id") or payload.video_id),
+            "title": video.get("title"),
+            "source_started_at_utc": video.get("created_at"),
+            "source_url": video.get("url") or f"https://www.twitch.tv/videos/{payload.video_id}",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Twitch metadata resolution failed: {str(exc)[:500]}") from exc
 
 
 @app.post("/internal/v1/vod-fetches", dependencies=[Depends(require_internal_token)])

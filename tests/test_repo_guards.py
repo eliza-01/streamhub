@@ -66,3 +66,20 @@ def test_device_auth_requests_irc_read_scope_for_redundancy():
     adapter_source = (root / "apps/twitch_adapter/app/main.py").read_text()
     assert "twitch_requested_scopes" in settings_source
     assert "settings.twitch_requested_scopes" in adapter_source
+
+
+def test_extension_uses_backend_context_state_and_no_autostart():
+    root = Path(__file__).resolve().parents[1]
+    popup = (root / "apps/chrome_extension/popup.js").read_text()
+    popup_html = (root / "apps/chrome_extension/popup.html").read_text()
+    assert "/api/v1/collector/context-status" in popup
+    assert "/stop-all" in popup
+    assert "autostart" not in popup.lower()
+    assert "autostart" not in popup_html.lower()
+
+
+def test_start_is_serialized_per_event_in_backend():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps/api/app/routers/sessions.py").read_text()
+    assert ".with_for_update()" in source
+    assert "active chat session already exists for event" in source
