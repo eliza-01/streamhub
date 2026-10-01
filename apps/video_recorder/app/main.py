@@ -19,7 +19,7 @@ from sqlalchemy import func, select, update
 
 from streamhub_common.db import SessionLocal
 from streamhub_common.logging import configure_logging
-from streamhub_common.models import StorageOutputSetting, VideoGap, VideoRun, VideoSegment, VideoSession
+from streamhub_common.models import StorageMigrationJob, StorageOutputSetting, VideoGap, VideoRun, VideoSegment, VideoSession
 from streamhub_common.security import require_internal_token
 from streamhub_common.settings import get_settings
 
@@ -27,10 +27,14 @@ from app.commands import build_ffmpeg_command, build_streamlink_command, segment
 from app.storage import (
     ArchiveCopyError,
     archive_segment_relative_path,
+    atomic_copy_tree_verified,
     atomic_copy_verified,
     atomic_write_text,
+    delete_quarantined_directory,
     directory_is_writable,
     ensure_archive_dirs,
+    restore_quarantined_directory,
+    quarantine_directory,
     safe_archive_session_root,
 )
 
@@ -61,6 +65,18 @@ def enabled_output_roots() -> dict[str, Path]:
     if settings.video_output_root_3_enabled:
         roots["root3"] = Path(settings.video_output_root_3)
     return roots
+
+
+def configured_output_root(key: str) -> Path:
+    roots = {
+        "root1": Path(settings.video_output_root_1),
+        "root2": Path(settings.video_output_root_2),
+        "root3": Path(settings.video_output_root_3),
+    }
+    root = roots.get(key)
+    if root is None:
+        raise ValueError(f"unknown video output root: {key}")
+    return root
 
 
 def normalize_output_subdir(value: str | None) -> PurePosixPath:
@@ -105,6 +121,16 @@ class VideoStartRequest(BaseModel):
 
 class StopRequest(BaseModel):
     reason: str = "user_stop"
+
+
+class PurgeTicket(BaseModel):
+    token: str
+    session_id: uuid.UUID
+    event_id: uuid.UUID
+    output_root_key: str
+    output_subdir: str
+    archive_quarantined: bool = False
+    spool_quarantined: bool = False
 
 
 async def probe_duration_ms(path: Path) -> int:
@@ -786,6 +812,221 @@ async def storage_watchdog_loop() -> None:
             pass
 
 
+async def claim_storage_migration_job() -> int | None:
+    async with SessionLocal() as db:
+        job = await db.scalar(
+            select(StorageMigrationJob)
+            .where(StorageMigrationJob.status.in_({"queued", "running"}))
+            .order_by(StorageMigrationJob.id)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        if job is None:
+            await db.rollback()
+            return None
+        job.status = "running"
+        job.migrated_sessions = 0
+        job.copied_bytes = 0
+        job.current_session_id = None
+        job.last_error = None
+        job.started_at_utc = utcnow_naive()
+        job.completed_at_utc = None
+        job.updated_at = utcnow_naive()
+        job_id = int(job.id)
+        await db.commit()
+        return job_id
+
+
+async def _session_archive_bytes(session_id: uuid.UUID) -> int:
+    async with SessionLocal() as db:
+        value = await db.scalar(
+            select(func.coalesce(func.sum(VideoSegment.bytes), 0)).where(
+                VideoSegment.video_session_id == session_id
+            )
+        )
+        return int(value or 0)
+
+
+async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[bool, int]:
+    async with SessionLocal() as db:
+        job = await db.get(StorageMigrationJob, job_id)
+        session = await db.get(VideoSession, session_id)
+        if job is None or session is None:
+            return False, 0
+        if session.status in ACTIVE_VIDEO_STATUSES:
+            raise ArchiveCopyError(f"video session became active during storage migration: {session_id}")
+        non_ready = await db.scalar(
+            select(func.count(VideoSegment.id)).where(
+                VideoSegment.video_session_id == session_id,
+                VideoSegment.storage_state != "archive_ready",
+            )
+        )
+        if int(non_ready or 0) > 0:
+            raise ArchiveCopyError(f"video session has non-archive-ready segments: {session_id}")
+        segment_bytes = int(
+            await db.scalar(
+                select(func.coalesce(func.sum(VideoSegment.bytes), 0)).where(
+                    VideoSegment.video_session_id == session_id
+                )
+            )
+            or 0
+        )
+        metadata = dict(session.metadata_json or {})
+        current_root_key = str(metadata.get("output_root_key") or "root1")
+        output_subdir = str(metadata.get("output_subdir") or "streamhub")
+        event_id = session.event_id
+        source_root_key = job.source_root_key
+        destination_root_key = job.destination_root_key
+
+    if current_root_key not in {source_root_key, destination_root_key}:
+        logger.warning(
+            "storage migration job=%s skipped session=%s because root changed to %s",
+            job_id,
+            session_id,
+            current_root_key,
+        )
+        return False, 0
+
+    source_base = session_output_base({
+        "output_root_key": source_root_key,
+        "output_subdir": output_subdir,
+    })
+    destination_base = session_output_base({
+        "output_root_key": destination_root_key,
+        "output_subdir": output_subdir,
+    })
+    source_session_root = safe_archive_session_root(source_base, event_id, session_id)
+    destination_session_root = safe_archive_session_root(destination_base, event_id, session_id)
+
+    if current_root_key == source_root_key:
+        if source_session_root.exists():
+            await asyncio.to_thread(
+                atomic_copy_tree_verified,
+                source_session_root,
+                destination_session_root,
+                min_free_bytes=settings.video_archive_min_free_bytes,
+            )
+        elif segment_bytes > 0:
+            raise ArchiveCopyError(f"storage migration source is missing for session {session_id}")
+
+        async with SessionLocal() as db:
+            session = await db.get(VideoSession, session_id)
+            if session is None:
+                raise ArchiveCopyError(f"video session disappeared during storage migration: {session_id}")
+            metadata = dict(session.metadata_json or {})
+            metadata["output_root_key"] = destination_root_key
+            session.metadata_json = metadata
+            await db.commit()
+
+        # Rewrite manifests/session metadata through the new root before removing
+        # the old tree. This also creates the destination metadata tree for an
+        # empty session.
+        await refresh_archive_metadata(session_id)
+
+    # Crash recovery path: if the DB was already switched to destination but the
+    # old tree survived, verify the destination again and then clean the source.
+    # A non-empty session must never be considered migrated if the destination
+    # tree disappeared after the DB switch.
+    if current_root_key == destination_root_key and segment_bytes > 0 and not destination_session_root.exists():
+        raise ArchiveCopyError(
+            f"destination tree is missing after DB migration for session {session_id}"
+        )
+
+    if source_session_root.exists():
+        if not destination_session_root.exists():
+            raise ArchiveCopyError(
+                f"destination tree is missing after DB migration for session {session_id}"
+            )
+        await asyncio.to_thread(
+            atomic_copy_tree_verified,
+            source_session_root,
+            destination_session_root,
+            min_free_bytes=0,
+        )
+        same_location = False
+        try:
+            same_location = os.path.samefile(source_session_root, destination_session_root)
+        except OSError:
+            pass
+        if not same_location:
+            await asyncio.to_thread(shutil.rmtree, source_session_root)
+
+    return True, segment_bytes
+
+
+async def process_storage_migration_job(job_id: int) -> None:
+    try:
+        async with SessionLocal() as db:
+            job = await db.get(StorageMigrationJob, job_id)
+            if job is None:
+                return
+            raw_ids = list(job.session_ids_json or [])
+        session_ids = [uuid.UUID(str(value)) for value in raw_ids]
+        migrated = 0
+        copied_bytes = 0
+        for session_id in session_ids:
+            if archive_shutdown.is_set():
+                return
+            async with SessionLocal() as db:
+                job = await db.get(StorageMigrationJob, job_id)
+                if job is None:
+                    return
+                job.current_session_id = session_id
+                job.updated_at = utcnow_naive()
+                await db.commit()
+
+            moved, session_bytes = await migrate_storage_session(job_id, session_id)
+            if moved:
+                migrated += 1
+                copied_bytes += session_bytes
+            async with SessionLocal() as db:
+                job = await db.get(StorageMigrationJob, job_id)
+                if job is None:
+                    return
+                job.migrated_sessions = migrated
+                job.copied_bytes = copied_bytes
+                job.current_session_id = None
+                job.updated_at = utcnow_naive()
+                await db.commit()
+
+        async with SessionLocal() as db:
+            job = await db.get(StorageMigrationJob, job_id)
+            if job is None:
+                return
+            job.status = "completed"
+            job.migrated_sessions = migrated
+            job.copied_bytes = copied_bytes
+            job.current_session_id = None
+            job.completed_at_utc = utcnow_naive()
+            job.updated_at = utcnow_naive()
+            await db.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("storage migration failed job=%s", job_id)
+        async with SessionLocal() as db:
+            job = await db.get(StorageMigrationJob, job_id)
+            if job is not None:
+                job.status = "failed"
+                job.last_error = f"{type(exc).__name__}: {exc}"[:4000]
+                job.current_session_id = None
+                job.completed_at_utc = utcnow_naive()
+                job.updated_at = utcnow_naive()
+                await db.commit()
+
+
+async def storage_migration_loop() -> None:
+    while not archive_shutdown.is_set():
+        job_id = await claim_storage_migration_job()
+        if job_id is None:
+            try:
+                await asyncio.wait_for(archive_shutdown.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        await process_storage_migration_job(job_id)
+
+
 class RecorderWorker:
     def __init__(self, request: VideoStartRequest):
         self.request = request
@@ -1184,6 +1425,7 @@ async def lifespan(_app: FastAPI):
         for worker_no in range(1, settings.video_storage_copy_workers + 1)
     ]
     watchdog = asyncio.create_task(storage_watchdog_loop(), name="video-storage-watchdog")
+    migration = asyncio.create_task(storage_migration_loop(), name="video-storage-migration")
     recovery = asyncio.create_task(recover_active_sessions())
     try:
         yield
@@ -1197,9 +1439,10 @@ async def lifespan(_app: FastAPI):
         archive_shutdown.set()
         archive_wakeup.set()
         watchdog.cancel()
+        migration.cancel()
         for task in storage_tasks:
             task.cancel()
-        await asyncio.gather(watchdog, *storage_tasks, return_exceptions=True)
+        await asyncio.gather(watchdog, migration, *storage_tasks, return_exceptions=True)
 
 
 app = FastAPI(title="StreamHub Video Recorder", version="0.1.0", lifespan=lifespan)
@@ -1288,3 +1531,77 @@ async def stop_video_session(session_id: uuid.UUID, payload: StopRequest) -> dic
         row.last_activity_at_utc = utcnow_naive()
         await db.commit()
     return {"status": "stopped_without_runtime", "session_id": str(session_id)}
+
+
+def purge_archive_root(ticket: PurgeTicket) -> Path:
+    root = configured_output_root(ticket.output_root_key).resolve()
+    subdir = normalize_output_subdir(ticket.output_subdir)
+    base = (root / Path(*subdir.parts)).resolve()
+    base.relative_to(root)
+    return safe_archive_session_root(base, ticket.event_id, ticket.session_id)
+
+
+@app.post(
+    "/internal/v1/video-sessions/{session_id}/purge-quarantine",
+    dependencies=[Depends(require_internal_token)],
+)
+async def quarantine_video_session_for_purge(session_id: uuid.UUID) -> dict:
+    worker = workers.get(session_id)
+    if worker is not None and worker.task is not None and not worker.task.done():
+        raise HTTPException(409, "active video worker must be stopped before purge")
+    async with SessionLocal() as db:
+        row = await db.get(VideoSession, session_id)
+        if row is None:
+            raise HTTPException(404, "video session not found")
+        if row.status in ACTIVE_VIDEO_STATUSES:
+            raise HTTPException(409, "active video session must be stopped before purge")
+        metadata = row.metadata_json or {}
+        ticket = PurgeTicket(
+            token=uuid.uuid4().hex,
+            session_id=row.id,
+            event_id=row.event_id,
+            output_root_key=str(metadata.get("output_root_key") or "root1"),
+            output_subdir=str(metadata.get("output_subdir") or "streamhub"),
+        )
+
+    archive_root = purge_archive_root(ticket)
+    spool_root = safe_session_root(session_id)
+    try:
+        ticket.archive_quarantined = await asyncio.to_thread(
+            quarantine_directory, archive_root, ticket.token
+        )
+        ticket.spool_quarantined = await asyncio.to_thread(
+            quarantine_directory, spool_root, ticket.token
+        )
+    except Exception as exc:
+        try:
+            if ticket.spool_quarantined:
+                await asyncio.to_thread(restore_quarantined_directory, spool_root, ticket.token)
+            if ticket.archive_quarantined:
+                await asyncio.to_thread(restore_quarantined_directory, archive_root, ticket.token)
+        except Exception:
+            logger.exception("failed rolling back purge quarantine session=%s", session_id)
+        raise HTTPException(500, f"video purge quarantine failed: {exc}") from exc
+    return ticket.model_dump(mode="json")
+
+
+@app.post("/internal/v1/video-purge/restore", dependencies=[Depends(require_internal_token)])
+async def restore_video_purge(ticket: PurgeTicket) -> dict:
+    archive_root = purge_archive_root(ticket)
+    spool_root = safe_session_root(ticket.session_id)
+    if ticket.spool_quarantined:
+        await asyncio.to_thread(restore_quarantined_directory, spool_root, ticket.token)
+    if ticket.archive_quarantined:
+        await asyncio.to_thread(restore_quarantined_directory, archive_root, ticket.token)
+    return {"status": "restored", "session_id": str(ticket.session_id)}
+
+
+@app.post("/internal/v1/video-purge/finalize", dependencies=[Depends(require_internal_token)])
+async def finalize_video_purge(ticket: PurgeTicket) -> dict:
+    archive_root = purge_archive_root(ticket)
+    spool_root = safe_session_root(ticket.session_id)
+    if ticket.spool_quarantined:
+        await asyncio.to_thread(delete_quarantined_directory, spool_root, ticket.token)
+    if ticket.archive_quarantined:
+        await asyncio.to_thread(delete_quarantined_directory, archive_root, ticket.token)
+    return {"status": "deleted", "session_id": str(ticket.session_id)}

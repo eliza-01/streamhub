@@ -11,7 +11,15 @@ from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
-from streamhub_common.models import AuditLog, CaptureJob, ChatEvent, ChatMessage, MediaEvent, Session, SessionSegment
+from streamhub_common.models import (
+    AuditLog,
+    CaptureJob,
+    ChatEvent,
+    ChatMessage,
+    MediaEvent,
+    Session,
+    SessionSegment,
+)
 from streamhub_common.settings import get_settings
 
 from ..event_domain import resolve_or_create_media_event
@@ -118,6 +126,7 @@ def session_dict(row: Session) -> dict:
         "duration_recorded_ms": row.duration_recorded_ms,
         "source_duration_ms": row.source_duration_ms,
         "deleted_at_utc": row.deleted_at_utc,
+        "deletion_group_id": str(row.deletion_group_id) if row.deletion_group_id else None,
         "coverage_start_ms": row.coverage_start_ms,
         "coverage_end_ms": row.coverage_end_ms,
         "gap_count": row.gap_count,
@@ -267,9 +276,10 @@ async def start_session(payload: SessionStartRequest, db: AsyncSession = Depends
         .limit(1)
     )
     if active_session is not None:
+        active_session_id = active_session.id
         raise HTTPException(
             status_code=409,
-            detail=f"active chat session already exists for event: {active_session.id}",
+            detail=f"active chat session already exists for event: {active_session_id}",
         )
 
     row = Session(
@@ -602,6 +612,7 @@ async def soft_delete_session(session_id: uuid.UUID, db: AsyncSession = Depends(
         return {"ok": True, "already_deleted": True}
     await ensure_capture_is_idle_for_delete(db, row)
     row.deleted_at_utc = datetime.now(UTC).replace(tzinfo=None)
+    row.deletion_group_id = None
     row.status = "soft_deleted"
     db.add(AuditLog(session_id=session_id, action="soft_delete", payload_json={}))
     await db.commit()
@@ -616,7 +627,13 @@ async def restore_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_
     if row.deleted_at_utc is None:
         return {"ok": True, "already_restored": True}
     row.deleted_at_utc = None
-    row.status = "completed" if row.completeness_status == "complete" else "stopped_incomplete"
+    row.deletion_group_id = None
+    if row.completeness_status == "complete":
+        row.status = "completed"
+    elif row.completeness_status == "failed":
+        row.status = "failed"
+    else:
+        row.status = "stopped_incomplete"
     db.add(AuditLog(session_id=session_id, action="restore", payload_json={}))
     await db.commit()
     return {"ok": True}
@@ -645,13 +662,7 @@ async def purge_session(
     await db.execute(delete(ChatEvent).where(ChatEvent.session_id == session_id))
     await db.execute(delete(ChatMessage).where(ChatMessage.session_id == session_id))
     await db.execute(delete(SessionSegment).where(SessionSegment.session_id == session_id))
-    event_id = row.event_id
     await db.execute(delete(CaptureJob).where(CaptureJob.session_id == session_id))
     await db.execute(delete(Session).where(Session.id == session_id))
-    remaining_sessions = await db.scalar(
-        select(func.count()).select_from(Session).where(Session.event_id == event_id)
-    )
-    if int(remaining_sessions or 0) == 0:
-        await db.execute(delete(MediaEvent).where(MediaEvent.id == event_id))
     await db.commit()
     return {"ok": True, "purged": True}

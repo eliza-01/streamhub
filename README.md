@@ -102,9 +102,9 @@ docker-compose.yml
 4. commit `video_segments.storage_state=archive_ready` and the archive-relative path;
 5. only after that DB commit, delete the spool copy.
 
-The recorder uses a bounded Docker spool plus an explicit physical output root. `VIDEO_OUTPUT_ROOT_1_HOST` is required and must be an absolute host path outside the project/Docker storage (Windows example: `D:/StreamHub/output`). There is no relative-path fallback. Web → **Хранилище** selects the directory inside that mounted disk/root. A Video session snapshots that choice at Start, so changing the default never moves an active session mid-recording.
+The recorder uses a bounded Docker spool plus explicit physical output roots. `VIDEO_OUTPUT_ROOT_1_HOST` and `VIDEO_OUTPUT_ROOT_2_HOST` are absolute host paths mounted as `/outputs/root1` and `/outputs/root2` (Windows examples: `E:/StreamHub/output` and `F:/StreamHub/output`). There is no project-relative fallback. Web → **Хранилище** selects the enabled root and directory inside it. A Video session snapshots that choice at Start, so changing the default never moves an active session mid-recording.
 
-The UI shows `VIDEO_OUTPUT_ROOT_1_LABEL`, so set it to a human-readable disk label such as `D: output`. Additional roots stay disabled until an explicit absolute bind mount is added for them; this avoids Docker silently creating project-local fallback directories.
+The UI shows the configured root labels. Set `VIDEO_OUTPUT_ROOT_2_ENABLED=true` when the second mounted root should be selectable. The Storage page can then create a durable background migration from one enabled output root to the other; only idle sessions whose segments are already `archive_ready` are moved, each session tree is verified on the destination before the DB root switch, and the old tree is removed only after that commit.
 
 Closed segments are released from spool in verified batches (`VIDEO_ARCHIVE_BATCH_SEGMENTS`, default `100`). While recording, a batch is copied to the selected physical output, SHA-256 read-back is verified, the batch is committed as `archive_ready`, and only then are those spool copies removed. Stop/EOF flushes the final remainder smaller than the batch size.
 ```text

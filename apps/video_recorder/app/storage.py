@@ -212,3 +212,129 @@ def directory_is_writable(path: Path) -> bool:
             probe.unlink()
         except FileNotFoundError:
             pass
+
+
+def _iter_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(path for path in root.rglob("*") if path.is_file())
+
+
+def directory_size_bytes(root: Path) -> int:
+    return sum(path.stat().st_size for path in _iter_files(root))
+
+
+def _verify_tree_equal(source_root: Path, destination_root: Path) -> int:
+    source_files = _iter_files(source_root)
+    destination_files = _iter_files(destination_root)
+    source_rel = [path.relative_to(source_root) for path in source_files]
+    destination_rel = [path.relative_to(destination_root) for path in destination_files]
+    if source_rel != destination_rel:
+        raise ArchiveCopyError("destination tree does not contain the same files as source")
+
+    total = 0
+    for relative in source_rel:
+        source = source_root / relative
+        destination = destination_root / relative
+        source_size = source.stat().st_size
+        destination_size = destination.stat().st_size
+        if source_size != destination_size:
+            raise ArchiveCopyError(f"migration size mismatch for {relative}")
+        if sha256_file(source) != sha256_file(destination):
+            raise ArchiveCopyError(f"migration hash mismatch for {relative}")
+        total += source_size
+    return total
+
+
+def atomic_copy_tree_verified(
+    source_root: Path,
+    final_root: Path,
+    *,
+    min_free_bytes: int = 0,
+) -> int:
+    """Copy one immutable session tree across output roots and publish atomically.
+
+    The source is never removed here. The caller must first commit the DB switch
+    to the destination root and only then delete the old tree.
+    """
+    source_root = source_root.resolve()
+    if not source_root.exists():
+        raise ArchiveCopyError(f"migration source does not exist: {source_root}")
+    final_root.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if final_root.exists() and os.path.samefile(source_root, final_root):
+            return directory_size_bytes(source_root)
+    except OSError:
+        pass
+
+    if final_root.exists():
+        return _verify_tree_equal(source_root, final_root)
+
+    source_bytes = directory_size_bytes(source_root)
+    free_bytes = shutil.disk_usage(final_root.parent).free
+    required_free = source_bytes + max(0, min_free_bytes)
+    if free_bytes < required_free:
+        raise ArchiveCopyError(
+            f"destination free space below safety reserve: free={free_bytes} required={required_free}"
+        )
+
+    partial = final_root.with_name(f".{final_root.name}.migrate-{uuid.uuid4().hex}")
+    try:
+        partial.mkdir(parents=False, exist_ok=False)
+        for source in _iter_files(source_root):
+            relative = source.relative_to(source_root)
+            destination = partial / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source_digest = hashlib.sha256()
+            with source.open("rb") as src, destination.open("xb") as dst:
+                while True:
+                    chunk = src.read(COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    source_digest.update(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            if source.stat().st_size != destination.stat().st_size:
+                raise ArchiveCopyError(f"migration size mismatch for {relative}")
+            if source_digest.hexdigest() != sha256_file(destination):
+                raise ArchiveCopyError(f"migration read-back hash mismatch for {relative}")
+            _fsync_directory(destination.parent)
+
+        _verify_tree_equal(source_root, partial)
+        os.replace(partial, final_root)
+        _fsync_directory(final_root.parent)
+        return source_bytes
+    finally:
+        if partial.exists():
+            shutil.rmtree(partial, ignore_errors=True)
+
+
+def quarantine_directory(path: Path, token: str) -> bool:
+    """Rename a directory to a purge quarantine on the same filesystem."""
+    if not path.exists():
+        return False
+    quarantine = path.with_name(f"{path.name}.purge-{token}")
+    if quarantine.exists():
+        raise ArchiveCopyError(f"purge quarantine already exists: {quarantine}")
+    os.replace(path, quarantine)
+    _fsync_directory(path.parent)
+    return True
+
+
+def restore_quarantined_directory(path: Path, token: str) -> None:
+    quarantine = path.with_name(f"{path.name}.purge-{token}")
+    if not quarantine.exists():
+        return
+    if path.exists():
+        raise ArchiveCopyError(f"cannot restore purge quarantine because destination exists: {path}")
+    os.replace(quarantine, path)
+    _fsync_directory(path.parent)
+
+
+def delete_quarantined_directory(path: Path, token: str) -> None:
+    quarantine = path.with_name(f"{path.name}.purge-{token}")
+    if quarantine.exists():
+        shutil.rmtree(quarantine)
+        _fsync_directory(path.parent)

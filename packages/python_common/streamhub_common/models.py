@@ -44,6 +44,7 @@ class MediaEvent(Base):
     )
     metadata_json: Mapped[dict | None] = mapped_column(JSON)
     deleted_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    deletion_group_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), index=True)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -73,6 +74,7 @@ class Session(Base):
     duration_recorded_ms: Mapped[int] = mapped_column(BigInteger, default=0)
     source_duration_ms: Mapped[int | None] = mapped_column(BigInteger)
     deleted_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    deletion_group_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), index=True)
     metadata_json: Mapped[dict | None] = mapped_column(JSON)
     coverage_start_ms: Mapped[int | None] = mapped_column(BigInteger)
     coverage_end_ms: Mapped[int | None] = mapped_column(BigInteger)
@@ -230,6 +232,7 @@ class VideoSession(Base):
     stop_reason: Mapped[str | None] = mapped_column(String(64))
     metadata_json: Mapped[dict | None] = mapped_column(JSON)
     deleted_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    deletion_group_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), index=True)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -303,6 +306,27 @@ class StorageOutputSetting(Base):
     output_root_key: Mapped[str] = mapped_column(String(32), default="root1")
     output_subdir: Mapped[str] = mapped_column(String(512), default="streamhub")
     batch_segments: Mapped[int] = mapped_column(Integer, default=100)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class StorageMigrationJob(Base):
+    __tablename__ = "storage_migration_jobs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    source_root_key: Mapped[str] = mapped_column(String(32))
+    destination_root_key: Mapped[str] = mapped_column(String(32))
+    session_ids_json: Mapped[list | None] = mapped_column(JSON)
+    total_sessions: Mapped[int] = mapped_column(Integer, default=0)
+    migrated_sessions: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_sessions: Mapped[int] = mapped_column(Integer, default=0)
+    total_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    copied_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    current_session_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary(), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

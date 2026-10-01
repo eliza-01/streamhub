@@ -5,11 +5,18 @@ from datetime import UTC, datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
-from streamhub_common.models import AuditLog, VideoRun, VideoSegment, VideoSession
+from streamhub_common.models import (
+    AuditLog,
+    StorageMigrationJob,
+    VideoGap,
+    VideoRun,
+    VideoSegment,
+    VideoSession,
+)
 from streamhub_common.settings import get_settings
 
 router = APIRouter(prefix="/api/v1", tags=["video"])
@@ -50,16 +57,17 @@ def video_session_dict(row: VideoSession) -> dict:
         "stop_reason": row.stop_reason,
         "metadata": row.metadata_json,
         "deleted_at_utc": row.deleted_at_utc,
+        "deletion_group_id": str(row.deletion_group_id) if row.deletion_group_id else None,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         "progress_percent": video_progress_percent(row),
     }
 
 
-async def recorder_post(path: str, payload: dict) -> dict:
+async def recorder_post(path: str, payload: dict, *, timeout: float = 30.0) -> dict:
     headers = {"X-Internal-Service-Token": settings.internal_service_token}
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(f"{settings.video_recorder_base_url}{path}", json=payload, headers=headers)
     except httpx.HTTPError as exc:
         raise HTTPException(
@@ -82,6 +90,52 @@ async def stop_video_capture_row(db: AsyncSession, row: VideoSession, *, reason:
             payload_json={"reason": reason},
         )
     )
+
+
+def restored_video_status(row: VideoSession) -> str:
+    if row.completeness_status == "complete":
+        return "completed"
+    if row.completeness_status == "failed":
+        return "failed"
+    return "completed" if row.ended_at_utc is not None else "new"
+
+
+async def ensure_video_idle_for_delete(db: AsyncSession, row: VideoSession) -> None:
+    if row.status in ACTIVE_VIDEO_STATUSES:
+        raise HTTPException(409, "active video capture must be stopped before deleting the session")
+    migration_id = await db.scalar(
+        select(StorageMigrationJob.id)
+        .where(
+            StorageMigrationJob.status == "running",
+            StorageMigrationJob.current_session_id == row.id,
+        )
+        .limit(1)
+    )
+    if migration_id is not None:
+        raise HTTPException(409, "video session is currently being moved between output roots")
+
+
+async def quarantine_video_for_purge(row: VideoSession) -> dict:
+    return await recorder_post(
+        f"/internal/v1/video-sessions/{row.id}/purge-quarantine",
+        {},
+    )
+
+
+async def restore_video_purge(ticket: dict) -> None:
+    await recorder_post("/internal/v1/video-purge/restore", ticket, timeout=120.0)
+
+
+async def finalize_video_purge(ticket: dict) -> None:
+    await recorder_post("/internal/v1/video-purge/finalize", ticket, timeout=120.0)
+
+
+async def delete_video_db_rows(db: AsyncSession, session_id: uuid.UUID) -> None:
+    await db.execute(delete(AuditLog).where(AuditLog.video_session_id == session_id))
+    await db.execute(delete(VideoGap).where(VideoGap.video_session_id == session_id))
+    await db.execute(delete(VideoSegment).where(VideoSegment.video_session_id == session_id))
+    await db.execute(delete(VideoRun).where(VideoRun.video_session_id == session_id))
+    await db.execute(delete(VideoSession).where(VideoSession.id == session_id))
 
 
 @router.post("/video-sessions/{session_id}/stop")
@@ -248,4 +302,127 @@ async def list_video_segments(
             for segment in segments
         ],
         "next_after_segment_no": segments[-1].segment_no if has_more and segments else None,
+    }
+
+@router.get("/deleted/video-sessions")
+async def list_deleted_video_sessions(
+    page_size: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            select(VideoSession)
+            .where(VideoSession.deleted_at_utc.is_not(None))
+            .order_by(VideoSession.deleted_at_utc.desc(), VideoSession.created_at.desc())
+            .limit(page_size)
+        )
+    ).scalars().all()
+    ids = [row.id for row in rows]
+    aggregates = {}
+    if ids:
+        aggregate_rows = (
+            await db.execute(
+                select(
+                    VideoSegment.video_session_id,
+                    func.count(VideoSegment.id),
+                    func.coalesce(func.sum(VideoSegment.bytes), 0),
+                )
+                .where(VideoSegment.video_session_id.in_(ids))
+                .group_by(VideoSegment.video_session_id)
+            )
+        ).all()
+        aggregates = {
+            session_id: (int(count or 0), int(total_bytes or 0))
+            for session_id, count, total_bytes in aggregate_rows
+        }
+    items = []
+    for row in rows:
+        segment_count, total_bytes = aggregates.get(row.id, (0, 0))
+        data = video_session_dict(row)
+        data["segment_count"] = segment_count
+        data["bytes"] = total_bytes
+        items.append(data)
+    return {"items": items}
+
+
+@router.delete("/video-sessions/{session_id}")
+async def soft_delete_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    row = await db.get(VideoSession, session_id)
+    if row is None:
+        raise HTTPException(404, "video session not found")
+    if row.deleted_at_utc is not None:
+        return {"ok": True, "already_deleted": True}
+    await ensure_video_idle_for_delete(db, row)
+    row.deleted_at_utc = datetime.now(UTC).replace(tzinfo=None)
+    row.deletion_group_id = None
+    row.status = "soft_deleted"
+    db.add(
+        AuditLog(
+            event_id=row.event_id,
+            video_session_id=row.id,
+            action="video_soft_delete",
+            payload_json={},
+        )
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/video-sessions/{session_id}/restore")
+async def restore_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    row = await db.get(VideoSession, session_id)
+    if row is None:
+        raise HTTPException(404, "video session not found")
+    if row.deleted_at_utc is None:
+        return {"ok": True, "already_restored": True}
+    row.deleted_at_utc = None
+    row.deletion_group_id = None
+    row.status = restored_video_status(row)
+    db.add(
+        AuditLog(
+            event_id=row.event_id,
+            video_session_id=row.id,
+            action="video_restore",
+            payload_json={},
+        )
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete("/deleted/video-sessions/{session_id}")
+async def purge_video_session(
+    session_id: uuid.UUID,
+    permanent: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if not permanent:
+        raise HTTPException(400, "permanent=true and explicit UI confirmation are required")
+    row = await db.get(VideoSession, session_id)
+    if row is None:
+        raise HTTPException(404, "video session not found")
+    if row.deleted_at_utc is None:
+        raise HTTPException(409, "video session must be soft-deleted first")
+    await ensure_video_idle_for_delete(db, row)
+    ticket = await quarantine_video_for_purge(row)
+    try:
+        await delete_video_db_rows(db, session_id)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        try:
+            await restore_video_purge(ticket)
+        except Exception:
+            pass
+        raise
+
+    cleanup_pending = False
+    try:
+        await finalize_video_purge(ticket)
+    except HTTPException:
+        cleanup_pending = True
+    return {
+        "ok": True,
+        "purged": True,
+        "filesystem_cleanup_pending": cleanup_pending,
     }

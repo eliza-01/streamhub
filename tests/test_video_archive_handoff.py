@@ -94,9 +94,11 @@ def test_stage4_migration_and_compose_are_additive():
     assert "VIDEO_OUTPUT_ROOT_1_HOST:?" in compose
     assert "VIDEO_OUTPUT_ROOT_1_HOST:-./output" not in compose
     assert "target: /outputs/root1" in compose
-    assert "VIDEO_OUTPUT_ROOT_2_HOST" not in compose
+    assert "VIDEO_OUTPUT_ROOT_2_HOST:?" in compose
+    assert "target: /outputs/root2" in compose
     assert "VIDEO_OUTPUT_ROOT_3_HOST" not in compose
     assert 'alias="VIDEO_OUTPUT_ROOT_1"' in settings
+    assert 'alias="VIDEO_OUTPUT_ROOT_2"' in settings
     assert 'alias="VIDEO_STORAGE_COPY_WORKERS"' in settings
 
 
@@ -129,3 +131,23 @@ def test_stage5_output_settings_and_batch_size_are_wired():
     assert "output-settings" in api
     assert "Хранилище" in web
     assert "batch_segments" in web
+
+
+def test_output_tree_migration_is_verified_and_keeps_source_until_caller_commits(tmp_path: Path):
+    module = load_storage_module()
+    source = tmp_path / "root1" / "session"
+    destination = tmp_path / "root2" / "session"
+    (source / "segments").mkdir(parents=True)
+    (source / "logs").mkdir(parents=True)
+    (source / "segments" / "seg_000001.ts").write_bytes(b"mpeg-ts" * 4096)
+    (source / "session.json").write_text("{\"ok\": true}\n", encoding="utf-8")
+    (source / "logs" / "recorder.log").write_text("done\n", encoding="utf-8")
+
+    copied = module.atomic_copy_tree_verified(source, destination, min_free_bytes=0)
+
+    assert copied == module.directory_size_bytes(source)
+    assert source.exists()
+    assert destination.exists()
+    assert module.directory_size_bytes(destination) == copied
+    assert (destination / "segments" / "seg_000001.ts").read_bytes() == (source / "segments" / "seg_000001.ts").read_bytes()
+    assert not list(destination.parent.glob(".*.migrate-*"))

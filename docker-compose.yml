@@ -91,6 +91,9 @@ services:
       - type: bind
         source: ${VIDEO_OUTPUT_ROOT_1_HOST:?set VIDEO_OUTPUT_ROOT_1_HOST in .env to an absolute host path, e.g. D:/StreamHub/output}
         target: /outputs/root1
+      - type: bind
+        source: ${VIDEO_OUTPUT_ROOT_2_HOST:?set VIDEO_OUTPUT_ROOT_2_HOST in .env to an absolute host path, e.g. E:/StreamHub/output}
+        target: /outputs/root2
     depends_on:
       migrate:
         condition: service_completed_successfully

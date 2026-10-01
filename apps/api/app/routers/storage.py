@@ -3,22 +3,31 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
-from streamhub_common.models import StorageOutputSetting
+from streamhub_common.models import StorageMigrationJob, StorageOutputSetting, VideoSegment, VideoSession
 from streamhub_common.settings import get_settings
 
 router = APIRouter(prefix="/api/v1/storage", tags=["storage"])
 settings = get_settings()
+
+ACTIVE_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting"})
+ACTIVE_MIGRATION_STATUSES = frozenset({"queued", "running"})
 
 
 class OutputSettingsUpdate(BaseModel):
     output_root_key: str
     output_subdir: str
     batch_segments: int = Field(default=100, ge=1, le=1000)
+
+
+class StorageMigrationCreate(BaseModel):
+    source_root_key: str
+    destination_root_key: str
 
 
 def available_output_roots() -> list[dict[str, str]]:
@@ -70,6 +79,26 @@ def payload(row: StorageOutputSetting) -> dict:
     }
 
 
+def migration_payload(row: StorageMigrationJob) -> dict:
+    return {
+        "id": row.id,
+        "status": row.status,
+        "source_root_key": row.source_root_key,
+        "destination_root_key": row.destination_root_key,
+        "total_sessions": int(row.total_sessions or 0),
+        "migrated_sessions": int(row.migrated_sessions or 0),
+        "skipped_sessions": int(row.skipped_sessions or 0),
+        "total_bytes": int(row.total_bytes or 0),
+        "copied_bytes": int(row.copied_bytes or 0),
+        "current_session_id": str(row.current_session_id) if row.current_session_id else None,
+        "last_error": row.last_error,
+        "created_at": row.created_at,
+        "started_at_utc": row.started_at_utc,
+        "completed_at_utc": row.completed_at_utc,
+        "updated_at": row.updated_at,
+    }
+
+
 @router.get("/output-settings")
 async def read_output_settings(db: AsyncSession = Depends(get_db)) -> dict:
     return payload(await get_or_create_output_setting(db))
@@ -88,3 +117,134 @@ async def update_output_settings(body: OutputSettingsUpdate, db: AsyncSession = 
     await db.commit()
     await db.refresh(row)
     return payload(row)
+
+
+@router.get("/migrations")
+async def list_storage_migrations(
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            select(StorageMigrationJob).order_by(StorageMigrationJob.id.desc()).limit(limit)
+        )
+    ).scalars().all()
+    return {"items": [migration_payload(row) for row in rows]}
+
+
+@router.post("/migrations")
+async def create_storage_migration(
+    body: StorageMigrationCreate,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    roots = {item["key"] for item in available_output_roots()}
+    if body.source_root_key not in roots or body.destination_root_key not in roots:
+        raise HTTPException(400, "source and destination output roots must both be enabled")
+    if body.source_root_key == body.destination_root_key:
+        raise HTTPException(400, "source and destination output roots must be different")
+
+    active_job = await db.scalar(
+        select(StorageMigrationJob.id)
+        .where(StorageMigrationJob.status.in_(ACTIVE_MIGRATION_STATUSES))
+        .limit(1)
+    )
+    if active_job is not None:
+        raise HTTPException(409, "another storage migration is already queued or running")
+
+    sessions = (
+        await db.execute(select(VideoSession).order_by(VideoSession.created_at, VideoSession.id))
+    ).scalars().all()
+    source_sessions = [
+        row
+        for row in sessions
+        if str((row.metadata_json or {}).get("output_root_key") or "root1") == body.source_root_key
+    ]
+    source_ids = [row.id for row in source_sessions]
+
+    stats: dict = {}
+    if source_ids:
+        stats_rows = (
+            await db.execute(
+                select(
+                    VideoSegment.video_session_id,
+                    func.count(VideoSegment.id),
+                    func.coalesce(func.sum(VideoSegment.bytes), 0),
+                    func.coalesce(
+                        func.sum(case((VideoSegment.storage_state != "archive_ready", 1), else_=0)),
+                        0,
+                    ),
+                )
+                .where(VideoSegment.video_session_id.in_(source_ids))
+                .group_by(VideoSegment.video_session_id)
+            )
+        ).all()
+        stats = {
+            session_id: (int(count or 0), int(total_bytes or 0), int(non_ready or 0))
+            for session_id, count, total_bytes, non_ready in stats_rows
+        }
+
+    eligible: list[VideoSession] = []
+    skipped = 0
+    total_bytes = 0
+    for row in source_sessions:
+        _segment_count, bytes_for_session, non_ready = stats.get(row.id, (0, 0, 0))
+        if row.status in ACTIVE_VIDEO_STATUSES or non_ready > 0:
+            skipped += 1
+            continue
+        eligible.append(row)
+        total_bytes += bytes_for_session
+
+    if not eligible:
+        raise HTTPException(
+            409,
+            "no idle video sessions with fully archived segments were found on the source root",
+        )
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    job = StorageMigrationJob(
+        status="queued",
+        source_root_key=body.source_root_key,
+        destination_root_key=body.destination_root_key,
+        session_ids_json=[str(row.id) for row in eligible],
+        total_sessions=len(eligible),
+        migrated_sessions=0,
+        skipped_sessions=skipped,
+        total_bytes=total_bytes,
+        copied_bytes=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return migration_payload(job)
+
+
+@router.post("/migrations/{job_id}/retry")
+async def retry_storage_migration(job_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+    job = await db.get(StorageMigrationJob, job_id)
+    if job is None:
+        raise HTTPException(404, "storage migration not found")
+    if job.status != "failed":
+        raise HTTPException(409, "only failed storage migrations can be retried")
+    another = await db.scalar(
+        select(StorageMigrationJob.id)
+        .where(
+            StorageMigrationJob.id != job_id,
+            StorageMigrationJob.status.in_(ACTIVE_MIGRATION_STATUSES),
+        )
+        .limit(1)
+    )
+    if another is not None:
+        raise HTTPException(409, "another storage migration is already queued or running")
+    job.status = "queued"
+    job.migrated_sessions = 0
+    job.copied_bytes = 0
+    job.current_session_id = None
+    job.last_error = None
+    job.started_at_utc = None
+    job.completed_at_utc = None
+    job.updated_at = datetime.now(UTC).replace(tzinfo=None)
+    await db.commit()
+    await db.refresh(job)
+    return migration_payload(job)

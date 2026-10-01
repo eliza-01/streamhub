@@ -14,6 +14,7 @@ type Session = {
   source_duration_ms?: number | null;
   coverage_end_ms?: number | null;
   deleted_at_utc?: string | null;
+  deletion_group_id?: string | null;
   message_count?: number;
   progress_percent?: number | null;
 };
@@ -52,6 +53,7 @@ type VideoSession = {
   output_root_key?: string;
   output_subdir?: string;
   storage_summary?: Record<string, { segments: number; bytes: number }>;
+  deletion_group_id?: string | null;
 };
 
 type OutputRoot = {
@@ -65,6 +67,23 @@ type OutputSettings = {
   roots: OutputRoot[];
   batch_segments: number;
   applies_to: string;
+};
+
+type StorageMigration = {
+  id: number;
+  status: "queued" | "running" | "completed" | "failed" | string;
+  source_root_key: string;
+  destination_root_key: string;
+  total_sessions: number;
+  migrated_sessions: number;
+  skipped_sessions: number;
+  total_bytes: number;
+  copied_bytes: number;
+  current_session_id?: string | null;
+  last_error?: string | null;
+  created_at: string;
+  started_at_utc?: string | null;
+  completed_at_utc?: string | null;
 };
 
 type VideoRun = {
@@ -123,6 +142,8 @@ type MediaEvent = {
   has_chat: boolean;
   has_video: boolean;
   metadata?: { identity_state?: string } | null;
+  deleted_at_utc?: string | null;
+  deletion_group_id?: string | null;
 };
 
 type Message = {
@@ -254,7 +275,7 @@ function VideoProgressBar({ session, progress }: { session: VideoSession; progre
 
 function App() {
   const [events, setEvents] = useState<MediaEvent[]>([]);
-  const [trashSessions, setTrashSessions] = useState<Session[]>([]);
+  const [trashEvents, setTrashEvents] = useState<MediaEvent[]>([]);
   const [view, setView] = useState<ViewMode>("events");
   const [expandedIds, setExpandedIds] = useState<string[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
@@ -274,6 +295,10 @@ function App() {
   const [outputSubdir, setOutputSubdir] = useState("streamhub");
   const [outputBatchSegments, setOutputBatchSegments] = useState(100);
   const [savingOutput, setSavingOutput] = useState(false);
+  const [storageMigrations, setStorageMigrations] = useState<StorageMigration[]>([]);
+  const [migrationSourceRoot, setMigrationSourceRoot] = useState("root1");
+  const [migrationDestinationRoot, setMigrationDestinationRoot] = useState("root2");
+  const [migrationAction, setMigrationAction] = useState(false);
 
   async function loadEvents() {
     try {
@@ -298,6 +323,12 @@ function App() {
       setOutputRootKey(data.output_root_key);
       setOutputSubdir(data.output_subdir);
       setOutputBatchSegments(data.batch_segments);
+      const rootKeys = data.roots.map((root) => root.key);
+      setMigrationSourceRoot((current) => rootKeys.includes(current) ? current : (rootKeys[0] || "root1"));
+      setMigrationDestinationRoot((current) => {
+        if (rootKeys.includes(current) && current !== migrationSourceRoot) return current;
+        return rootKeys.find((key) => key !== data.output_root_key) || rootKeys[0] || "root1";
+      });
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -330,12 +361,64 @@ function App() {
     }
   }
 
-  async function loadTrash() {
+  async function startStorageMigration() {
+    if (migrationSourceRoot === migrationDestinationRoot) {
+      setError("Для миграции выберите разные output roots.");
+      return;
+    }
+    if (!window.confirm(`Перенести завершённые Video sessions ${migrationSourceRoot} → ${migrationDestinationRoot}? Активные и ещё не archive_ready sessions будут пропущены.`)) return;
+    setMigrationAction(true);
     try {
-      const res = await fetch(`${API}/api/v1/sessions?page_size=100&deleted=true`, { cache: "no-store" });
+      const res = await fetch(`${API}/api/v1/storage/migrations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_root_key: migrationSourceRoot,
+          destination_root_key: migrationDestinationRoot,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await loadStorageMigrations();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setMigrationAction(false);
+    }
+  }
+
+  async function retryStorageMigration(job: StorageMigration) {
+    setMigrationAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/storage/migrations/${job.id}/retry`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadStorageMigrations();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setMigrationAction(false);
+    }
+  }
+
+  async function loadStorageMigrations() {
+    try {
+      const res = await fetch(`${API}/api/v1/storage/migrations?limit=20`, { cache: "no-store" });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      setTrashSessions(data.items || []);
+      setStorageMigrations(data.items || []);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function loadTrash() {
+    try {
+      const res = await fetch(`${API}/api/v1/deleted/events?page_size=100`, { cache: "no-store" });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setTrashEvents(data.items || []);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -344,7 +427,7 @@ function App() {
 
   async function loadCurrentView(targetView: ViewMode = view) {
     if (targetView === "events") await loadEvents();
-    else if (targetView === "storage") await loadOutputSettings();
+    else if (targetView === "storage") await Promise.all([loadOutputSettings(), loadStorageMigrations()]);
     else await loadTrash();
   }
 
@@ -417,7 +500,7 @@ function App() {
     try {
       const res = await fetch(`${API}/api/v1/sessions/${session.id}/restore`, { method: "POST" });
       if (!res.ok) throw new Error(await res.text());
-      setTrashSessions((current) => current.filter((item) => item.id !== session.id));
+      await loadTrash();
       if (selected?.id === session.id) setSelected(null);
       setError(null);
     } catch (e) {
@@ -433,8 +516,106 @@ function App() {
     try {
       const res = await fetch(`${API}/api/v1/deleted/sessions/${session.id}?permanent=true`, { method: "DELETE" });
       if (!res.ok) throw new Error(await res.text());
-      setTrashSessions((current) => current.filter((item) => item.id !== session.id));
+      await loadTrash();
       if (selected?.id === session.id) setSelected(null);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function moveVideoToTrash(session: VideoSession) {
+    if (isVideoBusy(session)) {
+      setError("Идущую Video запись нельзя удалить: сначала остановите её.");
+      return;
+    }
+    if (!window.confirm("Переместить эту Video session в корзину? Файлы останутся на output до permanent purge.")) return;
+    setActionId(session.id);
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions/${session.id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      if (selectedVideo?.id === session.id) setSelectedVideo(null);
+      await loadEvents();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function restoreVideoSession(session: VideoSession) {
+    setActionId(session.id);
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions/${session.id}/restore`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadTrash();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function purgeVideoSession(session: VideoSession) {
+    if (!window.confirm("Удалить Video session навсегда? Будут удалены DB записи и весь каталог этой Video session на output.")) return;
+    setActionId(session.id);
+    try {
+      const res = await fetch(`${API}/api/v1/deleted/video-sessions/${session.id}?permanent=true`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadTrash();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function moveEventToTrash(event: MediaEvent) {
+    if (event.active_chat_sessions_count > 0 || event.active_video_sessions_count > 0) {
+      setError("Нельзя удалить Event с активным Chat или Video capture. Сначала остановите запись.");
+      return;
+    }
+    if (!window.confirm("Переместить в корзину все текущие Chat и Video sessions этого Event? Сам уникальный Event остаётся группирующей сущностью.")) return;
+    setActionId(event.id);
+    try {
+      const res = await fetch(`${API}/api/v1/events/${event.id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      setEvents((current) => current.filter((item) => item.id !== event.id));
+      setExpandedIds((current) => current.filter((id) => id !== event.id));
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function restoreEvent(event: MediaEvent) {
+    setActionId(event.id);
+    try {
+      const res = await fetch(`${API}/api/v1/events/${event.id}/restore`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadTrash();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function purgeEvent(event: MediaEvent) {
+    if (!window.confirm("Удалить навсегда все sessions этого Event, которые сейчас находятся в корзине? Текущие sessions в Events и сам уникальный Event не затрагиваются.")) return;
+    setActionId(event.id);
+    try {
+      const res = await fetch(`${API}/api/v1/deleted/events/${event.id}?permanent=true`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadTrash();
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -453,6 +634,17 @@ function App() {
     loadCurrentView(view);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view]);
+
+  const activeStorageMigration = storageMigrations.find((job) => job.status === "queued" || job.status === "running");
+
+  useEffect(() => {
+    if (view !== "storage" || !activeStorageMigration) return;
+    const timer = window.setInterval(() => {
+      loadStorageMigrations();
+    }, 3000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, activeStorageMigration?.id, activeStorageMigration?.status]);
 
   const monitoredChatIds = useMemo(
     () => view === "events"
@@ -608,6 +800,7 @@ function App() {
           </div>
           <div className="actions">
             <button onClick={() => openVideoSession(selectedVideo)}>Обновить</button>
+            <button className="danger" disabled={actionId === selectedVideo.id || isVideoBusy(selectedVideo)} onClick={() => moveVideoToTrash(selectedVideo)}>В корзину</button>
           </div>
         </header>
         <VideoProgressBar session={selectedVideo} progress={progress} />
@@ -699,7 +892,7 @@ function App() {
       <header>
         <div>
           <h1>StreamHub</h1>
-          <p className="muted">{view === "trash" ? "Корзина Chat sessions" : view === "storage" ? "Video output · spool batches" : "Twitch Events · Chat + Video sessions"}</p>
+          <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
         </div>
         <div className="actions">
           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
@@ -736,6 +929,17 @@ function App() {
 
                   {expanded && (
                     <div className="event-children">
+                      <div className="event-delete-row">
+                        <span className="muted small">Event — постоянная Twitch-идентичность. Кнопка отправляет в корзину только текущие видимые sessions; старые удалённые sessions остаются в корзине отдельно от новых записей.</span>
+                        <button
+                          className="danger subtle"
+                          disabled={actionId === event.id || event.active_chat_sessions_count > 0 || event.active_video_sessions_count > 0}
+                          title={(event.active_chat_sessions_count > 0 || event.active_video_sessions_count > 0) ? "Сначала остановите Chat и Video capture" : "Переместить текущие sessions Event в корзину"}
+                          onClick={() => moveEventToTrash(event)}
+                        >
+                          В корзину все sessions
+                        </button>
+                      </div>
                       <div className="section-label">CHAT SESSIONS</div>
                       {event.chat_sessions.length === 0 ? <div className="empty-child">Chat sessions нет</div> : event.chat_sessions.map((session, index) => (
                         <div className="session-row" key={session.id}>
@@ -765,7 +969,10 @@ function App() {
                             <VideoProgressBar session={session} progress={videoProgressBySession[session.id]} />
                             {session.last_error && <div className="inline-warning">{session.last_error}</div>}
                           </div>
-                          <div className="session-actions"><button onClick={() => openVideoSession(session)}>Video Manager</button></div>
+                          <div className="session-actions">
+                            <button onClick={() => openVideoSession(session)}>Video Manager</button>
+                            <button className="danger subtle" disabled={actionId === session.id || isVideoBusy(session)} title={isVideoBusy(session) ? "Сначала остановите Video" : "Переместить Video session в корзину"} onClick={() => moveVideoToTrash(session)}>В корзину</button>
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -780,7 +987,7 @@ function App() {
           <div className="section-label">VIDEO OUTPUT</div>
           {!outputSettings ? <div className="empty-child">Загрузка настроек…</div> : (
             <>
-              <p className="muted">Диск задаётся абсолютным путём в .env; здесь выбирается разрешённый root и каталог внутри него. Настройка применяется только к новым Video sessions.</p>
+              <p className="muted">Диски задаются абсолютными host paths в .env; здесь выбирается разрешённый root и каталог внутри него. Настройка применяется только к новым Video sessions.</p>
               <label className="storage-field">
                 <span>Диск / output root из .env</span>
                 <select value={outputRootKey} onChange={(e) => setOutputRootKey(e.target.value)}>
@@ -802,33 +1009,125 @@ function App() {
                 />
               </label>
               <div className="storage-note">
-                После копирования и SHA-256 проверки вся пачка фиксируется как archive_ready и удаляется из Docker spool. При Stop/EOF остаток меньше batch тоже переносится. Для рабочего режима оставляем 100; для короткой проверки можно временно поставить 5.
+                После копирования и SHA-256 проверки вся пачка фиксируется как archive_ready и удаляется из Docker spool. При Stop/EOF остаток меньше batch тоже переносится.
               </div>
               <div className="actions storage-actions">
                 <button disabled={savingOutput} onClick={saveOutputSettings}>{savingOutput ? "Сохраняю…" : "Сохранить output"}</button>
               </div>
+
+              <div className="section-label storage-subsection">OUTPUT MIGRATION</div>
+              {outputSettings.roots.length < 2 ? (
+                <div className="storage-note">Для миграции нужен второй enabled root. Подключи VIDEO_OUTPUT_ROOT_2_HOST и включи VIDEO_OUTPUT_ROOT_2_ENABLED=true.</div>
+              ) : (
+                <>
+                  <p className="muted">Миграция переносит уже завершённые Video sessions между физическими output roots параллельно сервису. Для каждой session каталог полностью копируется и проверяется, затем DB переключается на новый root, и только после commit удаляется старый каталог. Активные или ещё не archive_ready sessions не трогаются.</p>
+                  <div className="storage-migration-controls">
+                    <label className="storage-field">
+                      <span>Из output</span>
+                      <select value={migrationSourceRoot} onChange={(e) => setMigrationSourceRoot(e.target.value)}>
+                        {outputSettings.roots.map((root) => <option key={root.key} value={root.key}>{root.label}</option>)}
+                      </select>
+                    </label>
+                    <label className="storage-field">
+                      <span>В output</span>
+                      <select value={migrationDestinationRoot} onChange={(e) => setMigrationDestinationRoot(e.target.value)}>
+                        {outputSettings.roots.map((root) => <option key={root.key} value={root.key}>{root.label}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="actions storage-actions">
+                    <button
+                      disabled={migrationAction || !!activeStorageMigration || migrationSourceRoot === migrationDestinationRoot}
+                      onClick={startStorageMigration}
+                    >
+                      {activeStorageMigration ? "Миграция уже выполняется" : migrationAction ? "Создаю…" : "Мигрировать output"}
+                    </button>
+                  </div>
+                  <div className="migration-list">
+                    {storageMigrations.length === 0 ? <div className="empty-child">Миграций ещё не было</div> : storageMigrations.slice(0, 10).map((job) => {
+                      const percent = job.total_sessions > 0 ? Math.min(100, Math.round((job.migrated_sessions / job.total_sessions) * 100)) : 0;
+                      const sourceLabel = outputSettings.roots.find((root) => root.key === job.source_root_key)?.label || job.source_root_key;
+                      const destinationLabel = outputSettings.roots.find((root) => root.key === job.destination_root_key)?.label || job.destination_root_key;
+                      return (
+                        <div className="migration-row" key={job.id}>
+                          <div className="row"><strong>#{job.id} · {sourceLabel} → {destinationLabel}</strong><span>{job.status}</span></div>
+                          <div className="muted small">sessions {job.migrated_sessions}/{job.total_sessions} · skipped {job.skipped_sessions} · {fmtBytes(job.copied_bytes)} / {fmtBytes(job.total_bytes)}</div>
+                          {(job.status === "queued" || job.status === "running") && <div className="progress-track"><div className="progress-fill" style={{ width: `${percent}%` }} /></div>}
+                          {job.current_session_id && <div className="muted small">current: <code>{job.current_session_id}</code></div>}
+                          {job.last_error && <div className="inline-error">{job.last_error}</div>}
+                          {job.status === "failed" && <button disabled={migrationAction || !!activeStorageMigration} onClick={() => retryStorageMigration(job)}>Retry</button>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
             </>
           )}
         </section>
       ) : (
         <>
-          {trashSessions.length === 0 && <div className="empty">Корзина пуста</div>}
-          <section className="grid">
-            {trashSessions.map((session) => (
-              <article className="card" key={session.id}>
-                <button className="card-main" onClick={() => openSession(session)}>
-                  <div className="row"><strong>{session.channel_login || "Twitch"}</strong><span>{session.media_type.toUpperCase()}</span></div>
-                  <div className="title">{session.title || "Без названия"}</div>
-                  <div className="row muted"><span>{session.status}</span><span>{session.completeness_status}</span></div>
-                  <div className="row muted"><span>{new Date(session.created_at).toLocaleString()}</span><span>{fmtMs(session.source_duration_ms)}</span></div>
-                </button>
-                <div className="card-actions">
-                  <button disabled={actionId === session.id} onClick={() => restoreSession(session)}>Восстановить</button>
-                  <button className="danger" disabled={actionId === session.id} onClick={() => purgeSession(session)}>Удалить навсегда</button>
-                </div>
-              </article>
-            ))}
-          </section>
+          {trashEvents.length === 0 && <div className="empty">Корзина пуста</div>}
+
+          {trashEvents.length > 0 && (
+            <section className="events-list trash-events-list">
+              {trashEvents.map((event) => (
+                <article className="event-card" key={event.id}>
+                  <div className="event-summary trash-event-summary">
+                    <div className="event-main">
+                      <div className="row"><strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong><span className="event-type">{event.media_type.toUpperCase()}</span></div>
+                      <div className="event-title">{event.title || (event.media_type === "vod" ? `VOD ${event.external_key.split(":").pop()}` : "LIVE stream")}</div>
+                      <div className="row muted event-meta"><span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span><span>{event.external_key}</span></div>
+                    </div>
+                    <div className="event-badges">
+                      <span>Удалено Chat: {event.chat_sessions_count}</span>
+                      <span>Удалено Video: {event.video_sessions_count}</span>
+                    </div>
+                  </div>
+
+                  <div className="event-children">
+                    <div className="event-delete-row">
+                      <span className="muted small">Этот же уникальный Event может одновременно быть в Events с новыми sessions и здесь со старыми удалёнными sessions.</span>
+                      <div className="actions">
+                        <button disabled={actionId === event.id} onClick={() => restoreEvent(event)}>Восстановить все sessions</button>
+                        <button className="danger" disabled={actionId === event.id} onClick={() => purgeEvent(event)}>Удалить из корзины навсегда</button>
+                      </div>
+                    </div>
+
+                    <div className="section-label">CHAT SESSIONS В КОРЗИНЕ</div>
+                    {event.chat_sessions.length === 0 ? <div className="empty-child">Chat sessions нет</div> : event.chat_sessions.map((session, index) => (
+                      <div className="session-row" key={session.id}>
+                        <div className="session-number">#{index + 1}</div>
+                        <div className="session-info">
+                          <div className="session-status-line"><strong>{session.completeness_status}</strong><span>{(session.message_count || 0).toLocaleString()} сообщений</span></div>
+                          <div className="muted session-date">{new Date(session.created_at).toLocaleString()} · <code>{session.id}</code></div>
+                        </div>
+                        <div className="session-actions">
+                          <button disabled={actionId === session.id} onClick={() => restoreSession(session)}>Восстановить</button>
+                          <button className="danger subtle" disabled={actionId === session.id} onClick={() => purgeSession(session)}>Удалить навсегда</button>
+                        </div>
+                      </div>
+                    ))}
+
+                    <div className="section-label video-section-label">VIDEO SESSIONS В КОРЗИНЕ</div>
+                    {event.video_sessions.length === 0 ? <div className="empty-child">Video sessions нет</div> : event.video_sessions.map((session, index) => (
+                      <div className="session-row video-session-row" key={session.id}>
+                        <div className="session-number">#{index + 1}</div>
+                        <div className="session-info">
+                          <div className="session-status-line"><strong>{session.completeness_status}</strong><span>{session.segment_count || 0} seg</span><span>{fmtBytes(session.bytes || 0)}</span></div>
+                          <div className="muted session-date">{new Date(session.created_at).toLocaleString()} · <code>{session.id}</code></div>
+                        </div>
+                        <div className="session-actions">
+                          <button disabled={actionId === session.id} onClick={() => restoreVideoSession(session)}>Восстановить</button>
+                          <button className="danger subtle" disabled={actionId === session.id} onClick={() => purgeVideoSession(session)}>Удалить навсегда</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </article>
+              ))}
+            </section>
+          )}
         </>
       )}
     </main>

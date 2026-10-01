@@ -2,17 +2,45 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
-from streamhub_common.models import ChatMessage, MediaEvent, Session, VideoSegment, VideoSession
+from streamhub_common.models import (
+    AuditLog,
+    CaptureJob,
+    ChatEvent,
+    ChatMessage,
+    MediaEvent,
+    Session,
+    SessionSegment,
+    VideoSegment,
+    VideoSession,
+)
 
-from .sessions import ACTIVE_CAPTURE_SESSION_STATUSES, capture_progress_percent, session_dict, stop_capture_row
-from .video import ACTIVE_VIDEO_STATUSES, stop_video_capture_row, video_progress_percent, video_session_dict
+from .sessions import (
+    ACTIVE_CAPTURE_SESSION_STATUSES,
+    capture_progress_percent,
+    ensure_capture_is_idle_for_delete,
+    session_dict,
+    stop_capture_row,
+)
+from .video import (
+    ACTIVE_VIDEO_STATUSES,
+    delete_video_db_rows,
+    ensure_video_idle_for_delete,
+    finalize_video_purge,
+    quarantine_video_for_purge,
+    restore_video_purge,
+    restored_video_status,
+    stop_video_capture_row,
+    video_progress_percent,
+    video_session_dict,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["events"])
 
@@ -37,6 +65,7 @@ def event_dict(row: MediaEvent) -> dict:
         "related_event_id": str(row.related_event_id) if row.related_event_id else None,
         "metadata": row.metadata_json,
         "deleted_at_utc": row.deleted_at_utc,
+        "deletion_group_id": str(row.deletion_group_id) if row.deletion_group_id else None,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -55,14 +84,23 @@ def chat_session_summary(row: Session, message_count: int) -> dict:
     return data
 
 
-async def _chat_summaries_by_event(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[dict]]:
+async def _chat_summaries_by_event(
+    db: AsyncSession,
+    event_ids: list[uuid.UUID],
+    *,
+    deleted: bool = False,
+) -> dict[uuid.UUID, list[dict]]:
     if not event_ids:
         return {}
 
+    conditions = [
+        Session.event_id.in_(event_ids),
+        Session.deleted_at_utc.is_not(None) if deleted else Session.deleted_at_utc.is_(None),
+    ]
     sessions = (
         await db.execute(
             select(Session)
-            .where(Session.event_id.in_(event_ids), Session.deleted_at_utc.is_(None))
+            .where(*conditions)
             .order_by(Session.event_id, Session.created_at.asc())
         )
     ).scalars().all()
@@ -85,13 +123,22 @@ async def _chat_summaries_by_event(db: AsyncSession, event_ids: list[uuid.UUID])
     return grouped
 
 
-async def _video_summaries_by_event(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[dict]]:
+async def _video_summaries_by_event(
+    db: AsyncSession,
+    event_ids: list[uuid.UUID],
+    *,
+    deleted: bool = False,
+) -> dict[uuid.UUID, list[dict]]:
     if not event_ids:
         return {}
+    conditions = [
+        VideoSession.event_id.in_(event_ids),
+        VideoSession.deleted_at_utc.is_not(None) if deleted else VideoSession.deleted_at_utc.is_(None),
+    ]
     sessions = (
         await db.execute(
             select(VideoSession)
-            .where(VideoSession.event_id.in_(event_ids), VideoSession.deleted_at_utc.is_(None))
+            .where(*conditions)
             .order_by(VideoSession.event_id, VideoSession.created_at.asc())
         )
     ).scalars().all()
@@ -159,7 +206,7 @@ async def list_events(
         .where(VideoSession.event_id == MediaEvent.id, VideoSession.deleted_at_utc.is_(None))
         .exists()
     )
-    conditions = [MediaEvent.deleted_at_utc.is_(None), visible_chat_exists | visible_video_exists]
+    conditions = [visible_chat_exists | visible_video_exists]
     if channel:
         conditions.append(MediaEvent.channel_login == channel)
     if type:
@@ -214,10 +261,44 @@ async def list_events(
     }
 
 
+@router.get("/deleted/events")
+async def list_deleted_events(
+    page_size: int = Query(default=100, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    deleted_chat_exists = (
+        select(Session.id)
+        .where(Session.event_id == MediaEvent.id, Session.deleted_at_utc.is_not(None))
+        .exists()
+    )
+    deleted_video_exists = (
+        select(VideoSession.id)
+        .where(VideoSession.event_id == MediaEvent.id, VideoSession.deleted_at_utc.is_not(None))
+        .exists()
+    )
+    events = (
+        await db.execute(
+            select(MediaEvent)
+            .where(deleted_chat_exists | deleted_video_exists)
+            .order_by(MediaEvent.created_at.desc(), MediaEvent.id.desc())
+            .limit(page_size)
+        )
+    ).scalars().all()
+    event_ids = [event.id for event in events]
+    chat_summaries = await _chat_summaries_by_event(db, event_ids, deleted=True)
+    video_summaries = await _video_summaries_by_event(db, event_ids, deleted=True)
+    return {
+        "items": [
+            _event_payload(event, chat_summaries.get(event.id, []), video_summaries.get(event.id, []))
+            for event in events
+        ]
+    }
+
+
 @router.get("/events/{event_id}")
 async def get_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
     event = await db.get(MediaEvent, event_id)
-    if event is None or event.deleted_at_utc is not None:
+    if event is None:
         raise HTTPException(404, "event not found")
     chat_summaries = await _chat_summaries_by_event(db, [event_id])
     video_summaries = await _video_summaries_by_event(db, [event_id])
@@ -227,7 +308,7 @@ async def get_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> 
 @router.post("/events/{event_id}/stop-all")
 async def stop_all_event_capture(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
     event = await db.get(MediaEvent, event_id)
-    if event is None or event.deleted_at_utc is not None:
+    if event is None:
         raise HTTPException(404, "event not found")
 
     active_rows = (
@@ -283,4 +364,208 @@ async def stop_all_event_capture(event_id: uuid.UUID, db: AsyncSession = Depends
             "failed": sum(1 for item in video_results if item["result"] == "failed"),
             "results": video_results,
         },
+    }
+
+
+@router.delete("/events/{event_id}")
+async def soft_delete_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    """Move the currently visible sessions of one canonical Event to Trash.
+
+    MediaEvent is an identity/grouping row and is never soft-deleted. A later
+    capture for the same Twitch stream/VOD therefore appears immediately in
+    Events while the older deleted sessions remain grouped in Trash.
+    """
+    event = await db.get(MediaEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "event not found")
+
+    chat_rows = (
+        await db.execute(
+            select(Session).where(Session.event_id == event_id, Session.deleted_at_utc.is_(None))
+        )
+    ).scalars().all()
+    video_rows = (
+        await db.execute(
+            select(VideoSession).where(VideoSession.event_id == event_id, VideoSession.deleted_at_utc.is_(None))
+        )
+    ).scalars().all()
+    if not chat_rows and not video_rows:
+        return {"ok": True, "already_empty": True, "chat_sessions": 0, "video_sessions": 0}
+
+    for row in chat_rows:
+        await ensure_capture_is_idle_for_delete(db, row)
+    for row in video_rows:
+        await ensure_video_idle_for_delete(db, row)
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    deletion_group_id = uuid.uuid4()
+    for row in chat_rows:
+        row.deleted_at_utc = now
+        row.deletion_group_id = deletion_group_id
+        row.status = "soft_deleted"
+    for row in video_rows:
+        row.deleted_at_utc = now
+        row.deletion_group_id = deletion_group_id
+        row.status = "soft_deleted"
+    # Legacy builds soft-deleted the identity row itself. Keep it normalized so
+    # Events/Trash are projections over sessions only.
+    event.deleted_at_utc = None
+    event.deletion_group_id = None
+    db.add(
+        AuditLog(
+            event_id=event_id,
+            action="event_sessions_soft_delete",
+            payload_json={
+                "deletion_group_id": str(deletion_group_id),
+                "chat_sessions": len(chat_rows),
+                "video_sessions": len(video_rows),
+            },
+        )
+    )
+    await db.commit()
+    return {
+        "ok": True,
+        "deletion_group_id": str(deletion_group_id),
+        "chat_sessions": len(chat_rows),
+        "video_sessions": len(video_rows),
+    }
+
+
+@router.post("/events/{event_id}/restore")
+async def restore_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    """Restore every trashed session grouped by this canonical Event."""
+    event = await db.get(MediaEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "event not found")
+
+    chat_rows = (
+        await db.execute(
+            select(Session).where(Session.event_id == event_id, Session.deleted_at_utc.is_not(None))
+        )
+    ).scalars().all()
+    video_rows = (
+        await db.execute(
+            select(VideoSession).where(VideoSession.event_id == event_id, VideoSession.deleted_at_utc.is_not(None))
+        )
+    ).scalars().all()
+
+    for row in chat_rows:
+        row.deleted_at_utc = None
+        row.deletion_group_id = None
+        if row.completeness_status == "complete":
+            row.status = "completed"
+        elif row.completeness_status == "failed":
+            row.status = "failed"
+        else:
+            row.status = "stopped_incomplete"
+    for row in video_rows:
+        row.deleted_at_utc = None
+        row.deletion_group_id = None
+        row.status = restored_video_status(row)
+
+    event.deleted_at_utc = None
+    event.deletion_group_id = None
+    db.add(
+        AuditLog(
+            event_id=event_id,
+            action="event_sessions_restore",
+            payload_json={"chat_sessions": len(chat_rows), "video_sessions": len(video_rows)},
+        )
+    )
+    await db.commit()
+    return {
+        "ok": True,
+        "restored_chat_sessions": len(chat_rows),
+        "restored_video_sessions": len(video_rows),
+    }
+
+
+@router.delete("/deleted/events/{event_id}")
+async def purge_event(
+    event_id: uuid.UUID,
+    permanent: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Permanently purge only this Event's sessions that are currently in Trash.
+
+    Visible sessions and the canonical MediaEvent identity are intentionally kept.
+    """
+    if not permanent:
+        raise HTTPException(400, "permanent=true and explicit UI confirmation are required")
+    event = await db.get(MediaEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "event not found")
+
+    chat_rows = (
+        await db.execute(
+            select(Session).where(Session.event_id == event_id, Session.deleted_at_utc.is_not(None))
+        )
+    ).scalars().all()
+    video_rows = (
+        await db.execute(
+            select(VideoSession).where(VideoSession.event_id == event_id, VideoSession.deleted_at_utc.is_not(None))
+        )
+    ).scalars().all()
+    if not chat_rows and not video_rows:
+        return {"ok": True, "already_purged": True, "video_sessions": 0, "chat_sessions": 0}
+
+    for row in chat_rows:
+        await ensure_capture_is_idle_for_delete(db, row)
+    for row in video_rows:
+        await ensure_video_idle_for_delete(db, row)
+
+    tickets: list[dict] = []
+    try:
+        for row in video_rows:
+            tickets.append(await quarantine_video_for_purge(row))
+    except Exception:
+        for ticket in reversed(tickets):
+            try:
+                await restore_video_purge(ticket)
+            except Exception:
+                pass
+        raise
+
+    try:
+        for row in video_rows:
+            await delete_video_db_rows(db, row.id)
+        chat_ids = [row.id for row in chat_rows]
+        if chat_ids:
+            await db.execute(delete(AuditLog).where(AuditLog.session_id.in_(chat_ids)))
+            await db.execute(delete(ChatEvent).where(ChatEvent.session_id.in_(chat_ids)))
+            await db.execute(delete(ChatMessage).where(ChatMessage.session_id.in_(chat_ids)))
+            await db.execute(delete(SessionSegment).where(SessionSegment.session_id.in_(chat_ids)))
+            await db.execute(delete(CaptureJob).where(CaptureJob.session_id.in_(chat_ids)))
+            await db.execute(delete(Session).where(Session.id.in_(chat_ids)))
+        event.deleted_at_utc = None
+        event.deletion_group_id = None
+        db.add(
+            AuditLog(
+                event_id=event_id,
+                action="event_trash_purge",
+                payload_json={"chat_sessions": len(chat_rows), "video_sessions": len(video_rows)},
+            )
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        for ticket in reversed(tickets):
+            try:
+                await restore_video_purge(ticket)
+            except Exception:
+                pass
+        raise
+
+    cleanup_pending = 0
+    for ticket in tickets:
+        try:
+            await finalize_video_purge(ticket)
+        except HTTPException:
+            cleanup_pending += 1
+    return {
+        "ok": True,
+        "purged": True,
+        "video_sessions": len(video_rows),
+        "chat_sessions": len(chat_rows),
+        "filesystem_cleanup_pending": cleanup_pending,
     }
