@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "StreamHub",
+  "version": "0.1.0",
+  "description": "Управление записью Twitch-чата StreamHub.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "https://www.twitch.tv/*",
+    "https://gql.twitch.tv/*",
+    "http://localhost:18741/*",
+    "http://127.0.0.1:18741/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.twitch.tv/*"
+      ],
+      "js": [
+        "content_script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "StreamHub"
+  }
+}

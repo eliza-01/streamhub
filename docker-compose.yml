@@ -1,0 +1,109 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    command: ["mysqld", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
+    volumes:
+      - streamhub_mysql:/var/lib/mysql
+    healthcheck:
+      # Docker Desktop on Windows may need several minutes to initialize MySQL 8.4
+      # on a brand-new volume. During start_period failures do not count toward
+      # retries. TCP also avoids declaring the temporary --skip-networking server healthy.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      start_period: 5m
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PMA_HOST: ${PMA_HOST}
+      PMA_PORT: ${PMA_PORT}
+      PMA_USER: ${PMA_USER}
+      PMA_PASSWORD: ${PMA_PASSWORD}
+    ports:
+      - "${PHPMYADMIN_PUBLIC_PORT:-18743}:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    working_dir: /opt/streamhub
+    command: ["alembic", "-c", "/opt/streamhub/alembic.ini", "upgrade", "head"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  chat-ingest:
+    build:
+      context: .
+      dockerfile: apps/chat_ingest/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  twitch-adapter:
+    build:
+      context: .
+      dockerfile: apps/twitch_adapter/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      chat-ingest:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    ports:
+      - "${API_PUBLIC_PORT:-18741}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      twitch-adapter:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:18741}
+    ports:
+      - "${WEB_PUBLIC_PORT:-18742}:3000"
+    depends_on:
+      - api
+
+volumes:
+  streamhub_mysql:

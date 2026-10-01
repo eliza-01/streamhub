@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StreamHub</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main>
+    <h1>StreamHub</h1>
+    <div id="status" class="status">Определяю контекст…</div>
+    <div id="details" class="details"></div>
+    <div class="actions">
+      <button id="start">Start recording</button>
+      <button id="pause">Pause</button>
+      <button id="resume">Resume</button>
+      <button id="stop" class="danger">Stop</button>
+      <button id="auth">Authorize Twitch</button>
+    </div>
+    <label class="toggle"><input id="autostart" type="checkbox" /> Autostart</label>
+    <div id="message" class="message"></div>
+  </main>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

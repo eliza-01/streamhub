@@ -1,0 +1,11 @@
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,7 +2,7 @@
+ uvicorn[standard]>=0.32,<1
+ pydantic>=2.10,<3
+ pydantic-settings>=2.6,<3
+-sqlalchemy>=2.0.36,<3
++sqlalchemy[asyncio]>=2.0.36,<3
+ asyncmy>=0.2.10,<1
+ PyMySQL>=1.1,<2
+ alembic>=1.14,<2

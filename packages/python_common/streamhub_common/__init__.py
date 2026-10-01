@@ -1,0 +1,1 @@
+"""Shared StreamHub backend primitives."""
