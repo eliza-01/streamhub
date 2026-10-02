@@ -25,6 +25,7 @@ from streamhub_common.models import AuthToken, CaptureJob, OAuthAccount, Session
 from streamhub_common.security import decrypt_secret, encrypt_secret, require_internal_token
 from streamhub_common.settings import get_settings
 
+from app.duration import parse_twitch_duration_ms
 from app.live import eventsub_chat_delete, eventsub_chat_message, irc_chat_event, irc_chat_message, parse_irc_line
 
 settings = get_settings()
@@ -1313,6 +1314,7 @@ async def resolve_twitch_metadata(payload: MetadataResolveRequest) -> dict:
             "video_external_id": str(video.get("id") or payload.video_id),
             "title": video.get("title"),
             "source_started_at_utc": video.get("created_at"),
+            "source_duration_ms": parse_twitch_duration_ms(video.get("duration")),
             "source_url": video.get("url") or f"https://www.twitch.tv/videos/{payload.video_id}",
         }
     except HTTPException:

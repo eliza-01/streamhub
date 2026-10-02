@@ -121,3 +121,11 @@ Closed segments are released from spool in verified batches (`VIDEO_ARCHIVE_BATC
 The storage worker is restart-idempotent at the important crash points: interrupted `copying` rows return to `spool`; an already published final segment can be verified and committed after restart; and an `archive_ready` row with a leftover spool copy is cleaned up only after the archive file is verified.
 
 **Do not use `docker compose down -v` while uncommitted video exists in spool.** `-v` deletes the named spool volume. Physical output roots are bind mounts and are separate from Compose named volumes.
+
+## v1.3 Video Parts / Video Manager
+
+`video-part-builder` is an internal-only service on port `8004`. It reads immutable `archive_ready` MPEG-TS segments from the same `/outputs/root*` mounts as the recorder and publishes parts under the selected Video session `parts/` directory. Web → **Video Manager** provides Manual range and Target MiB planning, durable reservation, queue progress, Retry/Cancel/Delete and Copy path.
+
+A part never remuxes or transcodes: it is exact byte-for-byte concatenation of one contiguous segment range inside one run. The API locks and reserves every segment before enqueue, so overlapping parts are rejected. The builder writes in `PART_BUILD_CHUNK_BYTES` chunks (default 512 KiB), calculates per-source and full-part SHA-256 while writing, fsyncs, performs a full SHA-256 read-back, and only then atomically publishes the final `.ts` file.
+
+Part jobs are durable in MySQL. Creating a part while any Video capture is active is allowed, but its job stays `waiting_capture_idle`. Before Video Start the API asks `video-part-builder` to quiesce; active builders stop file I/O after the current chunk and acknowledge before the recorder starts. When all Video captures are idle, queued/suspended builds resume automatically.

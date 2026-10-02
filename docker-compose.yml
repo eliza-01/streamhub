@@ -103,6 +103,28 @@ services:
       timeout: 3s
       retries: 30
 
+  video-part-builder:
+    build:
+      context: .
+      dockerfile: apps/video_part_builder/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ${VIDEO_OUTPUT_ROOT_1_HOST:?set VIDEO_OUTPUT_ROOT_1_HOST in .env to an absolute host path, e.g. D:/StreamHub/output}
+        target: /outputs/root1
+      - type: bind
+        source: ${VIDEO_OUTPUT_ROOT_2_HOST:?set VIDEO_OUTPUT_ROOT_2_HOST in .env to an absolute host path, e.g. E:/StreamHub/output}
+        target: /outputs/root2
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
   api:
     build:
       context: .
@@ -115,6 +137,8 @@ services:
       migrate:
         condition: service_completed_successfully
       twitch-adapter:
+        condition: service_healthy
+      video-part-builder:
         condition: service_healthy
 
   web:

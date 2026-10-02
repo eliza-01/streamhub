@@ -151,3 +151,66 @@ def test_output_tree_migration_is_verified_and_keeps_source_until_caller_commits
     assert module.directory_size_bytes(destination) == copied
     assert (destination / "segments" / "seg_000001.ts").read_bytes() == (source / "segments" / "seg_000001.ts").read_bytes()
     assert not list(destination.parent.glob(".*.migrate-*"))
+
+
+def test_purge_quarantine_falls_back_to_file_moves_when_directory_rename_is_locked(tmp_path: Path, monkeypatch):
+    module = load_storage_module()
+    session_root = tmp_path / "output" / "session"
+    (session_root / "segments").mkdir(parents=True)
+    (session_root / "logs").mkdir(parents=True)
+    first = session_root / "segments" / "seg_000001.ts"
+    second = session_root / "logs" / "recorder.log"
+    first.write_bytes(b"mpeg-ts" * 4096)
+    second.write_text("done\n", encoding="utf-8")
+    token = "locked-directory"
+    quarantine = session_root.with_name(f"{session_root.name}.purge-{token}")
+    real_replace = module.os.replace
+
+    def replace_with_locked_session_directory(source, destination):
+        if Path(source) == session_root and Path(destination) == quarantine:
+            raise PermissionError(13, "directory locked")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(module.os, "replace", replace_with_locked_session_directory)
+
+    assert module.quarantine_directory(session_root, token) is True
+    assert not module._iter_files(session_root)
+    assert (quarantine / "segments" / "seg_000001.ts").read_bytes() == b"mpeg-ts" * 4096
+    assert (quarantine / "logs" / "recorder.log").read_text(encoding="utf-8") == "done\n"
+
+    module.restore_quarantined_directory(session_root, token)
+
+    assert first.read_bytes() == b"mpeg-ts" * 4096
+    assert second.read_text(encoding="utf-8") == "done\n"
+    assert not quarantine.exists()
+
+
+def test_purge_file_move_fallback_rolls_back_if_one_artifact_is_locked(tmp_path: Path, monkeypatch):
+    module = load_storage_module()
+    session_root = tmp_path / "output" / "session"
+    (session_root / "segments").mkdir(parents=True)
+    first = session_root / "segments" / "seg_000001.ts"
+    second = session_root / "segments" / "seg_000002.ts"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    token = "partial-failure"
+    quarantine = session_root.with_name(f"{session_root.name}.purge-{token}")
+    real_replace = module.os.replace
+
+    def replace_with_one_locked_file(source, destination):
+        source = Path(source)
+        destination = Path(destination)
+        if source == session_root and destination == quarantine:
+            raise PermissionError(13, "directory locked")
+        if source == second:
+            raise PermissionError(13, "file locked")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(module.os, "replace", replace_with_one_locked_file)
+
+    with pytest.raises(PermissionError):
+        module.quarantine_directory(session_root, token)
+
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
+    assert not quarantine.exists()

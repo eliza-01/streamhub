@@ -19,7 +19,7 @@ from sqlalchemy import func, select, update
 
 from streamhub_common.db import SessionLocal
 from streamhub_common.logging import configure_logging
-from streamhub_common.models import StorageMigrationJob, StorageOutputSetting, VideoGap, VideoRun, VideoSegment, VideoSession
+from streamhub_common.models import StorageMigrationJob, StorageOutputSetting, VideoGap, VideoPart, VideoPartBuildJob, VideoRun, VideoSegment, VideoSession
 from streamhub_common.security import require_internal_token
 from streamhub_common.settings import get_settings
 
@@ -839,12 +839,18 @@ async def claim_storage_migration_job() -> int | None:
 
 async def _session_archive_bytes(session_id: uuid.UUID) -> int:
     async with SessionLocal() as db:
-        value = await db.scalar(
+        segment_bytes = await db.scalar(
             select(func.coalesce(func.sum(VideoSegment.bytes), 0)).where(
                 VideoSegment.video_session_id == session_id
             )
         )
-        return int(value or 0)
+        ready_part_bytes = await db.scalar(
+            select(func.coalesce(func.sum(VideoPart.final_bytes), 0)).where(
+                VideoPart.video_session_id == session_id,
+                VideoPart.status == "ready",
+            )
+        )
+        return int(segment_bytes or 0) + int(ready_part_bytes or 0)
 
 
 async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[bool, int]:
@@ -855,6 +861,17 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
             return False, 0
         if session.status in ACTIVE_VIDEO_STATUSES:
             raise ArchiveCopyError(f"video session became active during storage migration: {session_id}")
+        active_part_job = await db.scalar(
+            select(VideoPartBuildJob.id)
+            .join(VideoPart, VideoPart.id == VideoPartBuildJob.part_id)
+            .where(
+                VideoPart.video_session_id == session_id,
+                VideoPartBuildJob.status.in_({"queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"}),
+            )
+            .limit(1)
+        )
+        if active_part_job is not None:
+            raise ArchiveCopyError(f"video session has pending/active part build during storage migration: {session_id}")
         non_ready = await db.scalar(
             select(func.count(VideoSegment.id)).where(
                 VideoSegment.video_session_id == session_id,
@@ -871,6 +888,16 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
             )
             or 0
         )
+        ready_part_bytes = int(
+            await db.scalar(
+                select(func.coalesce(func.sum(VideoPart.final_bytes), 0)).where(
+                    VideoPart.video_session_id == session_id,
+                    VideoPart.status == "ready",
+                )
+            )
+            or 0
+        )
+        archive_bytes = segment_bytes + ready_part_bytes
         metadata = dict(session.metadata_json or {})
         current_root_key = str(metadata.get("output_root_key") or "root1")
         output_subdir = str(metadata.get("output_subdir") or "streamhub")
@@ -906,7 +933,7 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
                 destination_session_root,
                 min_free_bytes=settings.video_archive_min_free_bytes,
             )
-        elif segment_bytes > 0:
+        elif archive_bytes > 0:
             raise ArchiveCopyError(f"storage migration source is missing for session {session_id}")
 
         async with SessionLocal() as db:
@@ -927,7 +954,7 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
     # old tree survived, verify the destination again and then clean the source.
     # A non-empty session must never be considered migrated if the destination
     # tree disappeared after the DB switch.
-    if current_root_key == destination_root_key and segment_bytes > 0 and not destination_session_root.exists():
+    if current_root_key == destination_root_key and archive_bytes > 0 and not destination_session_root.exists():
         raise ArchiveCopyError(
             f"destination tree is missing after DB migration for session {session_id}"
         )
@@ -951,7 +978,7 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
         if not same_location:
             await asyncio.to_thread(shutil.rmtree, source_session_root)
 
-    return True, segment_bytes
+    return True, archive_bytes
 
 
 async def process_storage_migration_job(job_id: int) -> None:
@@ -1540,6 +1567,45 @@ def purge_archive_root(ticket: PurgeTicket) -> Path:
     base.relative_to(root)
     return safe_archive_session_root(base, ticket.event_id, ticket.session_id)
 
+async def wait_for_archive_copy_idle(session_id: uuid.UUID, *, timeout_seconds: float = 30.0) -> None:
+    """Wait for an already-claimed archive batch to leave the copying state.
+
+    Soft-deleted sessions are excluded from new archive claims, so once the
+    in-flight copying rows drain no new archive I/O can start for this session.
+    This closes the delete-vs-archive race on Windows bind mounts.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        async with SessionLocal() as db:
+            copying = await db.scalar(
+                select(func.count(VideoSegment.id)).where(
+                    VideoSegment.video_session_id == session_id,
+                    VideoSegment.storage_state == "copying",
+                )
+            )
+        if int(copying or 0) == 0:
+            return
+        if loop.time() >= deadline:
+            raise HTTPException(
+                409,
+                "video archive handoff is still finishing; retry permanent delete shortly",
+            )
+        await asyncio.sleep(0.25)
+
+
+async def quarantine_directory_with_retry(path: Path, token: str) -> bool:
+    """Retry transient Windows bind-mount rename locks for a short window."""
+    attempts = 20
+    for attempt in range(attempts):
+        try:
+            return await asyncio.to_thread(quarantine_directory, path, token)
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            await asyncio.sleep(0.25)
+    return False
+
 
 @app.post(
     "/internal/v1/video-sessions/{session_id}/purge-quarantine",
@@ -1555,6 +1621,8 @@ async def quarantine_video_session_for_purge(session_id: uuid.UUID) -> dict:
             raise HTTPException(404, "video session not found")
         if row.status in ACTIVE_VIDEO_STATUSES:
             raise HTTPException(409, "active video session must be stopped before purge")
+        if row.deleted_at_utc is None:
+            raise HTTPException(409, "video session must be soft-deleted before purge")
         metadata = row.metadata_json or {}
         ticket = PurgeTicket(
             token=uuid.uuid4().hex,
@@ -1564,14 +1632,20 @@ async def quarantine_video_session_for_purge(session_id: uuid.UUID) -> dict:
             output_subdir=str(metadata.get("output_subdir") or "streamhub"),
         )
 
+    # A batch may have been claimed immediately before the session was moved
+    # to Trash. Let that already-started copy finish before renaming either
+    # directory. New claims are impossible because deleted sessions are filtered
+    # out by claim_archive_batch().
+    await wait_for_archive_copy_idle(session_id)
+
     archive_root = purge_archive_root(ticket)
     spool_root = safe_session_root(session_id)
     try:
-        ticket.archive_quarantined = await asyncio.to_thread(
-            quarantine_directory, archive_root, ticket.token
+        ticket.archive_quarantined = await quarantine_directory_with_retry(
+            archive_root, ticket.token
         )
-        ticket.spool_quarantined = await asyncio.to_thread(
-            quarantine_directory, spool_root, ticket.token
+        ticket.spool_quarantined = await quarantine_directory_with_retry(
+            spool_root, ticket.token
         )
     except Exception as exc:
         try:

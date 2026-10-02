@@ -42,6 +42,9 @@ def test_event_trash_is_session_scoped_and_video_purge_uses_quarantine():
     assert "VideoSession.deleted_at_utc.is_not(None)" in events
     assert "quarantine_video_for_purge" in video
     assert "/purge-quarantine" in recorder
+    assert "wait_for_archive_copy_idle" in recorder
+    assert "VideoSegment.storage_state == \"copying\"" in recorder
+    assert "quarantine_directory_with_retry" in recorder
     assert "/internal/v1/video-purge/restore" in recorder
     assert "/internal/v1/video-purge/finalize" in recorder
 

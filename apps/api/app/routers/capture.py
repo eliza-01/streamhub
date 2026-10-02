@@ -18,12 +18,13 @@ from .sessions import (
     ACTIVE_CAPTURE_SESSION_STATUSES,
     SessionStartRequest,
     TwitchIntegrityContext,
+    adapter_post,
     capture_progress_percent,
     resolve_live_metadata,
     session_dict,
     start_session,
 )
-from .video import ACTIVE_VIDEO_STATUSES, recorder_post, video_progress_percent, video_session_dict
+from .video import ACTIVE_VIDEO_STATUSES, part_builder_post, recorder_post, video_progress_percent, video_session_dict
 
 router = APIRouter(prefix="/api/v1", tags=["capture"])
 settings = get_settings()
@@ -70,7 +71,37 @@ async def normalize_context(payload: CaptureStartRequest) -> CaptureStartRequest
     if payload.mode == "vod":
         if not payload.video_external_id:
             raise HTTPException(400, "video_external_id is required for VOD")
-        return payload
+        # Browser video.duration is not stable on Twitch: while the player is
+        # still bootstrapping it can be NaN/Infinity and the Extension sends null.
+        # Enrich VOD metadata server-side so Chat/Video progress does not depend
+        # on the exact moment the popup was opened. Metadata lookup is best-effort:
+        # a temporary Helix failure must not block an otherwise valid capture.
+        try:
+            resolved = await adapter_post(
+                "/internal/v1/metadata/resolve",
+                {"mode": "vod", "video_id": payload.video_external_id},
+            )
+        except HTTPException:
+            return payload
+        started_at = payload.source_started_at_utc
+        if resolved.get("source_started_at_utc"):
+            started_at = datetime.fromisoformat(str(resolved["source_started_at_utc"]).replace("Z", "+00:00"))
+        resolved_duration = resolved.get("source_duration_ms")
+        duration_ms = payload.duration_ms
+        if (duration_ms is None or duration_ms <= 0) and resolved_duration is not None:
+            duration_ms = max(0, int(resolved_duration))
+        return payload.model_copy(
+            update={
+                "channel_external_id": resolved.get("channel_external_id") or payload.channel_external_id,
+                "channel_login": resolved.get("channel_login") or payload.channel_login,
+                "channel_display_name": resolved.get("channel_display_name") or payload.channel_display_name,
+                "video_external_id": str(resolved.get("video_external_id") or payload.video_external_id),
+                "title": resolved.get("title") or payload.title,
+                "source_started_at_utc": started_at,
+                "duration_ms": duration_ms,
+                "page_url": resolved.get("source_url") or payload.page_url,
+            }
+        )
     if not payload.channel_login:
         raise HTTPException(400, "channel_login is required for LIVE")
     if payload.stream_external_id:
@@ -211,6 +242,7 @@ async def start_video_for_event(payload: CaptureStartRequest, event: MediaEvent,
     await db.commit()
 
     try:
+        await part_builder_post("/internal/v1/capture-priority/quiesce", {})
         await recorder_post(
             "/internal/v1/video-sessions",
             {

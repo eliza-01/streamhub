@@ -311,14 +311,96 @@ def atomic_copy_tree_verified(
             shutil.rmtree(partial, ignore_errors=True)
 
 
+def _move_tree_files(source_root: Path, destination_root: Path) -> None:
+    """Move every file individually, preserving the relative tree.
+
+    Windows/Docker Desktop can refuse renaming a non-empty bind-mounted
+    directory even when no process inside either container has an open file
+    descriptor for it.  Moving the files themselves on the same filesystem is
+    still atomic and gives purge a safe fallback without copying video bytes.
+
+    The operation is transactional at filesystem level: if any file move
+    fails, already-moved files are put back before the exception is raised.
+    """
+    moved: list[tuple[Path, Path]] = []
+    destination_root.mkdir(parents=False, exist_ok=False)
+    try:
+        for source in _iter_files(source_root):
+            relative = source.relative_to(source_root)
+            destination = destination_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                raise ArchiveCopyError(f"purge quarantine destination already exists: {destination}")
+            os.replace(source, destination)
+            moved.append((source, destination))
+            _fsync_directory(destination.parent)
+
+        leftovers = _iter_files(source_root)
+        if leftovers:
+            raise ArchiveCopyError(
+                f"purge quarantine left {len(leftovers)} source files behind: {source_root}"
+            )
+
+        # A Windows bind mount may keep the now-empty source directory locked.
+        # That is harmless: all durable artifacts are already in quarantine.
+        try:
+            shutil.rmtree(source_root)
+        except OSError:
+            pass
+        _fsync_directory(source_root.parent)
+    except Exception:
+        for source, destination in reversed(moved):
+            if not destination.exists():
+                continue
+            source.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(destination, source)
+            _fsync_directory(source.parent)
+        shutil.rmtree(destination_root, ignore_errors=True)
+        raise
+
+
+def _restore_tree_files(quarantine: Path, path: Path) -> None:
+    moved: list[tuple[Path, Path]] = []
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        for source in _iter_files(quarantine):
+            relative = source.relative_to(quarantine)
+            destination = path / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                raise ArchiveCopyError(f"cannot restore purge file because destination exists: {destination}")
+            os.replace(source, destination)
+            moved.append((source, destination))
+            _fsync_directory(destination.parent)
+        shutil.rmtree(quarantine)
+        _fsync_directory(path.parent)
+    except Exception:
+        for source, destination in reversed(moved):
+            if not destination.exists():
+                continue
+            source.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(destination, source)
+            _fsync_directory(source.parent)
+        raise
+
+
 def quarantine_directory(path: Path, token: str) -> bool:
-    """Rename a directory to a purge quarantine on the same filesystem."""
+    """Quarantine a directory without copying its payload.
+
+    Fast path is a single same-filesystem directory rename.  If Windows bind
+    mount semantics reject that rename with PermissionError, fall back to
+    same-filesystem atomic moves of the individual files into a sibling
+    quarantine directory.
+    """
     if not path.exists():
         return False
     quarantine = path.with_name(f"{path.name}.purge-{token}")
     if quarantine.exists():
         raise ArchiveCopyError(f"purge quarantine already exists: {quarantine}")
-    os.replace(path, quarantine)
+    try:
+        os.replace(path, quarantine)
+    except PermissionError:
+        _move_tree_files(path, quarantine)
     _fsync_directory(path.parent)
     return True
 
@@ -327,14 +409,26 @@ def restore_quarantined_directory(path: Path, token: str) -> None:
     quarantine = path.with_name(f"{path.name}.purge-{token}")
     if not quarantine.exists():
         return
-    if path.exists():
-        raise ArchiveCopyError(f"cannot restore purge quarantine because destination exists: {path}")
-    os.replace(quarantine, path)
-    _fsync_directory(path.parent)
+
+    # Whole-directory quarantine can be restored by one rename.  The
+    # file-by-file Windows fallback can leave an empty locked source directory,
+    # so in that case merge the quarantined files back into it.
+    if not path.exists():
+        try:
+            os.replace(quarantine, path)
+            _fsync_directory(path.parent)
+            return
+        except PermissionError:
+            pass
+    _restore_tree_files(quarantine, path)
 
 
 def delete_quarantined_directory(path: Path, token: str) -> None:
     quarantine = path.with_name(f"{path.name}.purge-{token}")
     if quarantine.exists():
         shutil.rmtree(quarantine)
-        _fsync_directory(path.parent)
+    # The Windows fallback may intentionally have left only empty directories
+    # at the original location.  They no longer contain referenced artifacts.
+    if path.exists() and not _iter_files(path):
+        shutil.rmtree(path, ignore_errors=True)
+    _fsync_directory(path.parent)

@@ -133,3 +133,33 @@ td { font-variant-numeric: tabular-nums; }
   .trash-event-summary .event-badges { grid-column: auto; }
   .trash-events-list .event-delete-row { align-items: stretch; flex-direction: column; }
 }
+
+.part-mode-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.part-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 260px)); gap: 14px; align-items: end; }
+.part-controls .storage-field { max-width: none; }
+.part-actions { margin-top: 14px; justify-content: flex-start; }
+.part-plan { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 14px; padding: 12px; background: #fafbfc; border: 1px solid #e2e5ea; border-radius: 10px; }
+.part-plan > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.part-plan span { color: #6b7280; font-size: 11px; }
+.part-plan strong { font-size: 13px; overflow-wrap: anywhere; }
+.part-plan-warning { grid-column: 1 / -1; }
+.part-list { display: grid; gap: 10px; }
+.part-row { padding: 14px; border: 1px solid #e2e5ea; border-radius: 10px; background: #fafbfc; }
+.part-row .row { align-items: flex-start; }
+.part-progress { margin: 10px 0 6px; }
+.part-row-actions { margin-top: 10px; justify-content: flex-start; flex-wrap: wrap; }
+.part-status { padding: 3px 7px; border: 1px solid #d7dbe2; border-radius: 999px; font-size: 11px; }
+.part-status-ready { font-weight: 700; }
+.part-status-failed, .part-status-cancelled { color: #a11919; border-color: #e4baba; }
+.hash-line code { overflow-wrap: anywhere; white-space: normal; }
+.segment-picker { padding: 4px 7px; border-radius: 7px; font-variant-numeric: tabular-nums; }
+.run-boundary td { border-top: 3px solid #c9ced7; }
+.video-manager-list { display: grid; gap: 10px; margin-top: 16px; }
+.video-manager-session { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 14px; border: 1px solid #e2e5ea; border-radius: 10px; background: #fafbfc; }
+.video-manager-session-main { min-width: 0; }
+
+@media (max-width: 760px) {
+  .part-controls { grid-template-columns: 1fr; }
+  .part-plan { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .video-manager-session { grid-template-columns: 1fr; }
+}

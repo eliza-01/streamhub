@@ -5,14 +5,19 @@ from datetime import UTC, datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
 from streamhub_common.models import (
     AuditLog,
+    MediaEvent,
     StorageMigrationJob,
     VideoGap,
+    VideoPart,
+    VideoPartBuildJob,
+    VideoPartSegment,
     VideoRun,
     VideoSegment,
     VideoSession,
@@ -23,6 +28,192 @@ router = APIRouter(prefix="/api/v1", tags=["video"])
 settings = get_settings()
 
 ACTIVE_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting"})
+
+PART_ACTIVE_JOB_STATUSES = frozenset({"queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"})
+
+
+class PartPlanRequest(BaseModel):
+    mode: str = "manual"
+    from_segment_no: int = Field(ge=1)
+    to_segment_no: int | None = Field(default=None, ge=1)
+    target_mib: int | None = Field(default=None, ge=1, le=102400)
+
+
+class PartCreateRequest(PartPlanRequest):
+    pass
+
+
+async def part_builder_request(method: str, path: str, payload: dict | None = None, *, timeout: float = 30.0) -> dict:
+    headers = {"X-Internal-Service-Token": settings.internal_service_token}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.request(
+                method,
+                f"{settings.video_part_builder_base_url}{path}",
+                json=payload if payload is not None else {},
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"video-part-builder unavailable: {type(exc).__name__}") from exc
+    if response.status_code >= 400:
+        detail = response.text[:1000]
+        status_code = 409 if response.status_code == 409 else 502
+        raise HTTPException(status_code=status_code, detail=f"video-part-builder error: {detail}")
+    return response.json()
+
+
+async def part_builder_post(path: str, payload: dict | None = None, *, timeout: float = 30.0) -> dict:
+    return await part_builder_request("POST", path, payload, timeout=timeout)
+
+
+async def part_builder_delete(path: str, *, timeout: float = 30.0) -> dict:
+    return await part_builder_request("DELETE", path, {}, timeout=timeout)
+
+
+def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
+    return {
+        "id": str(part.id),
+        "video_session_id": str(part.video_session_id),
+        "part_no": part.part_no,
+        "run_no": part.run_no,
+        "start_segment_no": part.start_segment_no,
+        "end_segment_no": part.end_segment_no,
+        "duration_ms": part.duration_ms,
+        "expected_bytes": part.expected_bytes,
+        "final_bytes": part.final_bytes,
+        "sha256": part.sha256,
+        "file_name": part.file_name,
+        "relative_path": part.relative_path,
+        "status": part.status,
+        "last_error": part.last_error,
+        "created_at": part.created_at,
+        "completed_at_utc": part.completed_at_utc,
+        "job": None if job is None else {
+            "id": job.id,
+            "status": job.status,
+            "phase": job.phase,
+            "attempts": job.attempts,
+            "cancel_requested": job.cancel_requested,
+            "progress_bytes": job.progress_bytes,
+            "total_bytes": job.total_bytes,
+            "last_error": job.last_error,
+            "created_at": job.created_at,
+            "started_at_utc": job.started_at_utc,
+            "completed_at_utc": job.completed_at_utc,
+            "heartbeat_at_utc": job.heartbeat_at_utc,
+        },
+    }
+
+
+def _part_file_name(session_id: uuid.UUID, part_no: int, start_segment_no: int, end_segment_no: int) -> str:
+    return f"vp_{session_id.hex}__part{part_no:04d}__s{start_segment_no:06d}-s{end_segment_no:06d}.ts"
+
+
+async def plan_part_range(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    payload: PartPlanRequest,
+    *,
+    lock: bool = False,
+) -> tuple[VideoSession, list[VideoSegment], int, dict]:
+    session = await db.get(VideoSession, session_id)
+    if session is None or session.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    if payload.mode not in {"manual", "target"}:
+        raise HTTPException(400, "mode must be manual or target")
+    if payload.mode == "manual" and payload.to_segment_no is None:
+        raise HTTPException(400, "to_segment_no is required for manual mode")
+    if payload.mode == "manual" and int(payload.to_segment_no or 0) < payload.from_segment_no:
+        raise HTTPException(400, "to_segment_no must be >= from_segment_no")
+
+    stmt = (
+        select(VideoSegment, VideoRun.run_no)
+        .join(VideoRun, VideoRun.id == VideoSegment.video_run_id)
+        .where(
+            VideoSegment.video_session_id == session_id,
+            VideoSegment.segment_no >= payload.from_segment_no,
+        )
+        .order_by(VideoSegment.segment_no)
+        .limit(10000)
+    )
+    if payload.mode == "manual":
+        stmt = stmt.where(VideoSegment.segment_no <= int(payload.to_segment_no))
+    if lock:
+        stmt = stmt.with_for_update()
+    rows = (await db.execute(stmt)).all()
+    if not rows or rows[0][0].segment_no != payload.from_segment_no:
+        raise HTTPException(409, "from_segment_no is missing or not available")
+
+    segment_ids = [segment.id for segment, _run_no in rows]
+    reserved_ids = set()
+    if segment_ids:
+        reserved_ids = set(
+            (
+                await db.execute(
+                    select(VideoPartSegment.segment_id).where(VideoPartSegment.segment_id.in_(segment_ids))
+                )
+            ).scalars().all()
+        )
+
+    selected: list[VideoSegment] = []
+    run_no: int | None = None
+    expected_next = payload.from_segment_no
+    total_bytes = 0
+    total_duration = 0
+    warnings: list[str] = []
+    target_bytes = int((payload.target_mib or settings.part_build_target_mib_default) * 1024 * 1024)
+
+    for segment, row_run_no in rows:
+        if segment.segment_no != expected_next:
+            if payload.mode == "manual":
+                raise HTTPException(409, f"segment range has a gap before #{expected_next}")
+            warnings.append(f"stopped_before_gap:{expected_next}")
+            break
+        if run_no is None:
+            run_no = int(row_run_no)
+        elif int(row_run_no) != run_no:
+            if payload.mode == "manual":
+                raise HTTPException(409, "part range cannot cross a run boundary")
+            warnings.append(f"stopped_before_run_boundary:{segment.segment_no}")
+            break
+        if segment.storage_state != "archive_ready" or segment.integrity_state != "hashed" or not segment.sha256:
+            if payload.mode == "manual":
+                raise HTTPException(409, f"segment #{segment.segment_no} is not archive_ready/hashed")
+            warnings.append(f"stopped_before_not_ready:{segment.segment_no}")
+            break
+        if segment.id in reserved_ids:
+            if payload.mode == "manual":
+                raise HTTPException(409, f"segment #{segment.segment_no} is already reserved by another part")
+            if not selected:
+                raise HTTPException(409, f"segment #{segment.segment_no} is already reserved by another part")
+            warnings.append(f"stopped_before_reserved:{segment.segment_no}")
+            break
+        selected.append(segment)
+        total_bytes += int(segment.bytes)
+        total_duration += int(segment.duration_ms)
+        expected_next += 1
+        if payload.mode == "target" and total_bytes >= target_bytes:
+            break
+
+    if not selected:
+        raise HTTPException(409, "no buildable segments are available from the requested start")
+    if payload.mode == "manual" and selected[-1].segment_no != int(payload.to_segment_no):
+        raise HTTPException(409, "manual range is incomplete")
+    if payload.mode == "target" and total_bytes < target_bytes:
+        warnings.append("target_not_reached_before_available_range_end")
+
+    plan = {
+        "mode": payload.mode,
+        "from_segment_no": selected[0].segment_no,
+        "end_segment_no": selected[-1].segment_no,
+        "run_no": run_no,
+        "segment_count": len(selected),
+        "expected_bytes": total_bytes,
+        "duration_ms": total_duration,
+        "target_mib": payload.target_mib or settings.part_build_target_mib_default if payload.mode == "target" else None,
+        "warnings": warnings,
+    }
+    return session, selected, int(run_no or 0), plan
 
 
 def video_progress_percent(row: VideoSession) -> float | None:
@@ -81,6 +272,10 @@ async def recorder_post(path: str, payload: dict, *, timeout: float = 30.0) -> d
 
 async def stop_video_capture_row(db: AsyncSession, row: VideoSession, *, reason: str) -> None:
     await recorder_post(f"/internal/v1/video-sessions/{row.id}/stop", {"reason": reason})
+    try:
+        await part_builder_post("/internal/v1/capture-priority/release", {})
+    except HTTPException:
+        pass
     await db.refresh(row)
     db.add(
         AuditLog(
@@ -113,6 +308,17 @@ async def ensure_video_idle_for_delete(db: AsyncSession, row: VideoSession) -> N
     )
     if migration_id is not None:
         raise HTTPException(409, "video session is currently being moved between output roots")
+    active_part_job = await db.scalar(
+        select(VideoPartBuildJob.id)
+        .join(VideoPart, VideoPart.id == VideoPartBuildJob.part_id)
+        .where(
+            VideoPart.video_session_id == row.id,
+            VideoPartBuildJob.status.in_(PART_ACTIVE_JOB_STATUSES),
+        )
+        .limit(1)
+    )
+    if active_part_job is not None:
+        raise HTTPException(409, "video session has an active part build")
 
 
 async def quarantine_video_for_purge(row: VideoSession) -> dict:
@@ -132,6 +338,7 @@ async def finalize_video_purge(ticket: dict) -> None:
 
 async def delete_video_db_rows(db: AsyncSession, session_id: uuid.UUID) -> None:
     await db.execute(delete(AuditLog).where(AuditLog.video_session_id == session_id))
+    await db.execute(delete(VideoPart).where(VideoPart.video_session_id == session_id))
     await db.execute(delete(VideoGap).where(VideoGap.video_session_id == session_id))
     await db.execute(delete(VideoSegment).where(VideoSegment.video_session_id == session_id))
     await db.execute(delete(VideoRun).where(VideoRun.video_session_id == session_id))
@@ -267,22 +474,24 @@ async def list_video_segments(
     row = await db.get(VideoSession, session_id)
     if row is None or row.deleted_at_utc is not None:
         raise HTTPException(404, "video session not found")
-    segments = (
+    segment_rows = (
         await db.execute(
-            select(VideoSegment)
+            select(VideoSegment, VideoRun.run_no)
+            .join(VideoRun, VideoRun.id == VideoSegment.video_run_id)
             .where(VideoSegment.video_session_id == session_id, VideoSegment.segment_no > after_segment_no)
             .order_by(VideoSegment.segment_no)
             .limit(page_size + 1)
         )
-    ).scalars().all()
-    has_more = len(segments) > page_size
-    segments = segments[:page_size]
+    ).all()
+    has_more = len(segment_rows) > page_size
+    segment_rows = segment_rows[:page_size]
     return {
         "items": [
             {
                 "id": segment.id,
                 "segment_no": segment.segment_no,
                 "video_run_id": segment.video_run_id,
+                "run_no": int(run_no),
                 "file_name": segment.file_name,
                 "relative_path": segment.relative_path,
                 "timeline_start_ms": segment.timeline_start_ms,
@@ -299,10 +508,189 @@ async def list_video_segments(
                 "archived_at_utc": segment.archived_at_utc,
                 "closed_at_utc": segment.closed_at_utc,
             }
-            for segment in segments
+            for segment, run_no in segment_rows
         ],
-        "next_after_segment_no": segments[-1].segment_no if has_more and segments else None,
+        "next_after_segment_no": segment_rows[-1][0].segment_no if has_more and segment_rows else None,
     }
+
+
+@router.get("/video-sessions")
+async def list_video_sessions(
+    page_size: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            select(VideoSession, MediaEvent)
+            .join(MediaEvent, MediaEvent.id == VideoSession.event_id)
+            .where(VideoSession.deleted_at_utc.is_(None))
+            .order_by(VideoSession.created_at.desc())
+            .limit(page_size)
+        )
+    ).all()
+    ids = [session.id for session, _event in rows]
+    aggregates: dict[uuid.UUID, tuple[int, int]] = {}
+    if ids:
+        aggregate_rows = (
+            await db.execute(
+                select(
+                    VideoSegment.video_session_id,
+                    func.count(VideoSegment.id),
+                    func.coalesce(func.sum(VideoSegment.bytes), 0),
+                )
+                .where(VideoSegment.video_session_id.in_(ids))
+                .group_by(VideoSegment.video_session_id)
+            )
+        ).all()
+        aggregates = {session_id: (int(count or 0), int(size or 0)) for session_id, count, size in aggregate_rows}
+    items = []
+    for session, event in rows:
+        data = video_session_dict(session)
+        segment_count, total_bytes = aggregates.get(session.id, (0, 0))
+        data.update({
+            "segment_count": segment_count,
+            "bytes": total_bytes,
+            "event": {
+                "id": str(event.id),
+                "media_type": event.media_type,
+                "channel_login": event.channel_login,
+                "channel_display_name": event.channel_display_name,
+                "title": event.title,
+                "external_key": event.external_key,
+            },
+        })
+        items.append(data)
+    return {"items": items}
+
+
+@router.post("/video-sessions/{session_id}/parts/plan")
+async def plan_video_part(
+    session_id: uuid.UUID,
+    payload: PartPlanRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    _session, _segments, _run_no, plan = await plan_part_range(db, session_id, payload)
+    return plan
+
+
+@router.post("/video-sessions/{session_id}/parts")
+async def create_video_part(
+    session_id: uuid.UUID,
+    payload: PartCreateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
+    session, segments, run_no, plan = await plan_part_range(db, session_id, payload, lock=True)
+    part_no = int(
+        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
+        or 0
+    ) + 1
+    file_name = _part_file_name(session_id, part_no, segments[0].segment_no, segments[-1].segment_no)
+    metadata = session.metadata_json or {}
+    output_subdir = str(metadata.get("output_subdir") or "streamhub").strip("/\\")
+    relative_path = f"{output_subdir}/twitch/events/{session.event_id}/video/{session.id}/parts/{file_name}"
+    active_capture = await db.scalar(
+        select(VideoSession.id)
+        .where(VideoSession.deleted_at_utc.is_(None), VideoSession.status.in_(ACTIVE_VIDEO_STATUSES))
+        .limit(1)
+    )
+    queued_status = "waiting_capture_idle" if active_capture is not None else "queued"
+    part = VideoPart(
+        id=uuid.uuid4(),
+        video_session_id=session_id,
+        part_no=part_no,
+        run_no=run_no,
+        start_segment_no=segments[0].segment_no,
+        end_segment_no=segments[-1].segment_no,
+        duration_ms=plan["duration_ms"],
+        expected_bytes=plan["expected_bytes"],
+        file_name=file_name,
+        relative_path=relative_path,
+        status=queued_status,
+    )
+    db.add(part)
+    await db.flush()
+    for segment in segments:
+        db.add(
+            VideoPartSegment(
+                part_id=part.id,
+                segment_id=segment.id,
+                segment_no=segment.segment_no,
+                expected_bytes=segment.bytes,
+            )
+        )
+    job = VideoPartBuildJob(
+        part_id=part.id,
+        status=queued_status,
+        phase=queued_status,
+        total_bytes=plan["expected_bytes"],
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(part)
+    await db.refresh(job)
+
+    wakeup_error = None
+    try:
+        await part_builder_post(f"/internal/v1/parts/{part.id}/enqueue", {})
+    except HTTPException as exc:
+        wakeup_error = str(exc.detail)
+    data = part_dict(part, job)
+    data["plan"] = plan
+    data["builder_wakeup_error"] = wakeup_error
+    return data
+
+
+@router.get("/video-sessions/{session_id}/parts")
+async def list_video_parts(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    session = await db.get(VideoSession, session_id)
+    if session is None or session.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    rows = (
+        await db.execute(
+            select(VideoPart, VideoPartBuildJob)
+            .outerjoin(VideoPartBuildJob, VideoPartBuildJob.part_id == VideoPart.id)
+            .where(VideoPart.video_session_id == session_id)
+            .order_by(VideoPart.part_no)
+        )
+    ).all()
+    return {"items": [part_dict(part, job) for part, job in rows]}
+
+
+@router.post("/video-parts/{part_id}/retry")
+async def retry_video_part(part_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    await part_builder_post(f"/internal/v1/parts/{part_id}/retry", {})
+    row = (
+        await db.execute(
+            select(VideoPart, VideoPartBuildJob)
+            .outerjoin(VideoPartBuildJob, VideoPartBuildJob.part_id == VideoPart.id)
+            .where(VideoPart.id == part_id)
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(404, "part not found")
+    return part_dict(row[0], row[1])
+
+
+@router.post("/video-parts/{part_id}/cancel")
+async def cancel_video_part(part_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    await part_builder_post(f"/internal/v1/parts/{part_id}/cancel", {})
+    row = (
+        await db.execute(
+            select(VideoPart, VideoPartBuildJob)
+            .outerjoin(VideoPartBuildJob, VideoPartBuildJob.part_id == VideoPart.id)
+            .where(VideoPart.id == part_id)
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(404, "part not found")
+    return part_dict(row[0], row[1])
+
+
+@router.delete("/video-parts/{part_id}")
+async def delete_video_part(part_id: uuid.UUID) -> dict:
+    return await part_builder_delete(f"/internal/v1/parts/{part_id}", timeout=120.0)
+
 
 @router.get("/deleted/video-sessions")
 async def list_deleted_video_sessions(

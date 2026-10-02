@@ -54,6 +54,61 @@ type VideoSession = {
   output_subdir?: string;
   storage_summary?: Record<string, { segments: number; bytes: number }>;
   deletion_group_id?: string | null;
+  event?: {
+    id: string;
+    media_type: "live" | "vod";
+    channel_login?: string | null;
+    channel_display_name?: string | null;
+    title?: string | null;
+    external_key: string;
+  };
+};
+
+type VideoPartJob = {
+  id: number;
+  status: string;
+  phase: string;
+  attempts: number;
+  cancel_requested: boolean;
+  progress_bytes: number;
+  total_bytes: number;
+  last_error?: string | null;
+  created_at: string;
+  started_at_utc?: string | null;
+  completed_at_utc?: string | null;
+  heartbeat_at_utc?: string | null;
+};
+
+type VideoPart = {
+  id: string;
+  video_session_id: string;
+  part_no: number;
+  run_no: number;
+  start_segment_no: number;
+  end_segment_no: number;
+  duration_ms: number;
+  expected_bytes: number;
+  final_bytes?: number | null;
+  sha256?: string | null;
+  file_name: string;
+  relative_path: string;
+  status: string;
+  last_error?: string | null;
+  created_at: string;
+  completed_at_utc?: string | null;
+  job?: VideoPartJob | null;
+};
+
+type PartPlan = {
+  mode: "manual" | "target";
+  from_segment_no: number;
+  end_segment_no: number;
+  run_no: number;
+  segment_count: number;
+  expected_bytes: number;
+  duration_ms: number;
+  target_mib?: number | null;
+  warnings: string[];
 };
 
 type OutputRoot = {
@@ -105,6 +160,7 @@ type VideoSegment = {
   id: number;
   segment_no: number;
   video_run_id: number;
+  run_no: number;
   file_name: string;
   relative_path: string;
   timeline_start_ms: number;
@@ -176,7 +232,7 @@ type VideoCaptureProgress = {
   percent?: number | null;
 };
 
-type ViewMode = "events" | "trash" | "storage";
+type ViewMode = "events" | "video-manager" | "trash" | "storage";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
 const PROGRESS_POLL_MS = 5000;
@@ -229,6 +285,18 @@ function localVideoProgressPercent(session: VideoSession): number | null {
   return Math.min(99.9, Math.round((covered / session.required_end_ms) * 1000) / 10);
 }
 
+function chatProgressLabel(session: Session, progress?: CaptureProgress): string {
+  const percent = progress?.percent ?? localProgressPercent(session);
+  if (percent != null) return `${Math.max(0, Math.min(100, percent)).toFixed(1)}%`;
+  return session.media_type === "live" ? "LIVE" : "VOD · …";
+}
+
+function videoProgressLabel(session: VideoSession, progress?: VideoCaptureProgress): string {
+  const percent = progress?.percent ?? localVideoProgressPercent(session);
+  if (percent != null) return `${Math.max(0, Math.min(100, percent)).toFixed(1)}%`;
+  return session.metadata?.media_type === "live" ? "LIVE" : "VOD · …";
+}
+
 function ProgressBar({ session, progress }: { session: Session; progress?: CaptureProgress }) {
   const percent = progress?.percent ?? localProgressPercent(session);
   const status = progress?.status || session.status;
@@ -236,9 +304,10 @@ function ProgressBar({ session, progress }: { session: Session; progress?: Captu
     return null;
   }
   if (percent == null) {
+    const label = chatProgressLabel(session, progress);
     return (
-      <div className="capture-progress" aria-label="Сбор идет, процент недоступен">
-        <div className="capture-progress-head"><span>Chat сбор</span><strong>LIVE</strong></div>
+      <div className="capture-progress" aria-label={`Chat ${session.media_type.toUpperCase()}: процент пока недоступен`}>
+        <div className="capture-progress-head"><span>Chat сбор</span><strong>{label}</strong></div>
         <div className="progress-track indeterminate"><div className="progress-fill" /></div>
       </div>
     );
@@ -282,6 +351,14 @@ function App() {
   const [selectedVideo, setSelectedVideo] = useState<VideoSession | null>(null);
   const [videoRuns, setVideoRuns] = useState<VideoRun[]>([]);
   const [videoSegments, setVideoSegments] = useState<VideoSegment[]>([]);
+  const [videoSessions, setVideoSessions] = useState<VideoSession[]>([]);
+  const [videoParts, setVideoParts] = useState<VideoPart[]>([]);
+  const [partMode, setPartMode] = useState<"manual" | "target">("manual");
+  const [partFromSegment, setPartFromSegment] = useState(1);
+  const [partToSegment, setPartToSegment] = useState(1);
+  const [partTargetMib, setPartTargetMib] = useState(1024);
+  const [partPlan, setPartPlan] = useState<PartPlan | null>(null);
+  const [partAction, setPartAction] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [progressBySession, setProgressBySession] = useState<Record<string, CaptureProgress>>({});
   const [videoProgressBySession, setVideoProgressBySession] = useState<Record<string, VideoCaptureProgress>>({});
@@ -312,6 +389,25 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  async function loadVideoSessions() {
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions?page_size=200`, { cache: "no-store" });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setVideoSessions(data.items || []);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function loadVideoParts(sessionId: string) {
+    const res = await fetch(`${API}/api/v1/video-sessions/${sessionId}/parts`, { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    setVideoParts(data.items || []);
   }
 
   async function loadOutputSettings() {
@@ -427,6 +523,7 @@ function App() {
 
   async function loadCurrentView(targetView: ViewMode = view) {
     if (targetView === "events") await loadEvents();
+    else if (targetView === "video-manager") await loadVideoSessions();
     else if (targetView === "storage") await Promise.all([loadOutputSettings(), loadStorageMigrations()]);
     else await loadTrash();
   }
@@ -450,22 +547,120 @@ function App() {
   async function openVideoSession(session: VideoSession) {
     setSelected(null);
     setSelectedVideo(session);
+    setPartPlan(null);
     try {
-      const [detailRes, runsRes, segmentsRes] = await Promise.all([
+      const [detailRes, runsRes, segmentsRes, partsRes] = await Promise.all([
         fetch(`${API}/api/v1/video-sessions/${session.id}`, { cache: "no-store" }),
         fetch(`${API}/api/v1/video-sessions/${session.id}/runs`, { cache: "no-store" }),
         fetch(`${API}/api/v1/video-sessions/${session.id}/segments?page_size=500`, { cache: "no-store" }),
+        fetch(`${API}/api/v1/video-sessions/${session.id}/parts`, { cache: "no-store" }),
       ]);
       if (!detailRes.ok) throw new Error(await detailRes.text());
       if (!runsRes.ok) throw new Error(await runsRes.text());
       if (!segmentsRes.ok) throw new Error(await segmentsRes.text());
-      const [detail, runs, segments] = await Promise.all([detailRes.json(), runsRes.json(), segmentsRes.json()]);
+      if (!partsRes.ok) throw new Error(await partsRes.text());
+      const [detail, runs, segments, parts] = await Promise.all([detailRes.json(), runsRes.json(), segmentsRes.json(), partsRes.json()]);
+      const loadedSegments = (segments.items || []) as VideoSegment[];
+      const loadedParts = (parts.items || []) as VideoPart[];
       setSelectedVideo(detail);
       setVideoRuns(runs.items || []);
-      setVideoSegments(segments.items || []);
+      setVideoSegments(loadedSegments);
+      setVideoParts(loadedParts);
+      const reserved = new Set<number>();
+      loadedParts.forEach((part) => {
+        for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
+      });
+      const next = loadedSegments.find((segment) => segment.storage_state === "archive_ready" && segment.integrity_state === "hashed" && !reserved.has(segment.segment_no))?.segment_no || loadedSegments[0]?.segment_no || 1;
+      setPartFromSegment(next);
+      setPartToSegment(next);
       setError(null);
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  function partRequestBody() {
+    return partMode === "manual"
+      ? { mode: "manual", from_segment_no: partFromSegment, to_segment_no: partToSegment }
+      : { mode: "target", from_segment_no: partFromSegment, target_mib: partTargetMib };
+  }
+
+  async function previewPart() {
+    if (!selectedVideo) return;
+    setPartAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/parts/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(partRequestBody()),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setPartPlan(await res.json());
+      setError(null);
+    } catch (e) {
+      setPartPlan(null);
+      setError(String(e));
+    } finally {
+      setPartAction(false);
+    }
+  }
+
+  async function buildPart() {
+    if (!selectedVideo) return;
+    setPartAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/parts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(partRequestBody()),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const created = await res.json() as VideoPart & { plan?: PartPlan; builder_wakeup_error?: string | null };
+      await loadVideoParts(selectedVideo.id);
+      const reserved = new Set<number>();
+      [...videoParts, created].forEach((part) => {
+        for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
+      });
+      const after = created.plan?.end_segment_no || created.end_segment_no;
+      const next = videoSegments.find((segment) => (
+        segment.segment_no > after
+        && segment.storage_state === "archive_ready"
+        && segment.integrity_state === "hashed"
+        && !reserved.has(segment.segment_no)
+      ))?.segment_no || after + 1;
+      setPartFromSegment(next);
+      setPartToSegment(next);
+      setPartPlan(null);
+      setError(created.builder_wakeup_error ? `Part поставлен в durable queue, но wakeup builder не прошёл: ${created.builder_wakeup_error}` : null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPartAction(false);
+    }
+  }
+
+  async function partActionRequest(part: VideoPart, action: "retry" | "cancel" | "delete") {
+    if (!selectedVideo) return;
+    if (action === "delete" && !window.confirm(`Удалить part #${part.part_no}? Source segments останутся.`)) return;
+    setPartAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-parts/${part.id}${action === "delete" ? "" : `/${action}`}`, { method: action === "delete" ? "DELETE" : "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadVideoParts(selectedVideo.id);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPartAction(false);
+    }
+  }
+
+  async function copyPartPath(part: VideoPart) {
+    try {
+      await navigator.clipboard.writeText(part.relative_path);
+      setError(null);
+    } catch {
+      setError(`Path: ${part.relative_path}`);
     }
   }
 
@@ -537,7 +732,8 @@ function App() {
       const res = await fetch(`${API}/api/v1/video-sessions/${session.id}`, { method: "DELETE" });
       if (!res.ok) throw new Error(await res.text());
       if (selectedVideo?.id === session.id) setSelectedVideo(null);
-      await loadEvents();
+      if (view === "video-manager") await loadVideoSessions();
+      else await loadEvents();
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -645,6 +841,17 @@ function App() {
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, activeStorageMigration?.id, activeStorageMigration?.status]);
+
+  const activePartBuild = videoParts.some((part) => ["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status));
+
+  useEffect(() => {
+    if (!selectedVideo || !activePartBuild) return;
+    const timer = window.setInterval(() => {
+      loadVideoParts(selectedVideo.id).catch((e) => console.warn("part queue poll failed", e));
+    }, 1500);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedVideo?.id, activePartBuild]);
 
   const monitoredChatIds = useMemo(
     () => view === "events"
@@ -792,7 +999,7 @@ function App() {
     const spoolPending = (selectedVideo.storage_summary?.spool?.segments || 0) + (selectedVideo.storage_summary?.copying?.segments || 0);
     return (
       <main>
-        <button className="link" onClick={() => setSelectedVideo(null)}>← Events</button>
+        <button className="link" onClick={() => setSelectedVideo(null)}>← {view === "video-manager" ? "Video Manager" : "Events"}</button>
         <header className="detail-header">
           <div>
             <h1>Video Manager · output</h1>
@@ -829,12 +1036,76 @@ function App() {
           )}
         </section>
         <section className="video-block">
+          <div className="section-label">BUILD PART</div>
+          <p className="muted small">Part — точная byte-for-byte склейка archive_ready MPEG-TS segments одного run. Range резервируется в БД до build. Во время активной Video записи queue ждёт capture idle.</p>
+          <div className="part-mode-tabs">
+            <button className={partMode === "manual" ? "active-tab" : ""} onClick={() => { setPartMode("manual"); setPartPlan(null); }}>Manual range</button>
+            <button className={partMode === "target" ? "active-tab" : ""} onClick={() => { setPartMode("target"); setPartPlan(null); }}>Target MiB</button>
+          </div>
+          <div className="part-controls">
+            <label className="storage-field"><span>From segment</span><input type="number" min={1} value={partFromSegment} onChange={(e) => { const value = Math.max(1, Number(e.target.value) || 1); setPartFromSegment(value); if (partMode === "manual" && partToSegment < value) setPartToSegment(value); setPartPlan(null); }} /></label>
+            {partMode === "manual" ? (
+              <label className="storage-field"><span>To segment</span><input type="number" min={partFromSegment} value={partToSegment} onChange={(e) => { setPartToSegment(Math.max(partFromSegment, Number(e.target.value) || partFromSegment)); setPartPlan(null); }} /></label>
+            ) : (
+              <label className="storage-field"><span>Target MiB</span><input type="number" min={1} value={partTargetMib} onChange={(e) => { setPartTargetMib(Math.max(1, Number(e.target.value) || 1)); setPartPlan(null); }} /></label>
+            )}
+          </div>
+          <div className="actions part-actions">
+            <button disabled={partAction} onClick={previewPart}>Preview</button>
+            <button disabled={partAction || !partPlan} onClick={buildPart}>{partAction ? "Работаю…" : "Build Part"}</button>
+          </div>
+          {partPlan && (
+            <div className="part-plan">
+              <div><span>Range</span><strong>#{partPlan.from_segment_no}–#{partPlan.end_segment_no}</strong></div>
+              <div><span>Run</span><strong>{partPlan.run_no}</strong></div>
+              <div><span>Segments</span><strong>{partPlan.segment_count}</strong></div>
+              <div><span>Duration</span><strong>{fmtMs(partPlan.duration_ms)}</strong></div>
+              <div><span>Expected</span><strong>{fmtBytes(partPlan.expected_bytes)}</strong></div>
+              {partPlan.warnings.length > 0 && <div className="part-plan-warning"><span>Warnings</span><strong>{partPlan.warnings.join(", ")}</strong></div>}
+            </div>
+          )}
+        </section>
+        <section className="video-block">
+          <div className="section-label">PARTS / BUILD QUEUE</div>
+          {videoParts.length === 0 ? <div className="empty-child">Parts ещё не создавались</div> : (
+            <div className="part-list">
+              {videoParts.map((part) => {
+                const job = part.job;
+                const progressTotal = job?.total_bytes || part.expected_bytes || 1;
+                const progressBytes = job?.progress_bytes || (part.status === "ready" ? (part.final_bytes || part.expected_bytes) : 0);
+                const progressPercent = Math.max(0, Math.min(100, Math.round((progressBytes / progressTotal) * 100)));
+                return (
+                  <div className="part-row" key={part.id}>
+                    <div className="row"><strong>Part #{part.part_no} · seg {part.start_segment_no}–{part.end_segment_no}</strong><span className={`part-status part-status-${part.status}`}>{part.status}</span></div>
+                    <div className="muted small">run {part.run_no} · {fmtMs(part.duration_ms)} · {fmtBytes(part.final_bytes ?? part.expected_bytes)} · attempts {job?.attempts || 0}</div>
+                    {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && (
+                      <>
+                        <div className="progress-track part-progress"><div className="progress-fill" style={{ width: `${progressPercent}%` }} /></div>
+                        <div className="muted small">{job?.phase || part.status} · {fmtBytes(progressBytes)} / {fmtBytes(progressTotal)}{part.status === "waiting_capture_idle" || part.status === "suspended_for_capture" ? " · ожидает завершения Video capture" : ""}</div>
+                      </>
+                    )}
+                    {part.sha256 && <div className="muted small hash-line">sha256 <code>{part.sha256}</code></div>}
+                    <div className="muted small path-cell"><code>{part.relative_path}</code></div>
+                    {(part.last_error || job?.last_error) && <div className="inline-error small">{part.last_error || job?.last_error}</div>}
+                    <div className="actions part-row-actions">
+                      {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}
+                      {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && <button disabled={partAction} onClick={() => partActionRequest(part, "cancel")}>Cancel</button>}
+                      <button onClick={() => copyPartPath(part)}>Copy path</button>
+                      {["ready", "failed", "cancelled"].includes(part.status) && <button className="danger subtle" disabled={partAction} onClick={() => partActionRequest(part, "delete")}>Delete</button>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+        <section className="video-block">
           <div className="section-label">SEGMENTS · spool → output</div>
           <p className="muted small">Закрытый segment сначала живёт в Docker spool. Backend переносит закрытые segments пачками в физический output. Spool очищается только после проверки всей пачки и DB commit.</p>
           {videoSegments.length === 0 ? <div className="empty-child">Закрытых сегментов пока нет</div> : (
             <div className="table-wrap"><table><thead><tr><th>Segment</th><th>Run</th><th>Timeline</th><th>Duration</th><th>Bytes</th><th>Storage</th><th>Integrity</th><th>Archived</th><th>Path / error</th></tr></thead><tbody>
-              {videoSegments.map((segment) => <tr key={segment.id}>
-                <td>#{segment.segment_no}</td><td>{segment.video_run_id}</td>
+              {videoSegments.map((segment, index) => <tr key={segment.id} className={index > 0 && videoSegments[index - 1].run_no !== segment.run_no ? "run-boundary" : ""}>
+                <td><button className="segment-picker" onClick={() => { setPartFromSegment(segment.segment_no); setPartToSegment(segment.segment_no); setPartPlan(null); }}>#{segment.segment_no}</button></td><td>{segment.run_no}</td>
                 <td>{fmtMs(segment.timeline_start_ms)}–{fmtMs(segment.timeline_end_ms)}</td>
                 <td>{fmtMs(segment.duration_ms)}</td><td>{fmtBytes(segment.bytes)}</td>
                 <td>{segment.storage_state}</td><td>{segment.integrity_state}</td>
@@ -892,10 +1163,11 @@ function App() {
       <header>
         <div>
           <h1>StreamHub</h1>
-          <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
+          <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "video-manager" ? "Video sessions · Segments · Parts · Build Queue" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
         </div>
         <div className="actions">
           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
+          <button className={view === "video-manager" ? "active-tab" : ""} onClick={() => setView("video-manager")}>Video Manager</button>
           <button className={view === "trash" ? "active-tab" : ""} onClick={() => setView("trash")}>Корзина</button>
           <button className={view === "storage" ? "active-tab" : ""} onClick={() => setView("storage")}>Хранилище</button>
           <button onClick={() => loadCurrentView(view)}>Обновить</button>
@@ -909,6 +1181,8 @@ function App() {
           <section className="events-list">
             {events.map((event) => {
               const expanded = expandedIds.includes(event.id);
+              const activeChat = event.chat_sessions.find(isCaptureBusy);
+              const activeVideo = event.video_sessions.find(isVideoBusy);
               return (
                 <article className="event-card" key={event.id}>
                   <button className="event-summary" onClick={() => toggleEvent(event.id)} aria-expanded={expanded}>
@@ -922,8 +1196,8 @@ function App() {
                       <span>Chat: {event.chat_sessions_count}</span>
                       <span>Video: {event.video_sessions_count}</span>
                       {event.metadata?.identity_state && event.metadata.identity_state !== "canonical" && <span>legacy identity</span>}
-                      {event.active_chat_sessions_count > 0 && <span className="active-badge">chat active</span>}
-                      {event.active_video_sessions_count > 0 && <span className="active-badge">video active</span>}
+                      {activeChat && <span className="active-badge">chat {chatProgressLabel(activeChat, progressBySession[activeChat.id])}</span>}
+                      {activeVideo && <span className="active-badge">video {videoProgressLabel(activeVideo, videoProgressBySession[activeVideo.id])}</span>}
                     </div>
                   </button>
 
@@ -982,6 +1256,26 @@ function App() {
             })}
           </section>
         </>
+       ) : view === "video-manager" ? (
+        <section className="storage-panel video-manager-index">
+          <div className="section-label">VIDEO SESSIONS</div>
+          <p className="muted">Открой session для Overview, Runs, Segments, Parts и durable Build Queue.</p>
+          {videoSessions.length === 0 ? <div className="empty-child">Video sessions пока нет</div> : (
+            <div className="video-manager-list">
+              {videoSessions.map((session) => (
+                <div className="video-manager-session" key={session.id}>
+                  <div className="video-manager-session-main">
+                    <div className="row"><strong>{session.event?.channel_display_name || session.event?.channel_login || session.metadata?.channel_login || "Twitch"}</strong><span>{session.event?.media_type?.toUpperCase() || session.metadata?.media_type?.toUpperCase() || "VIDEO"}</span></div>
+                    <div className="event-title">{session.event?.title || session.event?.external_key || session.id}</div>
+                    <div className="session-status-line"><strong>{session.status}</strong><span>{session.completeness_status}</span><span>{session.segment_count || 0} seg</span><span>{fmtBytes(session.bytes || 0)}</span><span>{fmtMs(session.duration_recorded_ms)}</span></div>
+                    <div className="muted small"><code>{session.id}</code></div>
+                  </div>
+                  <div className="actions"><button onClick={() => openVideoSession(session)}>Открыть</button></div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
       ) : view === "storage" ? (
         <section className="storage-panel">
           <div className="section-label">VIDEO OUTPUT</div>

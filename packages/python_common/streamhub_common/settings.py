@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     chat_ingest_base_url: str = Field(default="http://chat-ingest:8001", alias="CHAT_INGEST_BASE_URL")
     twitch_adapter_base_url: str = Field(default="http://twitch-adapter:8002", alias="TWITCH_ADAPTER_BASE_URL")
     video_recorder_base_url: str = Field(default="http://video-recorder:8003", alias="VIDEO_RECORDER_BASE_URL")
+    video_part_builder_base_url: str = Field(default="http://video-part-builder:8004", alias="VIDEO_PART_BUILDER_BASE_URL")
 
     video_output_root_1: str = Field(default="/outputs/root1", alias="VIDEO_OUTPUT_ROOT_1")
     video_output_root_1_label: str = Field(default="root1", alias="VIDEO_OUTPUT_ROOT_1_LABEL")
@@ -52,6 +53,11 @@ class Settings(BaseSettings):
     video_reconnect_seconds: float = Field(default=5.0, ge=1.0, alias="VIDEO_RECONNECT_SECONDS")
     video_stream_timeout_seconds: int = Field(default=90, ge=15, alias="VIDEO_STREAM_TIMEOUT_SECONDS")
     video_stop_timeout_seconds: int = Field(default=20, ge=5, alias="VIDEO_STOP_TIMEOUT_SECONDS")
+    part_build_workers: int = Field(default=2, ge=1, le=4, alias="PART_BUILD_WORKERS")
+    part_build_chunk_bytes: int = Field(default=524288, ge=65536, alias="PART_BUILD_CHUNK_BYTES")
+    part_build_target_mib_default: int = Field(default=1024, ge=1, alias="PART_BUILD_TARGET_MIB_DEFAULT")
+    part_build_allow_during_capture: bool = Field(default=False, alias="PART_BUILD_ALLOW_DURING_CAPTURE")
+    part_build_lease_seconds: int = Field(default=30, ge=10, alias="PART_BUILD_LEASE_SECONDS")
 
     twitch_client_id: str = Field(alias="TWITCH_CLIENT_ID")
     twitch_client_secret: str | None = Field(default=None, alias="TWITCH_CLIENT_SECRET")

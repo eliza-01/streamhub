@@ -16,7 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.dialects.mysql import BINARY as MYSQL_BINARY, DATETIME
+from sqlalchemy.dialects.mysql import BINARY as MYSQL_BINARY, BIGINT as MYSQL_BIGINT, DATETIME
 
 from .db import Base, UUIDBinary
 
@@ -297,6 +297,69 @@ class VideoGap(Base):
     source_end_ms: Mapped[int | None] = mapped_column(BigInteger)
     reason: Mapped[str] = mapped_column(String(64), default="unknown")
     resolved: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class VideoPart(Base):
+    __tablename__ = "video_parts"
+    __table_args__ = (UniqueConstraint("video_session_id", "part_no", name="uq_video_part_session_no"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
+    part_no: Mapped[int] = mapped_column(Integer)
+    run_no: Mapped[int] = mapped_column(Integer)
+    start_segment_no: Mapped[int] = mapped_column(Integer)
+    end_segment_no: Mapped[int] = mapped_column(Integer)
+    duration_ms: Mapped[int] = mapped_column(BigInteger, default=0)
+    expected_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    final_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    file_name: Mapped[str] = mapped_column(String(255))
+    relative_path: Mapped[str] = mapped_column(String(1024))
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class VideoPartSegment(Base):
+    __tablename__ = "video_part_segments"
+    __table_args__ = (
+        UniqueConstraint("segment_id", name="uq_video_part_segment_reservation"),
+        UniqueConstraint("part_id", "segment_no", name="uq_video_part_segment_no"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    part_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_parts.id", ondelete="CASCADE"), index=True)
+    segment_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"),
+        ForeignKey("video_segments.id", ondelete="RESTRICT"),
+    )
+    segment_no: Mapped[int] = mapped_column(Integer)
+    expected_bytes: Mapped[int] = mapped_column(BigInteger)
+    source_sha256: Mapped[str | None] = mapped_column(String(64))
+
+
+class VideoPartBuildJob(Base):
+    __tablename__ = "video_part_build_jobs"
+    __table_args__ = (UniqueConstraint("part_id", name="uq_video_part_build_job_part"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    part_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_parts.id", ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    phase: Mapped[str] = mapped_column(String(32), default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    progress_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    total_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    heartbeat_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class StorageOutputSetting(Base):

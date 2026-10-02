@@ -143,3 +143,15 @@ def test_capture_progress_is_one_batched_request_every_five_seconds():
     assert "PROGRESS_POLL_MS = 5000" in source
     assert source.count("/api/v1/capture/progress?") == 1
     assert 'document.visibilityState !== "visible"' in source
+
+
+def test_vod_progress_is_backend_enriched_and_vod_is_not_labeled_live():
+    root = Path(__file__).resolve().parents[1]
+    adapter = (root / "apps/twitch_adapter/app/main.py").read_text()
+    capture = (root / "apps/api/app/routers/capture.py").read_text()
+    web = (root / "apps/web/src/main.tsx").read_text()
+    assert '"source_duration_ms": parse_twitch_duration_ms(video.get("duration"))' in adapter
+    assert '{"mode": "vod", "video_id": payload.video_external_id}' in capture
+    assert 'return session.media_type === "live" ? "LIVE" : "VOD · …";' in web
+    assert '<span className="active-badge">chat {chatProgressLabel(' in web
+    assert '<span className="active-badge">video {videoProgressLabel(' in web

@@ -9,7 +9,14 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
-from streamhub_common.models import StorageMigrationJob, StorageOutputSetting, VideoSegment, VideoSession
+from streamhub_common.models import (
+    StorageMigrationJob,
+    StorageOutputSetting,
+    VideoPart,
+    VideoPartBuildJob,
+    VideoSegment,
+    VideoSession,
+)
 from streamhub_common.settings import get_settings
 
 router = APIRouter(prefix="/api/v1/storage", tags=["storage"])
@@ -17,6 +24,7 @@ settings = get_settings()
 
 ACTIVE_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting"})
 ACTIVE_MIGRATION_STATUSES = frozenset({"queued", "running"})
+PART_ACTIVE_JOB_STATUSES = frozenset({"queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"})
 
 
 class OutputSettingsUpdate(BaseModel):
@@ -183,21 +191,56 @@ async def create_storage_migration(
             for session_id, count, total_bytes, non_ready in stats_rows
         }
 
+    ready_part_bytes: dict = {}
+    sessions_with_active_part_jobs: set = set()
+    if source_ids:
+        part_rows = (
+            await db.execute(
+                select(
+                    VideoPart.video_session_id,
+                    func.coalesce(func.sum(VideoPart.final_bytes), 0),
+                )
+                .where(
+                    VideoPart.video_session_id.in_(source_ids),
+                    VideoPart.status == "ready",
+                )
+                .group_by(VideoPart.video_session_id)
+            )
+        ).all()
+        ready_part_bytes = {session_id: int(total or 0) for session_id, total in part_rows}
+        sessions_with_active_part_jobs = set(
+            (
+                await db.execute(
+                    select(VideoPart.video_session_id)
+                    .join(VideoPartBuildJob, VideoPartBuildJob.part_id == VideoPart.id)
+                    .where(
+                        VideoPart.video_session_id.in_(source_ids),
+                        VideoPartBuildJob.status.in_(PART_ACTIVE_JOB_STATUSES),
+                    )
+                    .distinct()
+                )
+            ).scalars().all()
+        )
+
     eligible: list[VideoSession] = []
     skipped = 0
     total_bytes = 0
     for row in source_sessions:
-        _segment_count, bytes_for_session, non_ready = stats.get(row.id, (0, 0, 0))
-        if row.status in ACTIVE_VIDEO_STATUSES or non_ready > 0:
+        _segment_count, segment_bytes, non_ready = stats.get(row.id, (0, 0, 0))
+        if (
+            row.status in ACTIVE_VIDEO_STATUSES
+            or non_ready > 0
+            or row.id in sessions_with_active_part_jobs
+        ):
             skipped += 1
             continue
         eligible.append(row)
-        total_bytes += bytes_for_session
+        total_bytes += segment_bytes + ready_part_bytes.get(row.id, 0)
 
     if not eligible:
         raise HTTPException(
             409,
-            "no idle video sessions with fully archived segments were found on the source root",
+            "no idle video sessions with fully archived segments and no pending part builds were found on the source root",
         )
 
     now = datetime.now(UTC).replace(tzinfo=None)
