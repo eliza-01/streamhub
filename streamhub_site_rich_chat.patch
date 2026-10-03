@@ -1,0 +1,323 @@
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+index e728314..b8f4f24 100644
+--- a/apps/api/app/routers/site.py
++++ b/apps/api/app/routers/site.py
+@@ -344,6 +344,54 @@ async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
+     return (await _site_payloads(db, [row]))[0]
+ 
+ 
++def _chat_fragments(row: ChatMessage) -> list[dict]:
++    value = row.fragments_json
++    if isinstance(value, list):
++        return [item for item in value if isinstance(item, dict)]
++    return []
++
++
++def _chat_message_text(row: ChatMessage) -> str:
++    # VOD replay rows historically stored the visible body only in fragments_json.
++    # Preserve message_text when it is populated, but reconstruct existing rows
++    # from their structured fragments so old captures remain fully renderable.
++    if row.message_text:
++        return str(row.message_text)
++    return "".join(str(item.get("text") or "") for item in _chat_fragments(row))
++
++
++def _chat_raw_message(row: ChatMessage) -> dict:
++    raw = row.raw_payload_json
++    if not isinstance(raw, dict):
++        return {}
++    message = raw.get("message")
++    if isinstance(message, dict):
++        return message
++    payload = raw.get("payload")
++    if isinstance(payload, dict):
++        event = payload.get("event")
++        if isinstance(event, dict):
++            nested = event.get("message")
++            if isinstance(nested, dict):
++                return nested
++    return {}
++
++
++def _chat_color(row: ChatMessage) -> str | None:
++    if row.color:
++        return str(row.color)
++    raw_message = _chat_raw_message(row)
++    value = raw_message.get("userColor") or raw_message.get("color")
++    return str(value) if value else None
++
++
++def _chat_badges(row: ChatMessage):
++    if row.badges_json not in (None, [], {}):
++        return row.badges_json
++    raw_message = _chat_raw_message(row)
++    return raw_message.get("userBadges") or raw_message.get("badges") or []
++
++
+ @router.get("/events/{event_id}/chat/messages")
+ async def site_event_chat_messages(
+     event_id: uuid.UUID,
+@@ -413,11 +461,17 @@ async def site_event_chat_messages(
+                 "timeline_offset_ms": int(row.timeline_offset_ms),
+                 "chatter_login": row.chatter_login,
+                 "chatter_name": row.chatter_name,
+-                "color": row.color,
+-                "badges": row.badges_json,
+-                "message_text": row.message_text,
++                "color": _chat_color(row),
++                "badges": _chat_badges(row),
++                "message_text": _chat_message_text(row),
++                "fragments": _chat_fragments(row),
++                "reply": row.reply_json,
++                "bits": row.bits,
+                 "message_type": row.message_type,
+                 "is_action": bool(row.is_action),
++                "source_kind": row.source_kind,
++                "provider_message_id": row.provider_message_id,
++                "channel_points_reward_id": row.channel_points_reward_id,
+             }
+             for row in page
+         ],
+diff --git a/apps/twitch_adapter/app/main.py b/apps/twitch_adapter/app/main.py
+index e6c7a6e..a1b3901 100644
+--- a/apps/twitch_adapter/app/main.py
++++ b/apps/twitch_adapter/app/main.py
+@@ -275,9 +275,11 @@ def normalize_vod_comment(node: dict[str, Any]) -> ChatMessageEnvelope:
+         chatter_external_id=str(commenter.get("id")) if commenter.get("id") is not None else None,
+         chatter_login=commenter.get("login") or commenter.get("name"),
+         chatter_name=commenter.get("displayName") or commenter.get("display_name") or commenter.get("name"),
+-        color=commenter.get("color"),
++        color=message.get("userColor") or message.get("color") or commenter.get("color"),
+         badges_json=badges,
+-        message_text=message.get("body") or "",
++        message_text=(message.get("body") or "".join(
++            str(fragment.get("text") or "") for fragment in fragments if isinstance(fragment, dict)
++        )),
+         fragments_json=fragments,
+         raw_payload_json=node,
+         message_type="message",
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 59d8f9b..2e936e7 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -273,8 +273,14 @@ type SiteChatMessage = {
+   color?: string | null;
+   badges?: unknown;
+   message_text: string;
++  fragments?: unknown;
++  reply?: unknown;
++  bits?: number | null;
+   message_type?: string | null;
+   is_action?: boolean;
++  source_kind?: string | null;
++  provider_message_id?: string | null;
++  channel_points_reward_id?: string | null;
+ };
+ 
+ type SiteEvent = {
+@@ -537,6 +543,100 @@ function safeChatColor(value?: string | null) {
+   return value && /^#[0-9a-f]{6}$/i.test(value) ? value : undefined;
+ }
+ 
++type ChatBadgeView = { key: string; label: string; title: string };
++
++function asChatRecord(value: unknown): Record<string, unknown> | null {
++  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
++}
++
++function compactBadgeLabel(setId: string) {
++  const parts = setId.split(/[^a-z0-9]+/i).filter(Boolean);
++  const compact = parts.map((part) => part.slice(0, 3)).join("·").slice(0, 10);
++  return (compact || setId.slice(0, 10) || "badge").toUpperCase();
++}
++
++function chatBadges(value: unknown): ChatBadgeView[] {
++  const result: ChatBadgeView[] = [];
++  const push = (setIdValue: unknown, versionValue: unknown, uniqueValue?: unknown) => {
++    const setId = String(setIdValue || "").trim();
++    if (!setId) return;
++    const version = String(versionValue || "").trim();
++    const title = version ? `${setId} · ${version}` : setId;
++    const key = String(uniqueValue || `${setId}/${version}`);
++    result.push({ key, label: compactBadgeLabel(setId), title });
++  };
++
++  if (Array.isArray(value)) {
++    value.forEach((item, index) => {
++      if (typeof item === "string") {
++        const [setId, ...versionParts] = item.split("/");
++        push(setId, versionParts.join("/"), `${item}:${index}`);
++        return;
++      }
++      const record = asChatRecord(item);
++      if (!record) return;
++      push(record.setID ?? record.setId ?? record.set_id ?? record.name, record.version ?? record.id, record.id ?? index);
++    });
++  } else {
++    const record = asChatRecord(value);
++    if (record) Object.entries(record).forEach(([setId, version]) => push(setId, version, setId));
++  }
++  return result;
++}
++
++function chatEmoteId(fragmentValue: unknown) {
++  const fragment = asChatRecord(fragmentValue);
++  if (!fragment) return null;
++  const emote = asChatRecord(fragment.emote);
++  const value = emote?.emoteID ?? emote?.emoteId ?? emote?.id ?? fragment.emote_id ?? fragment.emoteID;
++  if (value == null) return null;
++  const raw = String(value).trim();
++  const id = raw.split(";")[0];
++  return /^[a-z0-9_-]+$/i.test(id) ? id : null;
++}
++
++function chatFragmentText(fragmentValue: unknown) {
++  const fragment = asChatRecord(fragmentValue);
++  return fragment ? String(fragment.text || "") : "";
++}
++
++function twitchEmoteUrl(emoteId: string) {
++  return `https://static-cdn.jtvnw.net/emoticons/v2/${encodeURIComponent(emoteId)}/default/dark/1.0`;
++}
++
++function chatReplySummary(value: unknown) {
++  const reply = asChatRecord(value);
++  if (!reply) return null;
++  const author = String(
++    reply.parent_user_name ?? reply.parent_user_login ?? reply.thread_user_name ?? reply.thread_user_login ?? ""
++  ).trim();
++  const body = String(reply.parent_message_body ?? reply.parent_message_text ?? reply.parent_message ?? "").trim();
++  if (!author && !body) return null;
++  return `${author ? `↪ ${author}` : "↪"}${body ? `${author ? ": " : " "}${body}` : ""}`;
++}
++
++function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
++  const fragments = Array.isArray(message.fragments) ? message.fragments : [];
++  if (!fragments.length) return <>{message.message_text}</>;
++  return <>
++    {fragments.map((fragment, index) => {
++      const text = chatFragmentText(fragment);
++      const emoteId = chatEmoteId(fragment);
++      if (emoteId) {
++        return <img
++          className="site-chat-emote"
++          src={twitchEmoteUrl(emoteId)}
++          alt={text}
++          title={text}
++          loading="lazy"
++          key={`${emoteId}:${index}`}
++        />;
++      }
++      return <React.Fragment key={index}>{text}</React.Fragment>;
++    })}
++  </>;
++}
++
+ function SiteReplayChat({
+   eventId,
+   hasChat,
+@@ -675,15 +775,36 @@ function SiteReplayChat({
+       <div className="site-replay-chat-list" ref={listRef}>
+         {visible.length === 0 ? (
+           <div className="site-replay-chat-empty">{hasChat ? "В этой точке таймлайна сообщений пока нет." : "Для этого события чат не записан."}</div>
+-        ) : visible.map((message) => (
+-          <div className="site-replay-chat-message" key={message.id}>
+-            <button type="button" className="site-replay-chat-time" onClick={() => seekTo(message)}>{fmtMs(message.timeline_offset_ms)}</button>
+-            <div>
+-              <b style={{ color: safeChatColor(message.color) }}>{message.chatter_name || message.chatter_login || "Гость"}</b>{" "}
+-              <span>{message.message_text}</span>
++        ) : visible.map((message) => {
++          const badges = chatBadges(message.badges);
++          const reply = chatReplySummary(message.reply);
++          const authorColor = safeChatColor(message.color);
++          const specialType = message.message_type && !["message", "action"].includes(message.message_type)
++            ? message.message_type
++            : null;
++          return (
++            <div className={`site-replay-chat-message${message.is_action ? " is-action" : ""}`} key={message.id}>
++              <button type="button" className="site-replay-chat-time" onClick={() => seekTo(message)}>{fmtMs(message.timeline_offset_ms)}</button>
++              <div className="site-replay-chat-body">
++                {reply ? <div className="site-chat-reply" title={reply}>{reply}</div> : null}
++                <div className="site-chat-line">
++                  {badges.map((badge) => (
++                    <span className="site-chat-badge" title={badge.title} key={badge.key}>{badge.label}</span>
++                  ))}
++                  {message.channel_points_reward_id ? (
++                    <span className="site-chat-reward" title={`Channel points reward · ${message.channel_points_reward_id}`}>★</span>
++                  ) : null}
++                  <b style={{ color: authorColor }}>{message.chatter_name || message.chatter_login || "Гость"}</b>
++                  {message.bits ? <span className="site-chat-bits">{message.bits.toLocaleString("ru-RU")} bits</span> : null}
++                  {specialType ? <span className="site-chat-type">{specialType}</span> : null}
++                  <span className="site-chat-text" style={message.is_action && authorColor ? { color: authorColor } : undefined}>
++                    <ChatMessageFragments message={message} />
++                  </span>
++                </div>
++              </div>
+             </div>
+-          </div>
+-        ))}
++          );
++        })}
+       </div>
+       <div className="site-replay-chat-foot">Синхронизация по timeline_offset_ms · клик по времени перематывает видео</div>
+     </aside>
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 74ec63d..e8f5e0f 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -245,9 +245,18 @@ td { font-variant-numeric: tabular-nums; }
+ .site-replay-chat-head span { color: #7f8c98; font-size: 11px; text-align: right; }
+ .site-replay-chat-list { min-height: 0; overflow-y: auto; padding: 9px 10px 12px; scrollbar-width: thin; scrollbar-color: #33404d transparent; }
+ .site-replay-chat-message { display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 7px; padding: 5px 2px; font-size: 12px; line-height: 1.42; }
+-.site-replay-chat-message > div { min-width: 0; overflow-wrap: anywhere; }
+-.site-replay-chat-message b { font-weight: 800; color: #f5a047; }
+-.site-replay-chat-message span { color: #d4d9dd; }
++.site-replay-chat-body { min-width: 0; overflow-wrap: anywhere; }
++.site-chat-line { display: inline; min-width: 0; }
++.site-replay-chat-message b { margin-right: 5px; font-weight: 800; color: #f5a047; }
++.site-chat-text { color: #d4d9dd; white-space: pre-wrap; }
++.site-replay-chat-message.is-action .site-chat-text { font-style: italic; }
++.site-chat-badge, .site-chat-reward, .site-chat-bits, .site-chat-type { display: inline-flex; align-items: center; vertical-align: middle; margin: 0 4px 1px 0; border-radius: 4px; white-space: nowrap; }
++.site-chat-badge { min-height: 14px; padding: 0 3px; border: 1px solid #465566; background: #1c2732; color: #d9e1e8; font-size: 8px; font-weight: 800; letter-spacing: .02em; line-height: 12px; }
++.site-chat-reward { width: 14px; height: 14px; justify-content: center; background: #6d3ac0; color: #fff; font-size: 9px; }
++.site-chat-bits { padding: 0 4px; background: #5f2f8f; color: #eadcff; font-size: 9px; font-weight: 700; }
++.site-chat-type { padding: 0 4px; border: 1px solid #394654; color: #93a3b2; font-size: 9px; }
++.site-chat-reply { margin: 0 0 2px; overflow: hidden; color: #7f8c98; font-size: 10px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
++.site-chat-emote { display: inline-block; width: auto; height: 22px; margin: -4px 2px -5px; vertical-align: middle; object-fit: contain; }
+ .site-replay-chat-time { border: 0; background: transparent; color: #6f7a84; padding: 0; text-align: left; cursor: pointer; font-size: 10px; font-variant-numeric: tabular-nums; }
+ .site-replay-chat-time:hover { color: #ff9f59; }
+ .site-replay-chat-empty { padding: 20px 8px; color: #7f8c98; font-size: 12px; line-height: 1.5; text-align: center; }
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+index ccdbad4..489d07c 100644
+--- a/tests/test_site_catalog.py
++++ b/tests/test_site_catalog.py
+@@ -76,3 +76,29 @@ def test_site_watch_exposes_persisted_chat_and_syncs_it_to_video_timeline():
+     assert '/chat/messages?' in web
+     assert 'message.timeline_offset_ms <= currentMs + 100' in web
+     assert 'video.currentTime = Math.max(0, message.timeline_offset_ms / 1000);' in web
++
++
++def test_site_chat_reconstructs_vod_text_and_exposes_rich_presentation_fields():
++    route = _read("apps/api/app/routers/site.py")
++    adapter = _read("apps/twitch_adapter/app/main.py")
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert 'return "".join(str(item.get("text") or "") for item in _chat_fragments(row))' in route
++    assert '"color": _chat_color(row)' in route
++    assert '"badges": _chat_badges(row)' in route
++    assert '"fragments": _chat_fragments(row)' in route
++    assert '"reply": row.reply_json' in route
++    assert '"bits": row.bits' in route
++
++    assert 'color=message.get("userColor") or message.get("color") or commenter.get("color")' in adapter
++    assert '"".join(' in adapter
++    assert 'str(fragment.get("text") or "") for fragment in fragments if isinstance(fragment, dict)' in adapter
++
++    assert 'function chatBadges(' in web
++    assert 'function ChatMessageFragments(' in web
++    assert 'static-cdn.jtvnw.net/emoticons/v2/' in web
++    assert 'chatReplySummary(message.reply)' in web
++    assert 'message.bits.toLocaleString("ru-RU")' in web
++    assert 'site-chat-badge' in css
++    assert 'site-chat-emote' in css

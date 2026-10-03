@@ -50,6 +50,46 @@ class MediaEvent(Base):
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class ContentCategory(Base):
+    __tablename__ = "content_categories"
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    label_ru: Mapped[str] = mapped_column(String(64))
+    sort_order: Mapped[int] = mapped_column(SmallInteger, default=100, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SiteEventPublication(Base):
+    __tablename__ = "site_event_publications"
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), primary_key=True
+    )
+    published_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class EventCategory(Base):
+    __tablename__ = "event_categories"
+    __table_args__ = (
+        UniqueConstraint("event_id", "position", name="uq_event_categories_position"),
+        Index("ix_event_categories_category_event", "category_id", "event_id"),
+    )
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), primary_key=True
+    )
+    category_id: Mapped[int] = mapped_column(
+        SmallInteger, ForeignKey("content_categories.id", ondelete="RESTRICT"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(SmallInteger, default=1)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+
+
 class Session(Base):
     __tablename__ = "sessions"
 

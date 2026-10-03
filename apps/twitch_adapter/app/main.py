@@ -48,6 +48,8 @@ vod_tasks: dict[uuid.UUID, asyncio.Task] = {}
 vod_integrity_contexts: dict[uuid.UUID, TwitchIntegrityContext] = {}
 auth_requests: dict[str, dict[str, Any]] = {}
 metadata_app_token: dict[str, Any] = {}
+chat_badge_cache: dict[str, dict[str, Any]] = {}
+CHAT_BADGE_CACHE_TTL = timedelta(hours=6)
 
 
 @dataclass(slots=True)
@@ -275,9 +277,11 @@ def normalize_vod_comment(node: dict[str, Any]) -> ChatMessageEnvelope:
         chatter_external_id=str(commenter.get("id")) if commenter.get("id") is not None else None,
         chatter_login=commenter.get("login") or commenter.get("name"),
         chatter_name=commenter.get("displayName") or commenter.get("display_name") or commenter.get("name"),
-        color=commenter.get("color"),
+        color=message.get("userColor") or message.get("color") or commenter.get("color"),
         badges_json=badges,
-        message_text=message.get("body") or "",
+        message_text=(message.get("body") or "".join(
+            str(fragment.get("text") or "") for fragment in fragments if isinstance(fragment, dict)
+        )),
         fragments_json=fragments,
         raw_payload_json=node,
         message_type="message",
@@ -620,6 +624,72 @@ def metadata_helix_headers(access_token: str) -> dict[str, str]:
         "Client-Id": settings.twitch_client_id,
         "Accept": "application/json",
     }
+
+
+def _flatten_chat_badges(payload: dict[str, Any], scope: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for badge_set in payload.get("data") or []:
+        if not isinstance(badge_set, dict):
+            continue
+        set_id = str(badge_set.get("set_id") or "").strip()
+        if not set_id:
+            continue
+        for version in badge_set.get("versions") or []:
+            if not isinstance(version, dict):
+                continue
+            version_id = str(version.get("id") or "").strip()
+            if not version_id:
+                continue
+            items.append(
+                {
+                    "set_id": set_id,
+                    "version": version_id,
+                    "scope": scope,
+                    "image_url_1x": version.get("image_url_1x"),
+                    "image_url_2x": version.get("image_url_2x"),
+                    "image_url_4x": version.get("image_url_4x"),
+                    "title": version.get("title"),
+                    "description": version.get("description"),
+                }
+            )
+    return items
+
+
+async def _load_chat_badge_scope(cache_key: str, path: str, *, params: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    now = datetime.now(UTC)
+    cached = chat_badge_cache.get(cache_key)
+    if cached and isinstance(cached.get("expires_at"), datetime) and cached["expires_at"] > now:
+        return list(cached.get("items") or [])
+
+    token = await load_metadata_access_token()
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get(
+            f"{settings.twitch_api_base_url}{path}",
+            params=params,
+            headers=metadata_helix_headers(token),
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Twitch chat badges failed HTTP {response.status_code}: {response.text[:500]}")
+    scope = "global" if cache_key == "global" else "channel"
+    items = _flatten_chat_badges(response.json(), scope)
+    chat_badge_cache[cache_key] = {"items": items, "expires_at": now + CHAT_BADGE_CACHE_TTL}
+    return list(items)
+
+
+async def load_chat_badge_manifest(broadcaster_id: str) -> list[dict[str, Any]]:
+    global_badges, channel_badges = await asyncio.gather(
+        _load_chat_badge_scope("global", "/chat/badges/global"),
+        _load_chat_badge_scope(
+            f"channel:{broadcaster_id}",
+            "/chat/badges",
+            params={"broadcaster_id": broadcaster_id},
+        ),
+    )
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in [*global_badges, *channel_badges]:
+        merged[(str(item["set_id"]), str(item["version"]))] = item
+    return sorted(merged.values(), key=lambda item: (str(item["set_id"]), str(item["version"])))
+
 
 def helix_headers(auth: TwitchRuntimeAuth) -> dict[str, str]:
     return {
@@ -1240,6 +1310,19 @@ async def health_live() -> dict[str, str]:
 @app.get("/health/ready")
 async def health_ready() -> dict[str, str]:
     return {"status": "ready"}
+
+
+@app.get("/internal/v1/chat/badges/{broadcaster_id}", dependencies=[Depends(require_internal_token)])
+async def chat_badges(broadcaster_id: str) -> dict:
+    broadcaster_id = broadcaster_id.strip()
+    if not broadcaster_id or not broadcaster_id.isdigit():
+        raise HTTPException(400, "numeric broadcaster_id is required")
+    try:
+        badges = await load_chat_badge_manifest(broadcaster_id)
+    except Exception as exc:
+        logger.warning("Twitch chat badge manifest failed for broadcaster %s: %s", broadcaster_id, exc)
+        raise HTTPException(502, f"Twitch chat badge manifest failed: {str(exc)[:500]}") from exc
+    return {"broadcaster_id": broadcaster_id, "badges": badges}
 
 
 @app.post("/internal/v1/metadata/resolve", dependencies=[Depends(require_internal_token)])

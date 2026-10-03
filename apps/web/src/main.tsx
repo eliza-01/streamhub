@@ -238,6 +238,101 @@ type VideoSegment = {
   closed_at_utc: string;
 };
 
+type SiteCategory = {
+  slug: string;
+  label: string;
+};
+
+type SiteVideoSession = {
+  id: string;
+  status: string;
+  completeness_status: string;
+  duration_recorded_ms: number;
+  ready_parts: number;
+  linked_parts: number;
+  playable: boolean;
+  playback_url?: string | null;
+  created_at: string;
+};
+
+type SiteChatSession = {
+  id: string;
+  status: string;
+  completeness_status: string;
+  source_duration_ms?: number | null;
+  coverage_end_ms?: number | null;
+  message_count: number;
+  created_at: string;
+};
+
+type SiteChatMessage = {
+  id: number;
+  timeline_offset_ms: number;
+  chatter_login?: string | null;
+  chatter_name?: string | null;
+  color?: string | null;
+  badges?: unknown;
+  message_text: string;
+  fragments?: unknown;
+  reply?: unknown;
+  bits?: number | null;
+  message_type?: string | null;
+  is_action?: boolean;
+  source_kind?: string | null;
+  provider_message_id?: string | null;
+  channel_points_reward_id?: string | null;
+};
+
+type SiteChatBadgeAsset = {
+  set_id: string;
+  version: string;
+  scope?: "global" | "channel" | string;
+  image_url_1x?: string | null;
+  image_url_2x?: string | null;
+  image_url_4x?: string | null;
+  title?: string | null;
+  description?: string | null;
+};
+
+type SiteEvent = {
+  id: string;
+  platform: string;
+  media_type: "live" | "vod";
+  external_key: string;
+  channel_login?: string | null;
+  channel_display_name?: string | null;
+  title: string;
+  source_started_at_utc?: string | null;
+  source_duration_ms?: number | null;
+  source_url?: string | null;
+  published_at_utc: string;
+  categories: Array<SiteCategory & { position?: number }>;
+  video_sessions: SiteVideoSession[];
+  chat_sessions: SiteChatSession[];
+  primary_chat_session_id?: string | null;
+  chat_message_count: number;
+  has_chat: boolean;
+  ready_parts: number;
+  linked_parts: number;
+  primary_video_session_id?: string | null;
+  playback_url?: string | null;
+  playable: boolean;
+};
+
+type SiteAvailableEvent = {
+  id: string;
+  media_type: "live" | "vod";
+  external_key: string;
+  channel_login?: string | null;
+  channel_display_name?: string | null;
+  title: string;
+  source_started_at_utc?: string | null;
+  source_duration_ms?: number | null;
+  video_sessions: number;
+  ready_parts: number;
+  linked_parts: number;
+};
+
 type MediaEvent = {
   id: string;
   platform: string;
@@ -292,7 +387,7 @@ type VideoCaptureProgress = {
   percent?: number | null;
 };
 
-type ViewMode = "events" | "video-manager" | "trash" | "storage";
+type ViewMode = "events" | "video-manager" | "site" | "trash" | "storage";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
 const PROGRESS_POLL_MS = 5000;
@@ -413,13 +508,24 @@ function VideoProgressBar({ session, progress }: { session: VideoSession; progre
   );
 }
 
-function TelegramVideoPlayer({ playlistUrl }: { playlistUrl: string }) {
+function apiUrl(pathOrUrl: string) {
+  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+  return `${API}${pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`}`;
+}
+
+function TelegramVideoPlayer({
+  playlistUrl,
+  externalRef,
+}: {
+  playlistUrl: string;
+  externalRef?: { current: HTMLVideoElement | null };
+}) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    const source = `${API}${playlistUrl}`;
+    const source = apiUrl(playlistUrl);
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
       video.src = source;
       return () => { video.removeAttribute("src"); video.load(); };
@@ -431,7 +537,356 @@ function TelegramVideoPlayer({ playlistUrl }: { playlistUrl: string }) {
     return () => hls.destroy();
   }, [playlistUrl]);
 
-  return <video ref={videoRef} className="telegram-player" controls preload="metadata" />;
+  return (
+    <video
+      ref={(node) => {
+        videoRef.current = node;
+        if (externalRef) externalRef.current = node;
+      }}
+      className="telegram-player"
+      controls
+      preload="metadata"
+    />
+  );
+}
+
+function safeChatColor(value?: string | null) {
+  return value && /^#[0-9a-f]{6}$/i.test(value) ? value : undefined;
+}
+
+type ChatBadgeView = {
+  key: string;
+  label: string;
+  title: string;
+  imageUrl?: string;
+  imageUrl2x?: string;
+  imageUrl4x?: string;
+};
+
+function asChatRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function compactBadgeLabel(setId: string) {
+  const parts = setId.split(/[^a-z0-9]+/i).filter(Boolean);
+  const compact = parts.map((part) => part.slice(0, 3)).join("·").slice(0, 10);
+  return (compact || setId.slice(0, 10) || "badge").toUpperCase();
+}
+
+function chatBadgeAssetKey(setId: string, version: string) {
+  return `${setId}/${version}`;
+}
+
+function chatBadges(value: unknown, assets: Record<string, SiteChatBadgeAsset> = {}): ChatBadgeView[] {
+  const result: ChatBadgeView[] = [];
+  const push = (setIdValue: unknown, versionValue: unknown, uniqueValue?: unknown) => {
+    const setId = String(setIdValue || "").trim();
+    if (!setId) return;
+    const version = String(versionValue || "").trim();
+    const asset = assets[chatBadgeAssetKey(setId, version)];
+    const fallbackTitle = version ? `${setId} · ${version}` : setId;
+    const title = String(asset?.title || fallbackTitle);
+    const key = String(uniqueValue || `${setId}/${version}`);
+    result.push({
+      key,
+      label: compactBadgeLabel(setId),
+      title,
+      imageUrl: asset?.image_url_1x || undefined,
+      imageUrl2x: asset?.image_url_2x || undefined,
+      imageUrl4x: asset?.image_url_4x || undefined,
+    });
+  };
+
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      if (typeof item === "string") {
+        const [setId, ...versionParts] = item.split("/");
+        push(setId, versionParts.join("/"), `${item}:${index}`);
+        return;
+      }
+      const record = asChatRecord(item);
+      if (!record) return;
+      push(record.setID ?? record.setId ?? record.set_id ?? record.name, record.version ?? record.id, record.id ?? index);
+    });
+  } else {
+    const record = asChatRecord(value);
+    if (record) Object.entries(record).forEach(([setId, version]) => push(setId, version, setId));
+  }
+  return result;
+}
+
+function chatEmoteId(fragmentValue: unknown) {
+  const fragment = asChatRecord(fragmentValue);
+  if (!fragment) return null;
+  const emote = asChatRecord(fragment.emote);
+  const value = emote?.emoteID ?? emote?.emoteId ?? emote?.id ?? fragment.emote_id ?? fragment.emoteID;
+  if (value == null) return null;
+  const raw = String(value).trim();
+  const id = raw.split(";")[0];
+  return /^[a-z0-9_-]+$/i.test(id) ? id : null;
+}
+
+function chatFragmentText(fragmentValue: unknown) {
+  const fragment = asChatRecord(fragmentValue);
+  return fragment ? String(fragment.text || "") : "";
+}
+
+function twitchEmoteUrl(emoteId: string) {
+  return `https://static-cdn.jtvnw.net/emoticons/v2/${encodeURIComponent(emoteId)}/default/dark/1.0`;
+}
+
+function chatReplySummary(value: unknown) {
+  const reply = asChatRecord(value);
+  if (!reply) return null;
+  const author = String(
+    reply.parent_user_name ?? reply.parent_user_login ?? reply.thread_user_name ?? reply.thread_user_login ?? ""
+  ).trim();
+  const body = String(reply.parent_message_body ?? reply.parent_message_text ?? reply.parent_message ?? "").trim();
+  if (!author && !body) return null;
+  return `${author ? `↪ ${author}` : "↪"}${body ? `${author ? ": " : " "}${body}` : ""}`;
+}
+
+function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
+  const fragments = Array.isArray(message.fragments) ? message.fragments : [];
+  if (!fragments.length) return <>{message.message_text}</>;
+  return <>
+    {fragments.map((fragment, index) => {
+      const text = chatFragmentText(fragment);
+      const emoteId = chatEmoteId(fragment);
+      if (emoteId) {
+        return <img
+          className="site-chat-emote"
+          src={twitchEmoteUrl(emoteId)}
+          alt={text}
+          title={text}
+          loading="lazy"
+          key={`${emoteId}:${index}`}
+        />;
+      }
+      return <React.Fragment key={index}>{text}</React.Fragment>;
+    })}
+  </>;
+}
+
+function SiteReplayChat({
+  eventId,
+  hasChat,
+  messageCount,
+  videoRef,
+}: {
+  eventId: string;
+  hasChat: boolean;
+  messageCount: number;
+  videoRef: { current: HTMLVideoElement | null };
+}) {
+  const [messages, setMessages] = useState<SiteChatMessage[]>([]);
+  const [badgeAssets, setBadgeAssets] = useState<Record<string, SiteChatBadgeAsset>>({});
+  const [currentMs, setCurrentMs] = useState(0);
+  const [chatStatus, setChatStatus] = useState(hasChat ? "Загрузка…" : "Чат не записан");
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const loadedRangeRef = useRef<{ from: number; to: number } | null>(null);
+
+  useEffect(() => {
+    setBadgeAssets({});
+    if (!hasChat) return;
+    let stopped = false;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/badges`), {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) return;
+        const payload = await response.json();
+        if (stopped) return;
+        const next: Record<string, SiteChatBadgeAsset> = {};
+        ((payload.badges || []) as SiteChatBadgeAsset[]).forEach((badge) => {
+          const setId = String(badge.set_id || "").trim();
+          const version = String(badge.version || "").trim();
+          if (setId && version) next[chatBadgeAssetKey(setId, version)] = badge;
+        });
+        setBadgeAssets(next);
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) {
+          console.warn("Twitch badge manifest unavailable", e);
+        }
+      }
+    })();
+    return () => {
+      stopped = true;
+      controller.abort();
+    };
+  }, [eventId, hasChat]);
+
+  useEffect(() => {
+    setMessages([]);
+    loadedRangeRef.current = null;
+    if (!hasChat) {
+      setChatStatus("Чат не записан");
+      return;
+    }
+
+    let stopped = false;
+    let controller: AbortController | null = null;
+    let loading = false;
+
+    const syncClock = () => {
+      const video = videoRef.current;
+      setCurrentMs(Math.max(0, Math.round((video?.currentTime || 0) * 1000)));
+    };
+
+    const loadWindow = async (force = false) => {
+      if (loading || stopped) return;
+      const current = Math.max(0, Math.round((videoRef.current?.currentTime || 0) * 1000));
+      const loaded = loadedRangeRef.current;
+      if (!force && loaded && current >= loaded.from + 12_000 && current <= loaded.to - 12_000) return;
+
+      const from = Math.max(0, current - 60_000);
+      const to = current + 45_000;
+      loading = true;
+      controller?.abort();
+      controller = new AbortController();
+      setChatStatus("Синхронизация…");
+      try {
+        const loadedMessages: SiteChatMessage[] = [];
+        let cursor: { time_ms: number; id: number } | null = null;
+        do {
+          const params = new URLSearchParams({
+            from_ms: String(from),
+            to_ms: String(to),
+            page_size: "1000",
+          });
+          if (cursor) {
+            params.set("after_ms", String(cursor.time_ms));
+            params.set("after_id", String(cursor.id));
+          }
+          const res = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/messages?${params.toString()}`), {
+            cache: "no-store",
+            signal: controller.signal,
+          });
+          if (!res.ok) throw new Error(await res.text());
+          const data = await res.json();
+          loadedMessages.push(...((data.messages || []) as SiteChatMessage[]));
+          cursor = data.next_cursor || null;
+        } while (cursor && !stopped);
+
+        if (stopped) return;
+        loadedMessages.sort((a, b) => (a.timeline_offset_ms - b.timeline_offset_ms) || (a.id - b.id));
+        setMessages(loadedMessages);
+        loadedRangeRef.current = { from, to };
+        setChatStatus(`${messageCount.toLocaleString("ru-RU")} сообщений`);
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) {
+          setChatStatus(`Ошибка чата: ${String(e)}`);
+        }
+      } finally {
+        loading = false;
+      }
+    };
+
+    const attach = () => {
+      const video = videoRef.current;
+      if (!video) return () => {};
+      const onSeeked = () => { syncClock(); void loadWindow(true); };
+      const onLoaded = () => { syncClock(); void loadWindow(true); };
+      video.addEventListener("seeked", onSeeked);
+      video.addEventListener("loadedmetadata", onLoaded);
+      return () => {
+        video.removeEventListener("seeked", onSeeked);
+        video.removeEventListener("loadedmetadata", onLoaded);
+      };
+    };
+
+    syncClock();
+    void loadWindow(true);
+    const detach = attach();
+    const timer = window.setInterval(() => {
+      syncClock();
+      void loadWindow(false);
+    }, 500);
+
+    return () => {
+      stopped = true;
+      controller?.abort();
+      window.clearInterval(timer);
+      detach();
+    };
+  }, [eventId, hasChat, messageCount, videoRef]);
+
+  const visible = useMemo(
+    () => messages.filter((message) => message.timeline_offset_ms <= currentMs + 100).slice(-500),
+    [messages, currentMs]
+  );
+
+  useEffect(() => {
+    if (!listRef.current) return;
+    listRef.current.scrollTop = listRef.current.scrollHeight;
+  }, [visible.length]);
+
+  function seekTo(message: SiteChatMessage) {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = Math.max(0, message.timeline_offset_ms / 1000);
+    void video.play().catch(() => {});
+  }
+
+  return (
+    <aside className="site-replay-chat">
+      <div className="site-replay-chat-head">
+        <strong>Чат трансляции</strong>
+        <span>{chatStatus}</span>
+      </div>
+      <div className="site-replay-chat-list" ref={listRef}>
+        {visible.length === 0 ? (
+          <div className="site-replay-chat-empty">{hasChat ? "В этой точке таймлайна сообщений пока нет." : "Для этого события чат не записан."}</div>
+        ) : visible.map((message) => {
+          const badges = chatBadges(message.badges, badgeAssets);
+          const reply = chatReplySummary(message.reply);
+          const authorColor = safeChatColor(message.color);
+          const specialType = message.message_type && !["message", "action"].includes(message.message_type)
+            ? message.message_type
+            : null;
+          return (
+            <div className={`site-replay-chat-message${message.is_action ? " is-action" : ""}`} key={message.id}>
+              <button type="button" className="site-replay-chat-time" onClick={() => seekTo(message)}>{fmtMs(message.timeline_offset_ms)}</button>
+              <div className="site-replay-chat-body">
+                {reply ? <div className="site-chat-reply" title={reply}>{reply}</div> : null}
+                <div className="site-chat-line">
+                  {badges.map((badge) => badge.imageUrl ? (
+                    <img
+                      className="site-chat-badge-image"
+                      src={badge.imageUrl}
+                      srcSet={[
+                        badge.imageUrl2x ? `${badge.imageUrl2x} 2x` : null,
+                        badge.imageUrl4x ? `${badge.imageUrl4x} 4x` : null,
+                      ].filter(Boolean).join(", ") || undefined}
+                      alt={badge.title}
+                      title={badge.title}
+                      loading="lazy"
+                      key={badge.key}
+                    />
+                  ) : (
+                    <span className="site-chat-badge" title={badge.title} key={badge.key}>{badge.label}</span>
+                  ))}
+                  {message.channel_points_reward_id ? (
+                    <span className="site-chat-reward" title={`Channel points reward · ${message.channel_points_reward_id}`}>★</span>
+                  ) : null}
+                  <b style={{ color: authorColor }}>{message.chatter_name || message.chatter_login || "Гость"}</b>
+                  {message.bits ? <span className="site-chat-bits">{message.bits.toLocaleString("ru-RU")} bits</span> : null}
+                  {specialType ? <span className="site-chat-type">{specialType}</span> : null}
+                  <span className="site-chat-text" style={message.is_action && authorColor ? { color: authorColor } : undefined}>
+                    <ChatMessageFragments message={message} />
+                  </span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="site-replay-chat-foot">Синхронизация по timeline_offset_ms · клик по времени перематывает видео</div>
+    </aside>
+  );
 }
 
 function App() {
@@ -474,6 +929,17 @@ function App() {
   const [migrationSourceRoot, setMigrationSourceRoot] = useState("root1");
   const [migrationDestinationRoot, setMigrationDestinationRoot] = useState("root2");
   const [migrationAction, setMigrationAction] = useState(false);
+  const [siteEvents, setSiteEvents] = useState<SiteEvent[]>([]);
+  const [siteCategories, setSiteCategories] = useState<SiteCategory[]>([]);
+  const [siteCategory, setSiteCategory] = useState("all");
+  const [siteQuery, setSiteQuery] = useState("");
+  const [selectedSiteEvent, setSelectedSiteEvent] = useState<SiteEvent | null>(null);
+  const siteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [sitePublisherOpen, setSitePublisherOpen] = useState(false);
+  const [siteAvailableEvents, setSiteAvailableEvents] = useState<SiteAvailableEvent[]>([]);
+  const [sitePublishEventId, setSitePublishEventId] = useState("");
+  const [sitePublishCategories, setSitePublishCategories] = useState<string[]>([]);
+  const [siteAction, setSiteAction] = useState(false);
 
   useEffect(() => {
     try { window.localStorage.setItem(PART_TARGET_MIB_KEY, String(partTargetMib)); } catch { /* browser storage unavailable */ }
@@ -663,6 +1129,75 @@ function App() {
     }
   }
 
+  async function loadSiteFeed(category = siteCategory, query = siteQuery) {
+    try {
+      const params = new URLSearchParams();
+      if (category && category !== "all") params.set("category", category);
+      if (query.trim()) params.set("q", query.trim());
+      const res = await fetch(`${API}/api/v1/site/feed?${params.toString()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setSiteEvents(data.items || []);
+      setSiteCategories(data.categories || []);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function openSitePublisher() {
+    setSiteAction(true);
+    try {
+      const [eventsRes, categoriesRes] = await Promise.all([
+        fetch(`${API}/api/v1/site/admin/available-events`, { cache: "no-store" }),
+        fetch(`${API}/api/v1/site/categories`, { cache: "no-store" }),
+      ]);
+      if (!eventsRes.ok) throw new Error(await eventsRes.text());
+      if (!categoriesRes.ok) throw new Error(await categoriesRes.text());
+      const [eventsData, categoriesData] = await Promise.all([eventsRes.json(), categoriesRes.json()]);
+      const available = (eventsData.items || []) as SiteAvailableEvent[];
+      const categories = (categoriesData.items || []) as SiteCategory[];
+      setSiteAvailableEvents(available);
+      setSiteCategories(categories);
+      setSitePublishEventId(available[0]?.id || "");
+      setSitePublishCategories(categories[0]?.slug ? [categories[0].slug] : []);
+      setSitePublisherOpen(true);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSiteAction(false);
+    }
+  }
+
+  function toggleSitePublishCategory(slug: string) {
+    setSitePublishCategories((current) => {
+      if (current.includes(slug)) return current.filter((item) => item !== slug);
+      if (current.length >= 3) return current;
+      return [...current, slug];
+    });
+  }
+
+  async function publishSiteEvent() {
+    if (!sitePublishEventId || sitePublishCategories.length === 0) return;
+    setSiteAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/site/admin/events`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event_id: sitePublishEventId, categories: sitePublishCategories }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setSitePublisherOpen(false);
+      await loadSiteFeed(siteCategory, siteQuery);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSiteAction(false);
+    }
+  }
+
   async function loadTrash() {
     try {
       const res = await fetch(`${API}/api/v1/deleted/events?page_size=100`, { cache: "no-store" });
@@ -678,6 +1213,7 @@ function App() {
   async function loadCurrentView(targetView: ViewMode = view) {
     if (targetView === "events") await loadEvents();
     else if (targetView === "video-manager") await loadVideoSessions();
+    else if (targetView === "site") await loadSiteFeed();
     else if (targetView === "storage") await Promise.all([loadOutputSettings(), loadStorageMigrations()]);
     else await loadTrash();
   }
@@ -1222,6 +1758,45 @@ function App() {
     [messages, position]
   );
 
+  if (selectedSiteEvent) {
+    return (
+      <main className="site-page">
+        <button className="link" onClick={() => setSelectedSiteEvent(null)}>← Все видео</button>
+        <header className="site-detail-header">
+          <div>
+            <div className="site-brand">StreamVault</div>
+            <h1>{selectedSiteEvent.title}</h1>
+            <p className="muted">{selectedSiteEvent.channel_display_name || selectedSiteEvent.channel_login || "Twitch"} · {selectedSiteEvent.media_type.toUpperCase()}</p>
+          </div>
+          <div className="site-category-badges">
+            {selectedSiteEvent.categories.map((category) => <span key={category.slug}>{category.label}</span>)}
+          </div>
+        </header>
+        <section className="site-watch-layout">
+          <div className="site-watch-card">
+            {selectedSiteEvent.playable && selectedSiteEvent.playback_url ? (
+              <TelegramVideoPlayer playlistUrl={selectedSiteEvent.playback_url} externalRef={siteVideoRef} />
+            ) : (
+              <div className="site-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
+            )}
+            <div className="site-watch-meta">
+              <span>{selectedSiteEvent.source_started_at_utc ? new Date(selectedSiteEvent.source_started_at_utc).toLocaleString() : "Дата неизвестна"}</span>
+              <span>{selectedSiteEvent.linked_parts}/{selectedSiteEvent.ready_parts} parts в Telegram</span>
+              <span>{selectedSiteEvent.video_sessions.length} video session</span>
+              <span>{selectedSiteEvent.chat_message_count || 0} chat messages</span>
+            </div>
+          </div>
+          <SiteReplayChat
+            eventId={selectedSiteEvent.id}
+            hasChat={selectedSiteEvent.has_chat}
+            messageCount={selectedSiteEvent.chat_message_count || 0}
+            videoRef={siteVideoRef}
+          />
+        </section>
+      </main>
+    );
+  }
+
   if (selectedVideo) {
     const progress = videoProgressBySession[selectedVideo.id];
     const archiveReady = selectedVideo.storage_summary?.archive_ready?.segments || 0;
@@ -1341,9 +1916,8 @@ function App() {
             </div>
           )}
           {playbackStatus?.playable ? (
-            <div className="telegram-playback">
-              <div className="muted small">Telegram playback · segments {playbackStatus.first_segment_no}–{playbackStatus.last_segment_no} · {playbackStatus.linked_segment_count} linked</div>
-              <TelegramVideoPlayer playlistUrl={playbackStatus.playlist_url} />
+            <div className="muted small telegram-playback-status">
+              Telegram playback ready · segments {playbackStatus.first_segment_no}–{playbackStatus.last_segment_no} · {playbackStatus.linked_segment_count} linked
             </div>
           ) : playbackStatus?.playback_error ? (
             <div className="muted small">Playback: {playbackStatus.playback_error}</div>
@@ -1455,11 +2029,12 @@ function App() {
       <header>
         <div>
           <h1>StreamHub</h1>
-          <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "video-manager" ? "Video sessions · Segments · Parts · Build Queue" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
+          <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "video-manager" ? "Video sessions · Segments · Parts · Build Queue" : view === "site" ? "Публичный каталог · категории · опубликованные Events" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
         </div>
         <div className="actions">
           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
           <button className={view === "video-manager" ? "active-tab" : ""} onClick={() => setView("video-manager")}>Video Manager</button>
+          <button className={view === "site" ? "active-tab" : ""} onClick={() => setView("site")}>Сайт</button>
           <button className={view === "trash" ? "active-tab" : ""} onClick={() => setView("trash")}>Корзина</button>
           <button className={view === "storage" ? "active-tab" : ""} onClick={() => setView("storage")}>Хранилище</button>
           <button onClick={() => loadCurrentView(view)}>Обновить</button>
@@ -1548,6 +2123,119 @@ function App() {
             })}
           </section>
         </>
+       ) : view === "site" ? (
+        <section className="site-catalog-panel">
+          <div className="site-catalog-head">
+            <div>
+              <div className="site-brand">StreamVault</div>
+              <h2>Все видео</h2>
+              <p className="muted">На сайте видны только явно добавленные Events. Хранилище и публикация независимы.</p>
+            </div>
+            <button disabled={siteAction} onClick={openSitePublisher}>+ Добавить событие</button>
+          </div>
+
+          <div className="site-search-row">
+            <input
+              type="search"
+              value={siteQuery}
+              onChange={(e) => setSiteQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && loadSiteFeed(siteCategory, siteQuery)}
+              placeholder="Поиск записей, стримеров, шоу…"
+            />
+            <button onClick={() => loadSiteFeed(siteCategory, siteQuery)}>Найти</button>
+          </div>
+
+          <nav className="site-categories" aria-label="Категории видео">
+            <button
+              className={siteCategory === "all" ? "active" : ""}
+              onClick={() => { setSiteCategory("all"); loadSiteFeed("all", siteQuery); }}
+            >Все</button>
+            {siteCategories.map((category) => (
+              <button
+                key={category.slug}
+                className={siteCategory === category.slug ? "active" : ""}
+                onClick={() => { setSiteCategory(category.slug); loadSiteFeed(category.slug, siteQuery); }}
+              >{category.label}</button>
+            ))}
+          </nav>
+
+          {siteEvents.length === 0 ? (
+            <div className="site-empty">На сайте пока нет видео. Нажми «Добавить событие» и выбери Event из хранилища.</div>
+          ) : (
+            <div className="site-video-grid">
+              {siteEvents.map((event) => (
+                <article className="site-video-card" key={event.id}>
+                  <button className="site-video-card-main" onClick={() => setSelectedSiteEvent(event)}>
+                    <div className="site-video-cover">
+                      <span>{event.media_type.toUpperCase()}</span>
+                      <strong>{event.playable ? "▶" : "…"}</strong>
+                    </div>
+                    <div className="site-video-card-body">
+                      <h3>{event.title}</h3>
+                      <div className="muted small">{event.channel_display_name || event.channel_login || "Twitch"}</div>
+                      <div className="muted small">{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleString() : "Дата неизвестна"}</div>
+                      <div className="site-category-badges">
+                        {event.categories.map((category) => <span key={category.slug}>{category.label}</span>)}
+                      </div>
+                      <div className="site-storage-line">{event.linked_parts}/{event.ready_parts} Telegram parts · {event.video_sessions.length} video session</div>
+                    </div>
+                  </button>
+                </article>
+              ))}
+            </div>
+          )}
+
+          {sitePublisherOpen && (
+            <div className="site-modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setSitePublisherOpen(false); }}>
+              <div className="site-modal" role="dialog" aria-modal="true" aria-labelledby="sitePublisherTitle">
+                <div className="row">
+                  <div>
+                    <div className="section-label">SITE PUBLICATION</div>
+                    <h2 id="sitePublisherTitle">Добавить событие</h2>
+                  </div>
+                  <button onClick={() => setSitePublisherOpen(false)}>Закрыть</button>
+                </div>
+                {siteAvailableEvents.length === 0 ? (
+                  <div className="site-empty compact">Нет доступных Events: событие должно иметь ready part, связанный с Telegram, и ещё не быть опубликовано.</div>
+                ) : (
+                  <>
+                    <label className="storage-field site-modal-field">
+                      <span>Событие из хранилища</span>
+                      <select value={sitePublishEventId} onChange={(e) => setSitePublishEventId(e.target.value)}>
+                        {siteAvailableEvents.map((event) => (
+                          <option key={event.id} value={event.id}>
+                            {event.title} · {event.channel_display_name || event.channel_login || event.media_type} · TG {event.linked_parts}/{event.ready_parts}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="site-publish-categories">
+                      <span>Категории · до 3</span>
+                      <div>
+                        {siteCategories.map((category) => (
+                          <label key={category.slug} className={sitePublishCategories.includes(category.slug) ? "selected" : ""}>
+                            <input
+                              type="checkbox"
+                              checked={sitePublishCategories.includes(category.slug)}
+                              disabled={!sitePublishCategories.includes(category.slug) && sitePublishCategories.length >= 3}
+                              onChange={() => toggleSitePublishCategory(category.slug)}
+                            />
+                            {category.label}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="actions site-modal-actions">
+                      <button disabled={siteAction || !sitePublishEventId || sitePublishCategories.length === 0} onClick={publishSiteEvent}>
+                        {siteAction ? "Добавляю…" : "Добавить на сайт"}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
        ) : view === "video-manager" ? (
         <section className="storage-panel video-manager-index">
           <div className="section-label">VIDEO SESSIONS</div>

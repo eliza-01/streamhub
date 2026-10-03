@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from streamhub_common.logging import configure_logging
 from streamhub_common.settings import get_settings
 
-from .routers import auth, capture, events, playback, sessions, storage, telegram, video
+from .routers import auth, capture, events, playback, sessions, site, storage, telegram, video
 from .telegram.runtime import telegram_runtime
 
 settings = get_settings()
@@ -50,5 +50,6 @@ app.include_router(capture.router)
 app.include_router(video.router)
 app.include_router(telegram.router)
 app.include_router(playback.router)
+app.include_router(site.router)
 app.include_router(storage.router)
 app.include_router(auth.router)

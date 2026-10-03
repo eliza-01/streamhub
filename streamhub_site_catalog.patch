@@ -1,0 +1,1008 @@
+docker compose build webdiff --git a/apps/api/app/main.py b/apps/api/app/main.py
+index 692d7e7..8aa8c28 100644
+--- a/apps/api/app/main.py
++++ b/apps/api/app/main.py
+@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from streamhub_common.logging import configure_logging
+ from streamhub_common.settings import get_settings
+ 
+-from .routers import auth, capture, events, playback, sessions, storage, telegram, video
++from .routers import auth, capture, events, playback, sessions, site, storage, telegram, video
+ from .telegram.runtime import telegram_runtime
+ 
+ settings = get_settings()
+@@ -50,5 +50,6 @@ app.include_router(capture.router)
+ app.include_router(video.router)
+ app.include_router(telegram.router)
+ app.include_router(playback.router)
++app.include_router(site.router)
+ app.include_router(storage.router)
+ app.include_router(auth.router)
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+new file mode 100644
+index 0000000..6c27019
+--- /dev/null
++++ b/apps/api/app/routers/site.py
+@@ -0,0 +1,367 @@
++from __future__ import annotations
++
++import uuid
++from collections import defaultdict
++from datetime import UTC, datetime
++
++from fastapi import APIRouter, Depends, HTTPException, Query, status
++from pydantic import BaseModel, Field
++from sqlalchemy import delete, func, or_, select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from streamhub_common.db import get_db
++from streamhub_common.models import (
++    AuditLog,
++    ContentCategory,
++    EventCategory,
++    MediaEvent,
++    SiteEventPublication,
++    TelegramVideoPartBinding,
++    VideoPart,
++    VideoSession,
++)
++
++router = APIRouter(prefix="/api/v1/site", tags=["site"])
++
++MAX_EVENT_CATEGORIES = 3
++
++
++class SitePublishRequest(BaseModel):
++    event_id: uuid.UUID
++    categories: list[str] = Field(min_length=1, max_length=MAX_EVENT_CATEGORIES)
++
++
++class SiteCategoriesRequest(BaseModel):
++    categories: list[str] = Field(min_length=1, max_length=MAX_EVENT_CATEGORIES)
++
++
++def _event_title(event: MediaEvent) -> str:
++    return event.title or event.channel_display_name or event.channel_login or event.external_key
++
++
++def _base_event_payload(event: MediaEvent) -> dict:
++    return {
++        "id": str(event.id),
++        "platform": event.platform,
++        "media_type": event.media_type,
++        "external_key": event.external_key,
++        "channel_login": event.channel_login,
++        "channel_display_name": event.channel_display_name,
++        "title": _event_title(event),
++        "source_started_at_utc": event.source_started_at_utc,
++        "source_duration_ms": event.source_duration_ms,
++        "source_url": event.source_url,
++    }
++
++
++def _clean_category_slugs(values: list[str]) -> list[str]:
++    cleaned: list[str] = []
++    for value in values:
++        slug = str(value or "").strip().lower()
++        if slug and slug not in cleaned:
++            cleaned.append(slug)
++    if not cleaned:
++        raise HTTPException(400, "at least one category is required")
++    if len(cleaned) > MAX_EVENT_CATEGORIES:
++        raise HTTPException(400, f"no more than {MAX_EVENT_CATEGORIES} categories are allowed")
++    return cleaned
++
++
++async def _active_categories(db: AsyncSession) -> list[ContentCategory]:
++    return (
++        await db.execute(
++            select(ContentCategory)
++            .where(ContentCategory.is_active.is_(True))
++            .order_by(ContentCategory.sort_order, ContentCategory.id)
++        )
++    ).scalars().all()
++
++
++async def _category_rows(db: AsyncSession, slugs: list[str]) -> list[ContentCategory]:
++    rows = (
++        await db.execute(
++            select(ContentCategory).where(
++                ContentCategory.is_active.is_(True),
++                ContentCategory.slug.in_(slugs),
++            )
++        )
++    ).scalars().all()
++    by_slug = {row.slug: row for row in rows}
++    missing = [slug for slug in slugs if slug not in by_slug]
++    if missing:
++        raise HTTPException(400, f"unknown or inactive categories: {', '.join(missing)}")
++    return [by_slug[slug] for slug in slugs]
++
++
++async def _storage_event_ids(db: AsyncSession) -> set[uuid.UUID]:
++    rows = (
++        await db.execute(
++            select(VideoSession.event_id)
++            .join(VideoPart, VideoPart.video_session_id == VideoSession.id)
++            .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
++            .where(
++                VideoSession.deleted_at_utc.is_(None),
++                VideoPart.status == "ready",
++            )
++            .distinct()
++        )
++    ).scalars().all()
++    return set(rows)
++
++
++async def _event_categories(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[dict]]:
++    if not event_ids:
++        return {}
++    rows = (
++        await db.execute(
++            select(EventCategory.event_id, EventCategory.position, ContentCategory.slug, ContentCategory.label_ru)
++            .join(ContentCategory, ContentCategory.id == EventCategory.category_id)
++            .where(EventCategory.event_id.in_(event_ids), ContentCategory.is_active.is_(True))
++            .order_by(EventCategory.event_id, EventCategory.position)
++        )
++    ).all()
++    grouped: dict[uuid.UUID, list[dict]] = defaultdict(list)
++    for event_id, position, slug, label in rows:
++        grouped[event_id].append({"slug": slug, "label": label, "position": int(position)})
++    return grouped
++
++
++async def _video_summaries(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[dict]]:
++    if not event_ids:
++        return {}
++    rows = (
++        await db.execute(
++            select(
++                VideoSession,
++                func.count(VideoPart.id).label("ready_parts"),
++                func.count(TelegramVideoPartBinding.part_id).label("linked_parts"),
++            )
++            .join(VideoPart, VideoPart.video_session_id == VideoSession.id)
++            .outerjoin(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
++            .where(
++                VideoSession.event_id.in_(event_ids),
++                VideoSession.deleted_at_utc.is_(None),
++                VideoPart.status == "ready",
++            )
++            .group_by(VideoSession.id)
++            .order_by(VideoSession.event_id, VideoSession.created_at.desc())
++        )
++    ).all()
++    grouped: dict[uuid.UUID, list[dict]] = defaultdict(list)
++    for session, ready_parts, linked_parts in rows:
++        ready = int(ready_parts or 0)
++        linked = int(linked_parts or 0)
++        grouped[session.event_id].append(
++            {
++                "id": str(session.id),
++                "status": session.status,
++                "completeness_status": session.completeness_status,
++                "duration_recorded_ms": int(session.duration_recorded_ms or 0),
++                "ready_parts": ready,
++                "linked_parts": linked,
++                "playable": linked > 0,
++                "playback_url": f"/api/v1/playback/video-sessions/{session.id}/index.m3u8" if linked > 0 else None,
++                "created_at": session.created_at,
++            }
++        )
++    return grouped
++
++
++async def _site_payloads(
++    db: AsyncSession,
++    publication_rows: list[tuple[SiteEventPublication, MediaEvent]],
++) -> list[dict]:
++    event_ids = [event.id for _publication, event in publication_rows]
++    categories = await _event_categories(db, event_ids)
++    videos = await _video_summaries(db, event_ids)
++    payloads: list[dict] = []
++    for publication, event in publication_rows:
++        sessions = videos.get(event.id, [])
++        primary = next((item for item in sessions if item["playable"]), sessions[0] if sessions else None)
++        payloads.append(
++            {
++                **_base_event_payload(event),
++                "published_at_utc": publication.published_at_utc,
++                "categories": categories.get(event.id, []),
++                "video_sessions": sessions,
++                "ready_parts": sum(item["ready_parts"] for item in sessions),
++                "linked_parts": sum(item["linked_parts"] for item in sessions),
++                "primary_video_session_id": primary["id"] if primary else None,
++                "playback_url": primary["playback_url"] if primary else None,
++                "playable": bool(primary and primary["playable"]),
++            }
++        )
++    return payloads
++
++
++async def _published_event_row(db: AsyncSession, event_id: uuid.UUID) -> tuple[SiteEventPublication, MediaEvent] | None:
++    return (
++        await db.execute(
++            select(SiteEventPublication, MediaEvent)
++            .join(MediaEvent, MediaEvent.id == SiteEventPublication.event_id)
++            .where(SiteEventPublication.event_id == event_id)
++        )
++    ).first()
++
++
++async def _replace_categories(db: AsyncSession, event_id: uuid.UUID, slugs: list[str]) -> None:
++    slugs = _clean_category_slugs(slugs)
++    rows = await _category_rows(db, slugs)
++    await db.execute(delete(EventCategory).where(EventCategory.event_id == event_id))
++    for position, category in enumerate(rows, start=1):
++        db.add(EventCategory(event_id=event_id, category_id=category.id, position=position))
++
++
++@router.get("/categories")
++async def list_categories(db: AsyncSession = Depends(get_db)) -> dict:
++    rows = await _active_categories(db)
++    return {
++        "items": [
++            {"slug": row.slug, "label": row.label_ru, "sort_order": row.sort_order}
++            for row in rows
++        ]
++    }
++
++
++@router.get("/feed")
++async def site_feed(
++    category: str | None = Query(default=None, max_length=64),
++    q: str | None = Query(default=None, max_length=255),
++    limit: int = Query(default=60, ge=1, le=120),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    category_clean = (category or "").strip().lower() or None
++    if category_clean == "all":
++        category_clean = None
++    query_clean = (q or "").strip() or None
++
++    stmt = select(SiteEventPublication, MediaEvent).join(MediaEvent, MediaEvent.id == SiteEventPublication.event_id)
++    if category_clean:
++        stmt = stmt.where(
++            select(EventCategory.event_id)
++            .join(ContentCategory, ContentCategory.id == EventCategory.category_id)
++            .where(
++                EventCategory.event_id == MediaEvent.id,
++                ContentCategory.slug == category_clean,
++                ContentCategory.is_active.is_(True),
++            )
++            .exists()
++        )
++    if query_clean:
++        needle = f"%{query_clean}%"
++        stmt = stmt.where(
++            or_(
++                MediaEvent.title.like(needle),
++                MediaEvent.channel_display_name.like(needle),
++                MediaEvent.channel_login.like(needle),
++                MediaEvent.external_key.like(needle),
++            )
++        )
++    rows = (
++        await db.execute(
++            stmt.order_by(SiteEventPublication.published_at_utc.desc(), MediaEvent.created_at.desc()).limit(limit)
++        )
++    ).all()
++    categories = await _active_categories(db)
++    items = await _site_payloads(db, list(rows))
++    return {
++        "categories": [{"slug": row.slug, "label": row.label_ru} for row in categories],
++        "latest": items[0] if items else None,
++        "items": items,
++    }
++
++
++@router.get("/events/{event_id}")
++async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    row = await _published_event_row(db, event_id)
++    if row is None:
++        raise HTTPException(404, "site event not found")
++    return (await _site_payloads(db, [row]))[0]
++
++
++@router.get("/admin/available-events")
++async def site_available_events(db: AsyncSession = Depends(get_db)) -> dict:
++    storage_ids = await _storage_event_ids(db)
++    if not storage_ids:
++        return {"items": []}
++    published_ids = set((await db.execute(select(SiteEventPublication.event_id))).scalars().all())
++    available_ids = list(storage_ids - published_ids)
++    if not available_ids:
++        return {"items": []}
++    events = (
++        await db.execute(
++            select(MediaEvent)
++            .where(MediaEvent.id.in_(available_ids))
++            .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
++        )
++    ).scalars().all()
++    videos = await _video_summaries(db, [event.id for event in events])
++    items = []
++    for event in events:
++        sessions = videos.get(event.id, [])
++        items.append(
++            {
++                **_base_event_payload(event),
++                "video_sessions": len(sessions),
++                "ready_parts": sum(item["ready_parts"] for item in sessions),
++                "linked_parts": sum(item["linked_parts"] for item in sessions),
++            }
++        )
++    return {"items": items}
++
++
++@router.post("/admin/events", status_code=status.HTTP_201_CREATED)
++async def publish_site_event(payload: SitePublishRequest, db: AsyncSession = Depends(get_db)) -> dict:
++    event = await db.get(MediaEvent, payload.event_id)
++    if event is None:
++        raise HTTPException(404, "event not found")
++    if await db.get(SiteEventPublication, payload.event_id) is not None:
++        raise HTTPException(409, "event is already published on the site")
++    if payload.event_id not in await _storage_event_ids(db):
++        raise HTTPException(409, "event has no Telegram-linked ready video parts")
++
++    publication = SiteEventPublication(
++        event_id=event.id,
++        published_at_utc=datetime.now(UTC).replace(tzinfo=None),
++    )
++    db.add(publication)
++    await db.flush()
++    category_slugs = _clean_category_slugs(payload.categories)
++    await _replace_categories(db, event.id, category_slugs)
++    db.add(AuditLog(event_id=event.id, action="site_publish", payload_json={"categories": category_slugs}))
++    await db.commit()
++
++    row = await _published_event_row(db, event.id)
++    if row is None:
++        raise HTTPException(500, "published event disappeared")
++    return (await _site_payloads(db, [row]))[0]
++
++
++@router.put("/admin/events/{event_id}/categories")
++async def update_site_event_categories(
++    event_id: uuid.UUID,
++    payload: SiteCategoriesRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    if await db.get(SiteEventPublication, event_id) is None:
++        raise HTTPException(404, "site event not found")
++    category_slugs = _clean_category_slugs(payload.categories)
++    await _replace_categories(db, event_id, category_slugs)
++    db.add(AuditLog(event_id=event_id, action="site_categories_update", payload_json={"categories": category_slugs}))
++    await db.commit()
++    row = await _published_event_row(db, event_id)
++    if row is None:
++        raise HTTPException(404, "site event not found")
++    return (await _site_payloads(db, [row]))[0]
++
++
++@router.delete("/admin/events/{event_id}")
++async def unpublish_site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    publication = await db.get(SiteEventPublication, event_id)
++    if publication is None:
++        return {"ok": True, "already_unpublished": True}
++    await db.execute(delete(EventCategory).where(EventCategory.event_id == event_id))
++    await db.delete(publication)
++    db.add(AuditLog(event_id=event_id, action="site_unpublish", payload_json={}))
++    await db.commit()
++    return {"ok": True, "event_id": str(event_id)}
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 15d0948..1872a60 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -238,6 +238,58 @@ type VideoSegment = {
+   closed_at_utc: string;
+ };
+ 
++type SiteCategory = {
++  slug: string;
++  label: string;
++};
++
++type SiteVideoSession = {
++  id: string;
++  status: string;
++  completeness_status: string;
++  duration_recorded_ms: number;
++  ready_parts: number;
++  linked_parts: number;
++  playable: boolean;
++  playback_url?: string | null;
++  created_at: string;
++};
++
++type SiteEvent = {
++  id: string;
++  platform: string;
++  media_type: "live" | "vod";
++  external_key: string;
++  channel_login?: string | null;
++  channel_display_name?: string | null;
++  title: string;
++  source_started_at_utc?: string | null;
++  source_duration_ms?: number | null;
++  source_url?: string | null;
++  published_at_utc: string;
++  categories: Array<SiteCategory & { position?: number }>;
++  video_sessions: SiteVideoSession[];
++  ready_parts: number;
++  linked_parts: number;
++  primary_video_session_id?: string | null;
++  playback_url?: string | null;
++  playable: boolean;
++};
++
++type SiteAvailableEvent = {
++  id: string;
++  media_type: "live" | "vod";
++  external_key: string;
++  channel_login?: string | null;
++  channel_display_name?: string | null;
++  title: string;
++  source_started_at_utc?: string | null;
++  source_duration_ms?: number | null;
++  video_sessions: number;
++  ready_parts: number;
++  linked_parts: number;
++};
++
+ type MediaEvent = {
+   id: string;
+   platform: string;
+@@ -292,7 +344,7 @@ type VideoCaptureProgress = {
+   percent?: number | null;
+ };
+ 
+-type ViewMode = "events" | "video-manager" | "trash" | "storage";
++type ViewMode = "events" | "video-manager" | "site" | "trash" | "storage";
+ 
+ const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
+ const PROGRESS_POLL_MS = 5000;
+@@ -474,6 +526,16 @@ function App() {
+   const [migrationSourceRoot, setMigrationSourceRoot] = useState("root1");
+   const [migrationDestinationRoot, setMigrationDestinationRoot] = useState("root2");
+   const [migrationAction, setMigrationAction] = useState(false);
++  const [siteEvents, setSiteEvents] = useState<SiteEvent[]>([]);
++  const [siteCategories, setSiteCategories] = useState<SiteCategory[]>([]);
++  const [siteCategory, setSiteCategory] = useState("all");
++  const [siteQuery, setSiteQuery] = useState("");
++  const [selectedSiteEvent, setSelectedSiteEvent] = useState<SiteEvent | null>(null);
++  const [sitePublisherOpen, setSitePublisherOpen] = useState(false);
++  const [siteAvailableEvents, setSiteAvailableEvents] = useState<SiteAvailableEvent[]>([]);
++  const [sitePublishEventId, setSitePublishEventId] = useState("");
++  const [sitePublishCategories, setSitePublishCategories] = useState<string[]>([]);
++  const [siteAction, setSiteAction] = useState(false);
+ 
+   useEffect(() => {
+     try { window.localStorage.setItem(PART_TARGET_MIB_KEY, String(partTargetMib)); } catch { /* browser storage unavailable */ }
+@@ -663,6 +725,75 @@ function App() {
+     }
+   }
+ 
++  async function loadSiteFeed(category = siteCategory, query = siteQuery) {
++    try {
++      const params = new URLSearchParams();
++      if (category && category !== "all") params.set("category", category);
++      if (query.trim()) params.set("q", query.trim());
++      const res = await fetch(`${API}/api/v1/site/feed?${params.toString()}`, { cache: "no-store" });
++      if (!res.ok) throw new Error(await res.text());
++      const data = await res.json();
++      setSiteEvents(data.items || []);
++      setSiteCategories(data.categories || []);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    }
++  }
++
++  async function openSitePublisher() {
++    setSiteAction(true);
++    try {
++      const [eventsRes, categoriesRes] = await Promise.all([
++        fetch(`${API}/api/v1/site/admin/available-events`, { cache: "no-store" }),
++        fetch(`${API}/api/v1/site/categories`, { cache: "no-store" }),
++      ]);
++      if (!eventsRes.ok) throw new Error(await eventsRes.text());
++      if (!categoriesRes.ok) throw new Error(await categoriesRes.text());
++      const [eventsData, categoriesData] = await Promise.all([eventsRes.json(), categoriesRes.json()]);
++      const available = (eventsData.items || []) as SiteAvailableEvent[];
++      const categories = (categoriesData.items || []) as SiteCategory[];
++      setSiteAvailableEvents(available);
++      setSiteCategories(categories);
++      setSitePublishEventId(available[0]?.id || "");
++      setSitePublishCategories(categories[0]?.slug ? [categories[0].slug] : []);
++      setSitePublisherOpen(true);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setSiteAction(false);
++    }
++  }
++
++  function toggleSitePublishCategory(slug: string) {
++    setSitePublishCategories((current) => {
++      if (current.includes(slug)) return current.filter((item) => item !== slug);
++      if (current.length >= 3) return current;
++      return [...current, slug];
++    });
++  }
++
++  async function publishSiteEvent() {
++    if (!sitePublishEventId || sitePublishCategories.length === 0) return;
++    setSiteAction(true);
++    try {
++      const res = await fetch(`${API}/api/v1/site/admin/events`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ event_id: sitePublishEventId, categories: sitePublishCategories }),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      setSitePublisherOpen(false);
++      await loadSiteFeed(siteCategory, siteQuery);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setSiteAction(false);
++    }
++  }
++
+   async function loadTrash() {
+     try {
+       const res = await fetch(`${API}/api/v1/deleted/events?page_size=100`, { cache: "no-store" });
+@@ -678,6 +809,7 @@ function App() {
+   async function loadCurrentView(targetView: ViewMode = view) {
+     if (targetView === "events") await loadEvents();
+     else if (targetView === "video-manager") await loadVideoSessions();
++    else if (targetView === "site") await loadSiteFeed();
+     else if (targetView === "storage") await Promise.all([loadOutputSettings(), loadStorageMigrations()]);
+     else await loadTrash();
+   }
+@@ -1222,6 +1354,36 @@ function App() {
+     [messages, position]
+   );
+ 
++  if (selectedSiteEvent) {
++    return (
++      <main className="site-page">
++        <button className="link" onClick={() => setSelectedSiteEvent(null)}>← Все видео</button>
++        <header className="site-detail-header">
++          <div>
++            <div className="site-brand">StreamVault</div>
++            <h1>{selectedSiteEvent.title}</h1>
++            <p className="muted">{selectedSiteEvent.channel_display_name || selectedSiteEvent.channel_login || "Twitch"} · {selectedSiteEvent.media_type.toUpperCase()}</p>
++          </div>
++          <div className="site-category-badges">
++            {selectedSiteEvent.categories.map((category) => <span key={category.slug}>{category.label}</span>)}
++          </div>
++        </header>
++        <section className="site-watch-card">
++          {selectedSiteEvent.playable && selectedSiteEvent.playback_url ? (
++            <TelegramVideoPlayer playlistUrl={`${API}${selectedSiteEvent.playback_url}`} />
++          ) : (
++            <div className="site-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
++          )}
++          <div className="site-watch-meta">
++            <span>{selectedSiteEvent.source_started_at_utc ? new Date(selectedSiteEvent.source_started_at_utc).toLocaleString() : "Дата неизвестна"}</span>
++            <span>{selectedSiteEvent.linked_parts}/{selectedSiteEvent.ready_parts} parts в Telegram</span>
++            <span>{selectedSiteEvent.video_sessions.length} video session</span>
++          </div>
++        </section>
++      </main>
++    );
++  }
++
+   if (selectedVideo) {
+     const progress = videoProgressBySession[selectedVideo.id];
+     const archiveReady = selectedVideo.storage_summary?.archive_ready?.segments || 0;
+@@ -1455,11 +1617,12 @@ function App() {
+       <header>
+         <div>
+           <h1>StreamHub</h1>
+-          <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "video-manager" ? "Video sessions · Segments · Parts · Build Queue" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
++          <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "video-manager" ? "Video sessions · Segments · Parts · Build Queue" : view === "site" ? "Публичный каталог · категории · опубликованные Events" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
+         </div>
+         <div className="actions">
+           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
+           <button className={view === "video-manager" ? "active-tab" : ""} onClick={() => setView("video-manager")}>Video Manager</button>
++          <button className={view === "site" ? "active-tab" : ""} onClick={() => setView("site")}>Сайт</button>
+           <button className={view === "trash" ? "active-tab" : ""} onClick={() => setView("trash")}>Корзина</button>
+           <button className={view === "storage" ? "active-tab" : ""} onClick={() => setView("storage")}>Хранилище</button>
+           <button onClick={() => loadCurrentView(view)}>Обновить</button>
+@@ -1548,6 +1711,119 @@ function App() {
+             })}
+           </section>
+         </>
++       ) : view === "site" ? (
++        <section className="site-catalog-panel">
++          <div className="site-catalog-head">
++            <div>
++              <div className="site-brand">StreamVault</div>
++              <h2>Все видео</h2>
++              <p className="muted">На сайте видны только явно добавленные Events. Хранилище и публикация независимы.</p>
++            </div>
++            <button disabled={siteAction} onClick={openSitePublisher}>+ Добавить событие</button>
++          </div>
++
++          <div className="site-search-row">
++            <input
++              type="search"
++              value={siteQuery}
++              onChange={(e) => setSiteQuery(e.target.value)}
++              onKeyDown={(e) => e.key === "Enter" && loadSiteFeed(siteCategory, siteQuery)}
++              placeholder="Поиск записей, стримеров, шоу…"
++            />
++            <button onClick={() => loadSiteFeed(siteCategory, siteQuery)}>Найти</button>
++          </div>
++
++          <nav className="site-categories" aria-label="Категории видео">
++            <button
++              className={siteCategory === "all" ? "active" : ""}
++              onClick={() => { setSiteCategory("all"); loadSiteFeed("all", siteQuery); }}
++            >Все</button>
++            {siteCategories.map((category) => (
++              <button
++                key={category.slug}
++                className={siteCategory === category.slug ? "active" : ""}
++                onClick={() => { setSiteCategory(category.slug); loadSiteFeed(category.slug, siteQuery); }}
++              >{category.label}</button>
++            ))}
++          </nav>
++
++          {siteEvents.length === 0 ? (
++            <div className="site-empty">На сайте пока нет видео. Нажми «Добавить событие» и выбери Event из хранилища.</div>
++          ) : (
++            <div className="site-video-grid">
++              {siteEvents.map((event) => (
++                <article className="site-video-card" key={event.id}>
++                  <button className="site-video-card-main" onClick={() => setSelectedSiteEvent(event)}>
++                    <div className="site-video-cover">
++                      <span>{event.media_type.toUpperCase()}</span>
++                      <strong>{event.playable ? "▶" : "…"}</strong>
++                    </div>
++                    <div className="site-video-card-body">
++                      <h3>{event.title}</h3>
++                      <div className="muted small">{event.channel_display_name || event.channel_login || "Twitch"}</div>
++                      <div className="muted small">{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleString() : "Дата неизвестна"}</div>
++                      <div className="site-category-badges">
++                        {event.categories.map((category) => <span key={category.slug}>{category.label}</span>)}
++                      </div>
++                      <div className="site-storage-line">{event.linked_parts}/{event.ready_parts} Telegram parts · {event.video_sessions.length} video session</div>
++                    </div>
++                  </button>
++                </article>
++              ))}
++            </div>
++          )}
++
++          {sitePublisherOpen && (
++            <div className="site-modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setSitePublisherOpen(false); }}>
++              <div className="site-modal" role="dialog" aria-modal="true" aria-labelledby="sitePublisherTitle">
++                <div className="row">
++                  <div>
++                    <div className="section-label">SITE PUBLICATION</div>
++                    <h2 id="sitePublisherTitle">Добавить событие</h2>
++                  </div>
++                  <button onClick={() => setSitePublisherOpen(false)}>Закрыть</button>
++                </div>
++                {siteAvailableEvents.length === 0 ? (
++                  <div className="site-empty compact">Нет доступных Events: событие должно иметь ready part, связанный с Telegram, и ещё не быть опубликовано.</div>
++                ) : (
++                  <>
++                    <label className="storage-field site-modal-field">
++                      <span>Событие из хранилища</span>
++                      <select value={sitePublishEventId} onChange={(e) => setSitePublishEventId(e.target.value)}>
++                        {siteAvailableEvents.map((event) => (
++                          <option key={event.id} value={event.id}>
++                            {event.title} · {event.channel_display_name || event.channel_login || event.media_type} · TG {event.linked_parts}/{event.ready_parts}
++                          </option>
++                        ))}
++                      </select>
++                    </label>
++                    <div className="site-publish-categories">
++                      <span>Категории · до 3</span>
++                      <div>
++                        {siteCategories.map((category) => (
++                          <label key={category.slug} className={sitePublishCategories.includes(category.slug) ? "selected" : ""}>
++                            <input
++                              type="checkbox"
++                              checked={sitePublishCategories.includes(category.slug)}
++                              disabled={!sitePublishCategories.includes(category.slug) && sitePublishCategories.length >= 3}
++                              onChange={() => toggleSitePublishCategory(category.slug)}
++                            />
++                            {category.label}
++                          </label>
++                        ))}
++                      </div>
++                    </div>
++                    <div className="actions site-modal-actions">
++                      <button disabled={siteAction || !sitePublishEventId || sitePublishCategories.length === 0} onClick={publishSiteEvent}>
++                        {siteAction ? "Добавляю…" : "Добавить на сайт"}
++                      </button>
++                    </div>
++                  </>
++                )}
++              </div>
++            </div>
++          )}
++        </section>
+        ) : view === "video-manager" ? (
+         <section className="storage-panel video-manager-index">
+           <div className="section-label">VIDEO SESSIONS</div>
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 56c0b65..ded1ce1 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -183,3 +183,55 @@ td { font-variant-numeric: tabular-nums; }
+ .telegram-part-status-conflict, .telegram-part-status-size_mismatch, .telegram-part-status-linked_other_channel { color: #b45309; }
+ .telegram-part-status-missing { color: #6b7280; }
+ @media (max-width: 760px) { .telegram-storage-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
++
++/* Public site catalog (temporary publish controls live here until admin UI is split out). */
++.site-catalog-panel { margin-top: 22px; padding: 22px; background: #0b0f13; color: #eef2f6; border: 1px solid #1f2933; border-radius: 16px; }
++.site-catalog-panel .muted, .site-page .muted { color: #9aa6b2; }
++.site-catalog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
++.site-catalog-head h2 { margin: 3px 0 5px; font-size: 28px; }
++.site-brand { color: #ff8a32; font-size: 12px; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
++.site-search-row { display: flex; gap: 10px; margin-top: 20px; }
++.site-search-row input { flex: 1; min-width: 0; border: 1px solid #29323c; background: #11171d; color: #eef2f6; border-radius: 10px; padding: 11px 13px; }
++.site-categories { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 20px; }
++.site-categories button { border-color: #29323c; background: #11171d; color: #c9d2dc; }
++.site-categories button.active { background: #ff8a32; color: #1b1007; border-color: #ff8a32; font-weight: 800; }
++.site-empty { padding: 34px 20px; border: 1px dashed #33404d; border-radius: 12px; text-align: center; color: #9aa6b2; background: #0e1419; }
++.site-empty.compact { margin-top: 16px; padding: 20px; }
++.site-video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
++.site-video-card { overflow: hidden; border: 1px solid #202a33; border-radius: 14px; background: #10161c; }
++.site-video-card-main { display: block; width: 100%; padding: 0; border: 0; border-radius: 0; background: transparent; color: inherit; text-align: left; }
++.site-video-card-main:hover { background: #131b22; }
++.site-video-cover { min-height: 145px; display: flex; align-items: flex-start; justify-content: space-between; padding: 14px; background: linear-gradient(145deg, #191f25, #080b0e); border-bottom: 1px solid #202a33; }
++.site-video-cover span { padding: 4px 7px; border-radius: 999px; background: rgba(255,138,50,.12); color: #ff9f59; font-size: 11px; font-weight: 800; }
++.site-video-cover strong { align-self: center; margin-right: calc(50% - 20px); color: #ff8a32; font-size: 34px; font-weight: 500; }
++.site-video-card-body { padding: 14px; }
++.site-video-card-body h3 { margin: 0 0 8px; font-size: 16px; line-height: 1.35; }
++.site-category-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
++.site-category-badges span { display: inline-flex; padding: 4px 7px; border-radius: 999px; border: 1px solid #33404d; color: #d7dee6; background: #151c23; font-size: 11px; }
++.site-storage-line { margin-top: 11px; color: #7f8c98; font-size: 11px; }
++.site-modal-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: rgba(0,0,0,.72); }
++.site-modal { width: min(720px, 100%); max-height: 90vh; overflow: auto; padding: 20px; border: 1px solid #34414e; border-radius: 16px; background: #11171d; color: #eef2f6; box-shadow: 0 24px 80px rgba(0,0,0,.45); }
++.site-modal h2 { margin: 4px 0 0; }
++.site-modal .storage-field span { color: #c9d2dc; }
++.site-modal .storage-field select { background: #0d1217; color: #eef2f6; border-color: #34414e; }
++.site-modal-field { max-width: none; }
++.site-publish-categories { margin-top: 18px; }
++.site-publish-categories > span { display: block; margin-bottom: 8px; color: #c9d2dc; font-size: 12px; font-weight: 700; }
++.site-publish-categories > div { display: flex; flex-wrap: wrap; gap: 8px; }
++.site-publish-categories label { display: inline-flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid #34414e; border-radius: 999px; color: #c9d2dc; cursor: pointer; }
++.site-publish-categories label.selected { border-color: #ff8a32; color: #ffac6d; background: rgba(255,138,50,.08); }
++.site-publish-categories input { margin: 0; }
++.site-modal-actions { justify-content: flex-start; margin-top: 20px; }
++.site-page { max-width: 1100px; }
++.site-detail-header { margin: 10px 0 18px; padding: 18px; border-radius: 14px; background: #0b0f13; color: #eef2f6; }
++.site-detail-header h1 { margin-top: 5px; }
++.site-watch-card { padding: 14px; border: 1px solid #202a33; border-radius: 14px; background: #0b0f13; color: #eef2f6; }
++.site-video-placeholder { display: grid; min-height: 320px; place-items: center; padding: 30px; border-radius: 10px; background: #11171d; color: #9aa6b2; text-align: center; }
++.site-watch-meta { display: flex; flex-wrap: wrap; gap: 10px 18px; margin-top: 12px; color: #9aa6b2; font-size: 12px; }
++
++@media (max-width: 760px) {
++  .site-catalog-head { flex-direction: column; }
++  .site-search-row { flex-direction: column; }
++  .site-video-grid { grid-template-columns: 1fr; }
++  .site-detail-header { align-items: stretch; }
++}
+diff --git a/migrations/versions/0010_site_catalog.py b/migrations/versions/0010_site_catalog.py
+new file mode 100644
+index 0000000..6a685af
+--- /dev/null
++++ b/migrations/versions/0010_site_catalog.py
+@@ -0,0 +1,87 @@
++"""public site catalog and explicit event publishing
++
++Revision ID: 0010_site_catalog
++Revises: 0009_telegram_storage
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0010_site_catalog"
++down_revision = "0009_telegram_storage"
++branch_labels = None
++depends_on = None
++
++_DEFAULT_CATEGORIES = (
++    ("films", "Фильмы", 10),
++    ("shows", "Шоу", 20),
++    ("games", "Игры", 30),
++    ("fncs", "FNCS", 40),
++    ("chatroulette", "Чатрулетка", 50),
++)
++
++
++def _table_exists(name: str) -> bool:
++    return name in sa.inspect(op.get_bind()).get_table_names()
++
++
++def upgrade() -> None:
++    if not _table_exists("content_categories"):
++        op.create_table(
++            "content_categories",
++            sa.Column("id", mysql.SMALLINT(unsigned=True), autoincrement=True, nullable=False),
++            sa.Column("slug", sa.String(length=64), nullable=False),
++            sa.Column("label_ru", sa.String(length=64), nullable=False),
++            sa.Column("sort_order", mysql.SMALLINT(unsigned=True), nullable=False, server_default="100"),
++            sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.text("1")),
++            sa.Column("created_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++            sa.Column("updated_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++            sa.PrimaryKeyConstraint("id"),
++            sa.UniqueConstraint("slug", name="uq_content_categories_slug"),
++        )
++        op.create_index("ix_content_categories_active_sort", "content_categories", ["is_active", "sort_order"])
++
++    bind = op.get_bind()
++    for slug, label, sort_order in _DEFAULT_CATEGORIES:
++        bind.execute(
++            sa.text(
++                "INSERT INTO content_categories (slug,label_ru,sort_order,is_active) "
++                "VALUES (:slug,:label,:sort_order,1) "
++                "ON DUPLICATE KEY UPDATE label_ru=VALUES(label_ru),sort_order=VALUES(sort_order),is_active=1"
++            ),
++            {"slug": slug, "label": label, "sort_order": sort_order},
++        )
++
++    if not _table_exists("site_event_publications"):
++        op.create_table(
++            "site_event_publications",
++            sa.Column("event_id", sa.BINARY(16), nullable=False),
++            sa.Column("published_at_utc", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++            sa.Column("created_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++            sa.Column("updated_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++            sa.ForeignKeyConstraint(["event_id"], ["media_events.id"], ondelete="CASCADE"),
++            sa.PrimaryKeyConstraint("event_id"),
++        )
++        op.create_index("ix_site_event_publications_published", "site_event_publications", ["published_at_utc"])
++
++    if not _table_exists("event_categories"):
++        op.create_table(
++            "event_categories",
++            sa.Column("event_id", sa.BINARY(16), nullable=False),
++            sa.Column("category_id", mysql.SMALLINT(unsigned=True), nullable=False),
++            sa.Column("position", mysql.TINYINT(unsigned=True), nullable=False, server_default="1"),
++            sa.Column("created_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++            sa.ForeignKeyConstraint(["event_id"], ["media_events.id"], ondelete="CASCADE"),
++            sa.ForeignKeyConstraint(["category_id"], ["content_categories.id"], ondelete="RESTRICT"),
++            sa.PrimaryKeyConstraint("event_id", "category_id"),
++            sa.UniqueConstraint("event_id", "position", name="uq_event_categories_position"),
++        )
++        op.create_index("ix_event_categories_category_event", "event_categories", ["category_id", "event_id"])
++
++
++def downgrade() -> None:
++    op.drop_table("event_categories")
++    op.drop_table("site_event_publications")
++    op.drop_table("content_categories")
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index bc17a3a..75241f1 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -50,6 +50,46 @@ class MediaEvent(Base):
+     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+ 
+ 
++class ContentCategory(Base):
++    __tablename__ = "content_categories"
++
++    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=True)
++    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
++    label_ru: Mapped[str] = mapped_column(String(64))
++    sort_order: Mapped[int] = mapped_column(SmallInteger, default=100, index=True)
++    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
++class SiteEventPublication(Base):
++    __tablename__ = "site_event_publications"
++
++    event_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), primary_key=True
++    )
++    published_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
++class EventCategory(Base):
++    __tablename__ = "event_categories"
++    __table_args__ = (
++        UniqueConstraint("event_id", "position", name="uq_event_categories_position"),
++        Index("ix_event_categories_category_event", "category_id", "event_id"),
++    )
++
++    event_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), primary_key=True
++    )
++    category_id: Mapped[int] = mapped_column(
++        SmallInteger, ForeignKey("content_categories.id", ondelete="RESTRICT"), primary_key=True
++    )
++    position: Mapped[int] = mapped_column(SmallInteger, default=1)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++
++
+ class Session(Base):
+     __tablename__ = "sessions"
+ 
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+new file mode 100644
+index 0000000..bf8ee0b
+--- /dev/null
++++ b/tests/test_site_catalog.py
+@@ -0,0 +1,61 @@
++from pathlib import Path
++
++
++def _read(path: str) -> str:
++    root = Path(__file__).resolve().parents[1]
++    return (root / path).read_text(encoding="utf-8")
++
++
++def test_site_catalog_migration_seeds_normalized_categories_and_explicit_publications():
++    migration = _read("migrations/versions/0010_site_catalog.py")
++    models = _read("packages/python_common/streamhub_common/models.py")
++
++    assert 'down_revision = "0009_telegram_storage"' in migration
++    assert '"films", "Фильмы"' in migration
++    assert '"shows", "Шоу"' in migration
++    assert '"games", "Игры"' in migration
++    assert '"fncs", "FNCS"' in migration
++    assert '"chatroulette", "Чатрулетка"' in migration
++    assert '"site_event_publications"' in migration
++    assert '"event_categories"' in migration
++    assert 'class ContentCategory(Base):' in models
++    assert 'class SiteEventPublication(Base):' in models
++    assert 'class EventCategory(Base):' in models
++
++
++def test_site_publish_api_is_event_centric_and_requires_telegram_backed_storage():
++    route = _read("apps/api/app/routers/site.py")
++    main = _read("apps/api/app/main.py")
++
++    assert 'router = APIRouter(prefix="/api/v1/site"' in route
++    assert '@router.get("/feed")' in route
++    assert '@router.get("/admin/available-events")' in route
++    assert '@router.post("/admin/events"' in route
++    assert '@router.put("/admin/events/{event_id}/categories")' in route
++    assert '@router.delete("/admin/events/{event_id}")' in route
++    assert 'TelegramVideoPartBinding' in route
++    assert 'VideoPart.status == "ready"' in route
++    assert 'event has no Telegram-linked ready video parts' in route
++    assert 'app.include_router(site.router)' in main
++
++
++def test_site_frontend_fetches_categories_and_events_instead_of_hardcoding_content():
++    web = _read("apps/web/src/main.tsx")
++
++    assert '>Сайт</button>' in web
++    assert '>+ Добавить событие</button>' in web
++    assert 'fetch(`${API}/api/v1/site/feed?' in web
++    assert 'fetch(`${API}/api/v1/site/admin/available-events`' in web
++    assert 'fetch(`${API}/api/v1/site/categories`' in web
++    assert 'siteCategories.map((category)' in web
++    assert 'siteAvailableEvents.map((event)' in web
++    assert 'FNCS' not in web
++    assert 'Чатрулетка' not in web
++
++
++def test_site_feed_reuses_telegram_hls_playback_without_new_media_pipeline():
++    route = _read("apps/api/app/routers/site.py")
++    web = _read("apps/web/src/main.tsx")
++
++    assert 'f"/api/v1/playback/video-sessions/{session.id}/index.m3u8"' in route
++    assert '<TelegramVideoPlayer playlistUrl={`${API}${selectedSiteEvent.playback_url}`} />' in web
