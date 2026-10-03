@@ -170,3 +170,16 @@ td { font-variant-numeric: tabular-nums; }
 .part-plan-all-row:last-child { border-bottom: 0; }
 .part-plan-all-row span { color: #6b7280; text-align: right; }
 @media (max-width: 760px) { .part-plan-all-row { flex-direction: column; gap: 4px; } .part-plan-all-row span { text-align: left; } }
+
+.telegram-storage-head { align-items: flex-start; gap: 16px; }
+.telegram-storage-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.telegram-storage-summary > div { display: flex; flex-direction: column; gap: 4px; padding: 10px; border: 1px solid #e2e5ea; border-radius: 9px; background: #fafbfc; min-width: 0; }
+.telegram-storage-summary span { color: #6b7280; font-size: 12px; }
+.telegram-storage-summary strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.telegram-playback { display: grid; gap: 8px; margin-top: 14px; }
+.telegram-player { width: 100%; max-height: 65vh; background: #111; border-radius: 10px; }
+.telegram-part-status { margin-top: 6px; font-size: 12px; color: #6b7280; }
+.telegram-part-status-linked { color: #166534; }
+.telegram-part-status-conflict, .telegram-part-status-size_mismatch, .telegram-part-status-linked_other_channel { color: #b45309; }
+.telegram-part-status-missing { color: #6b7280; }
+@media (max-width: 760px) { .telegram-storage-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

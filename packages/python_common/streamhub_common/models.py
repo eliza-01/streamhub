@@ -7,6 +7,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     JSON,
@@ -338,6 +339,64 @@ class VideoPartSegment(Base):
     segment_no: Mapped[int] = mapped_column(Integer)
     expected_bytes: Mapped[int] = mapped_column(BigInteger)
     source_sha256: Mapped[str | None] = mapped_column(String(64))
+    part_offset_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class TelegramChannelState(Base):
+    __tablename__ = "telegram_channel_state"
+
+    channel_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_title: Mapped[str | None] = mapped_column(String(255))
+    account_id: Mapped[int | None] = mapped_column(BigInteger)
+    account_display: Mapped[str | None] = mapped_column(String(255))
+    last_scanned_message_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"), default=0
+    )
+    last_scan_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TelegramChannelFile(Base):
+    __tablename__ = "telegram_channel_files"
+    __table_args__ = (
+        Index("ix_telegram_files_name_size", "channel_id", "file_name", "bytes"),
+        Index("ix_telegram_files_document", "document_id"),
+    )
+
+    channel_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    message_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"), primary_key=True
+    )
+    file_name: Mapped[str] = mapped_column(String(255))
+    bytes: Mapped[int] = mapped_column(BigInteger)
+    mime_type: Mapped[str | None] = mapped_column(String(255))
+    document_id: Mapped[int] = mapped_column(BigInteger)
+    message_date_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    discovered_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TelegramVideoPartBinding(Base):
+    __tablename__ = "telegram_video_part_bindings"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "message_id", name="uq_telegram_binding_message"),
+        ForeignKeyConstraint(
+            ["channel_id", "message_id"],
+            ["telegram_channel_files.channel_id", "telegram_channel_files.message_id"],
+            ondelete="RESTRICT",
+            name="fk_telegram_binding_file",
+        ),
+    )
+
+    part_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("video_parts.id", ondelete="CASCADE"), primary_key=True
+    )
+    channel_id: Mapped[int] = mapped_column(BigInteger)
+    message_id: Mapped[int] = mapped_column(BigInteger().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"))
+    matched_by: Mapped[str] = mapped_column(String(64), default="exact_filename_size")
+    linked_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
 
 
 class VideoPartBuildJob(Base):

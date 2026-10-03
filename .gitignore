@@ -14,3 +14,5 @@ coverage/
 .idea/
 
 # Video output is an absolute host bind mount configured in .env, not a project-local directory.
+telegram_state/
+.venv-telegram/

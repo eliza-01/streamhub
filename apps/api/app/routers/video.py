@@ -811,6 +811,7 @@ async def _reserve_video_part(
     )
     db.add(part)
     await db.flush()
+    part_offset_bytes = 0
     for segment in segments:
         db.add(
             VideoPartSegment(
@@ -818,8 +819,10 @@ async def _reserve_video_part(
                 segment_id=segment.id,
                 segment_no=segment.segment_no,
                 expected_bytes=segment.bytes,
+                part_offset_bytes=part_offset_bytes,
             )
         )
+        part_offset_bytes += int(segment.bytes)
     job = VideoPartBuildJob(
         part_id=part.id,
         status=queued_status,

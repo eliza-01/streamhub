@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from streamhub_common.logging import configure_logging
 from streamhub_common.settings import get_settings
 
-from .routers import auth, capture, events, sessions, storage, video
+from .routers import auth, capture, events, playback, sessions, storage, telegram, video
+from .telegram.runtime import telegram_runtime
 
 settings = get_settings()
 configure_logging(settings.log_level)
 
-app = FastAPI(title="StreamHub API", version="0.1.0", debug=settings.app_debug)
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await telegram_runtime.start()
+    try:
+        yield
+    finally:
+        await telegram_runtime.stop()
+
+
+app = FastAPI(title="StreamHub API", version="0.1.0", debug=settings.app_debug, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.web_origin],
@@ -36,5 +48,7 @@ app.include_router(sessions.router)
 app.include_router(events.router)
 app.include_router(capture.router)
 app.include_router(video.router)
+app.include_router(telegram.router)
+app.include_router(playback.router)
 app.include_router(storage.router)
 app.include_router(auth.router)

@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import Hls from "hls.js";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -97,6 +98,55 @@ type VideoPart = {
   created_at: string;
   completed_at_utc?: string | null;
   job?: VideoPartJob | null;
+};
+
+type TelegramBinding = {
+  part_id: string;
+  session_id: string;
+  part_no: number;
+  file_name: string;
+  part_bytes: number;
+  status: "linked" | "missing" | "size_mismatch" | "conflict" | "match_pending" | "linked_other_channel" | string;
+  channel_id?: number | null;
+  message_id?: number | null;
+  matched_by?: string | null;
+  telegram_bytes?: number | null;
+};
+
+type TelegramStatus = {
+  ok: boolean;
+  configured: boolean;
+  session_name?: string;
+  session_present?: boolean;
+  config_error?: string | null;
+  channel?: {
+    channel_id: number;
+    channel_title?: string | null;
+    account_display?: string | null;
+    last_scanned_message_id: number;
+    last_scan_at_utc?: string | null;
+    catalog_files: number;
+    bound_parts: number;
+    ready_parts: number;
+    last_error?: string | null;
+  };
+  runtime: {
+    state: string;
+    last_error?: string | null;
+    last_sync_at_utc?: string | null;
+    last_scanned_messages?: number;
+    last_discovered_files?: number;
+  };
+};
+
+type PlaybackStatus = {
+  video_session_id: string;
+  playable: boolean;
+  playback_error?: string | null;
+  linked_segment_count: number;
+  first_segment_no?: number | null;
+  last_segment_no?: number | null;
+  playlist_url: string;
 };
 
 type PartPlan = {
@@ -363,6 +413,27 @@ function VideoProgressBar({ session, progress }: { session: VideoSession; progre
   );
 }
 
+function TelegramVideoPlayer({ playlistUrl }: { playlistUrl: string }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const source = `${API}${playlistUrl}`;
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = source;
+      return () => { video.removeAttribute("src"); video.load(); };
+    }
+    if (!Hls.isSupported()) return;
+    const hls = new Hls();
+    hls.loadSource(source);
+    hls.attachMedia(video);
+    return () => hls.destroy();
+  }, [playlistUrl]);
+
+  return <video ref={videoRef} className="telegram-player" controls preload="metadata" />;
+}
+
 function App() {
   const [events, setEvents] = useState<MediaEvent[]>([]);
   const [trashEvents, setTrashEvents] = useState<MediaEvent[]>([]);
@@ -382,6 +453,10 @@ function App() {
   const [partPlan, setPartPlan] = useState<PartPlan | null>(null);
   const [partPlanAll, setPartPlanAll] = useState<PartPlanAll | null>(null);
   const [partAction, setPartAction] = useState(false);
+  const [telegramBindings, setTelegramBindings] = useState<Record<string, TelegramBinding>>({});
+  const [telegramStatus, setTelegramStatus] = useState<TelegramStatus | null>(null);
+  const [telegramSyncing, setTelegramSyncing] = useState(false);
+  const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [progressBySession, setProgressBySession] = useState<Record<string, CaptureProgress>>({});
   const [videoProgressBySession, setVideoProgressBySession] = useState<Record<string, VideoCaptureProgress>>({});
@@ -439,6 +514,54 @@ function App() {
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     setVideoParts(data.items || []);
+  }
+
+  async function loadTelegramStatus() {
+    const res = await fetch(`${API}/api/v1/telegram/status`, { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    setTelegramStatus(await res.json() as TelegramStatus);
+  }
+
+  async function loadTelegramBindings(sessionId: string) {
+    const res = await fetch(`${API}/api/v1/telegram/bindings?session_id=${encodeURIComponent(sessionId)}`, { cache: "no-store" });
+    if (!res.ok) {
+      setTelegramBindings({});
+      return;
+    }
+    const data = await res.json() as { bindings?: TelegramBinding[] };
+    setTelegramBindings(Object.fromEntries((data.bindings || []).map((item) => [item.part_id, item])));
+  }
+
+  async function loadPlaybackStatus(sessionId: string) {
+    const res = await fetch(`${API}/api/v1/playback/video-sessions/${sessionId}`, { cache: "no-store" });
+    if (!res.ok) {
+      setPlaybackStatus(null);
+      return;
+    }
+    setPlaybackStatus(await res.json() as PlaybackStatus);
+  }
+
+  async function refreshTelegramForSession(sessionId: string) {
+    await Promise.allSettled([
+      loadTelegramStatus(),
+      loadTelegramBindings(sessionId),
+      loadPlaybackStatus(sessionId),
+    ]);
+  }
+
+  async function syncTelegram() {
+    if (!selectedVideo) return;
+    setTelegramSyncing(true);
+    try {
+      const res = await fetch(`${API}/api/v1/telegram/sync`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      await refreshTelegramForSession(selectedVideo.id);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setTelegramSyncing(false);
+    }
   }
 
   async function loadOutputSettings() {
@@ -605,6 +728,7 @@ function App() {
       const next = loadedSegments.find((segment) => segment.storage_state === "archive_ready" && segment.integrity_state === "hashed" && !reserved.has(segment.segment_no))?.segment_no || loadedSegments[0]?.segment_no || 1;
       setPartFromSegment(next);
       setPartToSegment(next);
+      await refreshTelegramForSession(session.id);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -949,6 +1073,15 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedVideo?.id, activePartBuild]);
 
+  useEffect(() => {
+    if (!selectedVideo) return;
+    const timer = window.setInterval(() => {
+      refreshTelegramForSession(selectedVideo.id).catch((e) => console.warn("telegram status poll failed", e));
+    }, 5000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedVideo?.id]);
+
   const monitoredChatIds = useMemo(
     () => view === "events"
       ? events.flatMap((event) => event.chat_sessions).filter(isCaptureBusy).map((session) => session.id)
@@ -1189,12 +1322,40 @@ function App() {
             </div>
           )}
         </section>
+        <section className="video-block telegram-storage-block">
+          <div className="row telegram-storage-head">
+            <div>
+              <div className="section-label">TELEGRAM STORAGE</div>
+              <div className="muted small">Read-only user session · parts are uploaded manually as Telegram documents.</div>
+            </div>
+            <button disabled={telegramSyncing || !telegramStatus?.configured} onClick={syncTelegram}>{telegramSyncing ? "Syncing…" : "Telegram sync"}</button>
+          </div>
+          {!telegramStatus?.configured ? (
+            <div className="inline-error small">Telegram не настроен: {telegramStatus?.config_error || "заполните .env и выполните telegram-auth.ps1"}</div>
+          ) : (
+            <div className="telegram-storage-summary">
+              <div><span>Runtime</span><strong>{telegramStatus.runtime.state}</strong></div>
+              <div><span>Session</span><strong>{telegramStatus.session_present ? telegramStatus.session_name : "missing"}</strong></div>
+              <div><span>Channel</span><strong>{telegramStatus.channel?.channel_title || telegramStatus.channel?.channel_id || "—"}</strong></div>
+              <div><span>Catalog / linked</span><strong>{telegramStatus.channel?.catalog_files || 0} / {telegramStatus.channel?.bound_parts || 0}</strong></div>
+            </div>
+          )}
+          {playbackStatus?.playable ? (
+            <div className="telegram-playback">
+              <div className="muted small">Telegram playback · segments {playbackStatus.first_segment_no}–{playbackStatus.last_segment_no} · {playbackStatus.linked_segment_count} linked</div>
+              <TelegramVideoPlayer playlistUrl={playbackStatus.playlist_url} />
+            </div>
+          ) : playbackStatus?.playback_error ? (
+            <div className="muted small">Playback: {playbackStatus.playback_error}</div>
+          ) : null}
+        </section>
         <section className="video-block">
           <div className="section-label">PARTS / BUILD QUEUE</div>
           {videoParts.length === 0 ? <div className="empty-child">Parts ещё не создавались</div> : (
             <div className="part-list">
               {videoParts.map((part) => {
                 const job = part.job;
+                const telegram = telegramBindings[part.id];
                 const progressTotal = job?.total_bytes || part.expected_bytes || 1;
                 const progressBytes = job?.progress_bytes || (part.status === "ready" ? (part.final_bytes || part.expected_bytes) : 0);
                 const progressPercent = Math.max(0, Math.min(100, Math.round((progressBytes / progressTotal) * 100)));
@@ -1210,6 +1371,13 @@ function App() {
                     )}
                     {part.sha256 && <div className="muted small hash-line">sha256 <code>{part.sha256}</code></div>}
                     <div className="muted small path-cell"><code>{part.relative_path}</code></div>
+                    {part.status === "ready" && (
+                      <div className={`telegram-part-status telegram-part-status-${telegram?.status || "missing"}`}>
+                        Telegram: <strong>{telegram?.status || "missing"}</strong>
+                        {telegram?.message_id != null && <> · message <code>{telegram.message_id}</code></>}
+                        {telegram?.matched_by && <> · {telegram.matched_by}</>}
+                      </div>
+                    )}
                     {(part.last_error || job?.last_error) && <div className="inline-error small">{part.last_error || job?.last_error}</div>}
                     <div className="actions part-row-actions">
                       {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}

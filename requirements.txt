@@ -11,3 +11,4 @@ cryptography>=44,<47
 PyJWT>=2.10,<3
 websockets>=14,<16
 python-multipart>=0.0.20,<1
+Telethon>=1.45,<2

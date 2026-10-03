@@ -133,6 +133,8 @@ services:
     restart: unless-stopped
     ports:
       - "${API_PUBLIC_PORT:-18741}:8000"
+    volumes:
+      - ./telegram_state:/telegram_state
     depends_on:
       migrate:
         condition: service_completed_successfully

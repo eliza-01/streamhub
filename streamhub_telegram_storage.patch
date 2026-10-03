@@ -1,0 +1,2542 @@
+diff --git a/.env.example b/.env.example
+index 8747bfa920b5b297ce57a73179b7ca3d886f515d..ff3f839d3b78e2d5330200a0ef7dc19a307da1fb 100644
+--- a/.env.example
++++ b/.env.example
+@@ -181,3 +181,16 @@ PART_BUILD_CHUNK_BYTES=524288
+ PART_BUILD_TARGET_MIB_DEFAULT=1990
+ PART_BUILD_ALLOW_DURING_CAPTURE=false
+ PART_BUILD_LEASE_SECONDS=30
++
++# -----------------------------------------------------------------------------
++# Telegram read-only part storage (user MTProto session, NOT Bot API)
++# -----------------------------------------------------------------------------
++# Create api_id/api_hash at https://my.telegram.org and authorize the user session
++# locally with .\telegram-auth.ps1. StreamHub never uploads or sends messages.
++TELEGRAM_API_ID=
++TELEGRAM_API_HASH=
++TELEGRAM_CHANNEL_ID=
++SESSION_NAME=streamhub
++TELEGRAM_STATE_ROOT=/telegram_state
++TELEGRAM_SYNC_INTERVAL_SECONDS=20
++TELEGRAM_MAX_PARALLEL_DOWNLOADS=4
+diff --git a/.gitignore b/.gitignore
+index a1d30e27e06e4d33ea21b5b075aadf67d4dcd18f..6f6709f9a8ee73647e2a3db034e8d177e08d300c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,3 +14,5 @@ coverage/
+ .idea/
+ 
+ # Video output is an absolute host bind mount configured in .env, not a project-local directory.
++telegram_state/
++.venv-telegram/
+diff --git a/apps/api/app/main.py b/apps/api/app/main.py
+index 0190785cacc215500ad8c3da8edf808fb054f395..692d7e72fdc030bcac5b9f44fe8813f7f15c7271 100644
+--- a/apps/api/app/main.py
++++ b/apps/api/app/main.py
+@@ -1,17 +1,29 @@
+ from __future__ import annotations
+ 
++from contextlib import asynccontextmanager
++
+ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+ from streamhub_common.logging import configure_logging
+ from streamhub_common.settings import get_settings
+ 
+-from .routers import auth, capture, events, sessions, storage, video
++from .routers import auth, capture, events, playback, sessions, storage, telegram, video
++from .telegram.runtime import telegram_runtime
+ 
+ settings = get_settings()
+ configure_logging(settings.log_level)
+ 
+-app = FastAPI(title="StreamHub API", version="0.1.0", debug=settings.app_debug)
++@asynccontextmanager
++async def lifespan(_app: FastAPI):
++    await telegram_runtime.start()
++    try:
++        yield
++    finally:
++        await telegram_runtime.stop()
++
++
++app = FastAPI(title="StreamHub API", version="0.1.0", debug=settings.app_debug, lifespan=lifespan)
+ app.add_middleware(
+     CORSMiddleware,
+     allow_origins=[settings.web_origin],
+@@ -36,5 +48,7 @@ app.include_router(sessions.router)
+ app.include_router(events.router)
+ app.include_router(capture.router)
+ app.include_router(video.router)
++app.include_router(telegram.router)
++app.include_router(playback.router)
+ app.include_router(storage.router)
+ app.include_router(auth.router)
+diff --git a/apps/api/app/routers/playback.py b/apps/api/app/routers/playback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..82d8b8f866634ea322cf07c9022c7b0fe322c083
+--- /dev/null
++++ b/apps/api/app/routers/playback.py
+@@ -0,0 +1,85 @@
++from __future__ import annotations
++
++import uuid
++
++from fastapi import APIRouter, Header, HTTPException
++from fastapi.responses import PlainTextResponse, StreamingResponse
++
++from ..telegram.playback import PlaybackNotFound, PlaybackUnavailable, TelegramPlaybackService
++from ..telegram.runtime import telegram_runtime
++from ..telegram.storage import TelegramAuthRequired, TelegramStorageError
++
++router = APIRouter(prefix="/api/v1/playback", tags=["playback"])
++service = TelegramPlaybackService(telegram_runtime)
++
++
++def _stream_response(plan) -> StreamingResponse:
++    headers = {
++        "Accept-Ranges": "bytes",
++        "Content-Length": str(plan.content_length),
++        "Cache-Control": "private, max-age=31536000, immutable",
++    }
++    if plan.content_range:
++        headers["Content-Range"] = plan.content_range
++    return StreamingResponse(
++        plan.iterator,
++        status_code=plan.status_code,
++        media_type=plan.media_type,
++        headers=headers,
++    )
++
++
++@router.get("/video-sessions/{session_id}")
++async def playback_status(session_id: uuid.UUID) -> dict:
++    try:
++        return await service.session_status(session_id)
++    except PlaybackNotFound as exc:
++        raise HTTPException(status_code=404, detail=str(exc)) from exc
++
++
++@router.get("/video-sessions/{session_id}/index.m3u8")
++async def playlist(session_id: uuid.UUID):
++    try:
++        return PlainTextResponse(
++            await service.playlist(session_id),
++            media_type="application/vnd.apple.mpegurl",
++            headers={"Cache-Control": "no-store"},
++        )
++    except PlaybackNotFound as exc:
++        raise HTTPException(status_code=404, detail=str(exc)) from exc
++    except PlaybackUnavailable as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++
++
++@router.get("/segments/{part_id}/{segment_no}.ts")
++async def segment(
++    part_id: uuid.UUID,
++    segment_no: int,
++    session_id: str | None = None,
++    range_header: str | None = Header(default=None, alias="Range"),
++):
++    _ = session_id
++    try:
++        return _stream_response(await service.segment_stream(part_id, segment_no, range_header))
++    except PlaybackNotFound as exc:
++        raise HTTPException(status_code=404, detail=str(exc)) from exc
++    except PlaybackUnavailable as exc:
++        raise HTTPException(status_code=416 if "range" in str(exc).lower() else 409, detail=str(exc)) from exc
++    except TelegramAuthRequired as exc:
++        raise HTTPException(status_code=401, detail=str(exc)) from exc
++    except TelegramStorageError as exc:
++        raise HTTPException(status_code=502, detail=str(exc)) from exc
++
++
++@router.get("/parts/{part_id}.ts")
++async def raw_part(part_id: uuid.UUID, range_header: str | None = Header(default=None, alias="Range")):
++    try:
++        return _stream_response(await service.part_stream(part_id, range_header))
++    except PlaybackNotFound as exc:
++        raise HTTPException(status_code=404, detail=str(exc)) from exc
++    except PlaybackUnavailable as exc:
++        raise HTTPException(status_code=416 if "range" in str(exc).lower() else 409, detail=str(exc)) from exc
++    except TelegramAuthRequired as exc:
++        raise HTTPException(status_code=401, detail=str(exc)) from exc
++    except TelegramStorageError as exc:
++        raise HTTPException(status_code=502, detail=str(exc)) from exc
+diff --git a/apps/api/app/routers/telegram.py b/apps/api/app/routers/telegram.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6cab506d036c98dca4fc881272b8b1133876ee82
+--- /dev/null
++++ b/apps/api/app/routers/telegram.py
+@@ -0,0 +1,34 @@
++from __future__ import annotations
++
++from fastapi import APIRouter, HTTPException, Query
++
++from ..telegram.runtime import telegram_runtime
++from ..telegram.storage import TelegramAuthRequired, TelegramStorageError
++
++router = APIRouter(prefix="/api/v1/telegram", tags=["telegram"])
++
++
++@router.get("/status")
++async def telegram_status() -> dict:
++    return await telegram_runtime.status()
++
++
++@router.post("/sync")
++async def telegram_sync() -> dict:
++    try:
++        result = await telegram_runtime.sync_once(reconcile_missing=True)
++        return {"ok": True, **result}
++    except TelegramAuthRequired as exc:
++        raise HTTPException(status_code=401, detail=str(exc)) from exc
++    except TelegramStorageError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++    except Exception as exc:
++        raise HTTPException(status_code=502, detail=str(exc)) from exc
++
++
++@router.get("/bindings")
++async def telegram_bindings(session_id: str | None = Query(default=None)) -> dict:
++    try:
++        return {"ok": True, "bindings": await telegram_runtime.bindings(session_id=session_id)}
++    except TelegramStorageError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
+diff --git a/apps/api/app/routers/video.py b/apps/api/app/routers/video.py
+index ad9ceaa75fb47635596be5c5ce0a4692f08f106d..82a35e89f526ddb8bbc89d4a0ab60585a67a8cac 100644
+--- a/apps/api/app/routers/video.py
++++ b/apps/api/app/routers/video.py
+@@ -811,6 +811,7 @@ async def _reserve_video_part(
+     )
+     db.add(part)
+     await db.flush()
++    part_offset_bytes = 0
+     for segment in segments:
+         db.add(
+             VideoPartSegment(
+@@ -818,8 +819,10 @@ async def _reserve_video_part(
+                 segment_id=segment.id,
+                 segment_no=segment.segment_no,
+                 expected_bytes=segment.bytes,
++                part_offset_bytes=part_offset_bytes,
+             )
+         )
++        part_offset_bytes += int(segment.bytes)
+     job = VideoPartBuildJob(
+         part_id=part.id,
+         status=queued_status,
+diff --git a/apps/api/app/telegram/__init__.py b/apps/api/app/telegram/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/apps/api/app/telegram/playback.py b/apps/api/app/telegram/playback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84b0058034c77721d502e5a9d6cb27469c65be6d
+--- /dev/null
++++ b/apps/api/app/telegram/playback.py
+@@ -0,0 +1,290 @@
++from __future__ import annotations
++
++import math
++import uuid
++from dataclasses import dataclass
++from typing import Any, AsyncIterator
++
++from sqlalchemy import select
++
++from streamhub_common.db import SessionLocal
++from streamhub_common.models import (
++    TelegramVideoPartBinding,
++    VideoPart,
++    VideoPartSegment,
++    VideoSegment,
++    VideoSession,
++)
++
++from .runtime import TelegramRuntime
++
++
++class PlaybackNotFound(RuntimeError):
++    pass
++
++
++class PlaybackUnavailable(RuntimeError):
++    pass
++
++
++@dataclass(frozen=True)
++class ByteRange:
++    start: int
++    end: int
++    total: int
++
++    @property
++    def length(self) -> int:
++        return self.end - self.start + 1
++
++    @property
++    def content_range(self) -> str:
++        return f"bytes {self.start}-{self.end}/{self.total}"
++
++
++@dataclass(frozen=True)
++class StreamPlan:
++    status_code: int
++    media_type: str
++    content_length: int
++    content_range: str | None
++    iterator: AsyncIterator[bytes]
++
++
++def parse_single_range(value: str | None, total: int) -> ByteRange | None:
++    if value is None or not value.strip():
++        return None
++    if total <= 0:
++        raise PlaybackUnavailable("resource is empty")
++    text = value.strip()
++    if not text.lower().startswith("bytes="):
++        raise PlaybackUnavailable("only bytes ranges are supported")
++    spec = text[6:].strip()
++    if not spec or "," in spec or "-" not in spec:
++        raise PlaybackUnavailable("exactly one byte range is supported")
++    left, right = (part.strip() for part in spec.split("-", 1))
++    try:
++        if left:
++            start = int(left)
++            if start < 0 or start >= total:
++                raise PlaybackUnavailable("range start is outside the resource")
++            if right:
++                end = int(right)
++                if end < start:
++                    raise PlaybackUnavailable("range end precedes start")
++                end = min(end, total - 1)
++            else:
++                end = total - 1
++        else:
++            if not right:
++                raise PlaybackUnavailable("invalid suffix range")
++            suffix = int(right)
++            if suffix <= 0:
++                raise PlaybackUnavailable("suffix length must be positive")
++            suffix = min(suffix, total)
++            start = total - suffix
++            end = total - 1
++    except ValueError as exc:
++        raise PlaybackUnavailable("invalid byte range") from exc
++    return ByteRange(start=start, end=end, total=total)
++
++
++def _validate_contiguous(segments: list[dict[str, Any]]) -> None:
++    if not segments:
++        raise PlaybackUnavailable("video session has no Telegram-linked ready parts")
++    previous = int(segments[0]["segment_no"])
++    for row in segments[1:]:
++        current = int(row["segment_no"])
++        if current != previous + 1:
++            raise PlaybackUnavailable(
++                f"Telegram-linked parts have a gap: segment {previous} is followed by {current}"
++            )
++        previous = current
++
++
++def _playlist(session_id: uuid.UUID, segments: list[dict[str, Any]]) -> str:
++    _validate_contiguous(segments)
++    max_duration = max(float(row["duration_ms"]) / 1000.0 for row in segments)
++    lines = [
++        "#EXTM3U",
++        "#EXT-X-VERSION:3",
++        f"#EXT-X-TARGETDURATION:{max(1, math.ceil(max_duration))}",
++        f"#EXT-X-MEDIA-SEQUENCE:{int(segments[0]['segment_no'])}",
++        "#EXT-X-PLAYLIST-TYPE:VOD",
++    ]
++    previous_run: int | None = None
++    for row in segments:
++        run_no = int(row["run_no"])
++        if previous_run is not None and run_no != previous_run:
++            lines.append("#EXT-X-DISCONTINUITY")
++        lines.append(f"#EXTINF:{max(0.001, float(row['duration_ms']) / 1000.0):.3f},")
++        lines.append(
++            f"/api/v1/playback/segments/{row['part_id']}/{int(row['segment_no'])}.ts"
++            f"?session_id={session_id}"
++        )
++        previous_run = run_no
++    lines.append("#EXT-X-ENDLIST")
++    return "\n".join(lines) + "\n"
++
++
++class TelegramPlaybackService:
++    def __init__(self, runtime: TelegramRuntime) -> None:
++        self.runtime = runtime
++
++    async def linked_segments(self, session_id: uuid.UUID) -> list[dict[str, Any]]:
++        async with SessionLocal() as db:
++            rows = (
++                await db.execute(
++                    select(
++                        VideoPart.id.label("part_id"),
++                        VideoPart.part_no,
++                        VideoPart.run_no,
++                        VideoPart.file_name.label("part_file_name"),
++                        VideoPart.expected_bytes,
++                        VideoPart.final_bytes,
++                        TelegramVideoPartBinding.channel_id,
++                        TelegramVideoPartBinding.message_id,
++                        VideoPartSegment.segment_no,
++                        VideoPartSegment.expected_bytes.label("segment_bytes"),
++                        VideoPartSegment.part_offset_bytes,
++                        VideoSegment.duration_ms,
++                    )
++                    .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
++                    .join(VideoPartSegment, VideoPartSegment.part_id == VideoPart.id)
++                    .join(VideoSegment, VideoSegment.id == VideoPartSegment.segment_id)
++                    .where(VideoPart.video_session_id == session_id, VideoPart.status == "ready")
++                    .order_by(VideoPartSegment.segment_no, VideoPart.part_no)
++                )
++            ).mappings().all()
++            return [
++                {
++                    **dict(row),
++                    "part_id": str(row["part_id"]),
++                    "part_bytes": int(row["final_bytes"] or row["expected_bytes"] or 0),
++                }
++                for row in rows
++            ]
++
++    async def session_status(self, session_id: uuid.UUID) -> dict[str, Any]:
++        async with SessionLocal() as db:
++            session = await db.get(VideoSession, session_id)
++            if session is None or session.deleted_at_utc is not None:
++                raise PlaybackNotFound("video session not found")
++        segments = await self.linked_segments(session_id)
++        error = None
++        try:
++            _validate_contiguous(segments)
++        except PlaybackUnavailable as exc:
++            error = str(exc)
++        return {
++            "video_session_id": str(session_id),
++            "playable": error is None,
++            "playback_error": error,
++            "linked_segment_count": len(segments),
++            "first_segment_no": int(segments[0]["segment_no"]) if segments else None,
++            "last_segment_no": int(segments[-1]["segment_no"]) if segments else None,
++            "playlist_url": f"/api/v1/playback/video-sessions/{session_id}/index.m3u8",
++        }
++
++    async def playlist(self, session_id: uuid.UUID) -> str:
++        async with SessionLocal() as db:
++            session = await db.get(VideoSession, session_id)
++            if session is None or session.deleted_at_utc is not None:
++                raise PlaybackNotFound("video session not found")
++        return _playlist(session_id, await self.linked_segments(session_id))
++
++    def _reader_for_channel(self, channel_id: int):
++        reader = self.runtime.require_reader()
++        if int(reader.config.channel_id) != int(channel_id):
++            raise PlaybackUnavailable(
++                f"part is linked to Telegram channel {channel_id}, configured channel is {reader.config.channel_id}"
++            )
++        return reader
++
++    @staticmethod
++    def _range_or_full(range_header: str | None, total: int) -> tuple[ByteRange, int]:
++        requested = parse_single_range(range_header, total)
++        if requested is None:
++            requested = ByteRange(start=0, end=total - 1, total=total)
++            return requested, 200
++        return requested, 206
++
++    async def segment_stream(
++        self, part_id: uuid.UUID, segment_no: int, range_header: str | None
++    ) -> StreamPlan:
++        async with SessionLocal() as db:
++            row = (
++                await db.execute(
++                    select(
++                        VideoPart.file_name.label("part_file_name"),
++                        VideoPart.expected_bytes,
++                        VideoPart.final_bytes,
++                        TelegramVideoPartBinding.channel_id,
++                        TelegramVideoPartBinding.message_id,
++                        VideoPartSegment.expected_bytes.label("segment_bytes"),
++                        VideoPartSegment.part_offset_bytes,
++                    )
++                    .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
++                    .join(VideoPartSegment, VideoPartSegment.part_id == VideoPart.id)
++                    .where(
++                        VideoPart.id == part_id,
++                        VideoPart.status == "ready",
++                        VideoPartSegment.segment_no == segment_no,
++                    )
++                )
++            ).mappings().first()
++        if row is None:
++            raise PlaybackNotFound("playback segment not found or part is not Telegram-linked")
++        total = int(row["segment_bytes"])
++        requested, status = self._range_or_full(range_header, total)
++        part_bytes = int(row["final_bytes"] or row["expected_bytes"] or 0)
++        reader = self._reader_for_channel(int(row["channel_id"]))
++        iterator = reader.iter_document_range(
++            int(row["message_id"]),
++            expected_name=str(row["part_file_name"]),
++            expected_size=part_bytes,
++            offset=int(row["part_offset_bytes"]) + requested.start,
++            length=requested.length,
++        )
++        return StreamPlan(
++            status_code=status,
++            media_type="video/mp2t",
++            content_length=requested.length,
++            content_range=requested.content_range if status == 206 else None,
++            iterator=iterator,
++        )
++
++    async def part_stream(self, part_id: uuid.UUID, range_header: str | None) -> StreamPlan:
++        async with SessionLocal() as db:
++            row = (
++                await db.execute(
++                    select(
++                        VideoPart.file_name.label("part_file_name"),
++                        VideoPart.expected_bytes,
++                        VideoPart.final_bytes,
++                        TelegramVideoPartBinding.channel_id,
++                        TelegramVideoPartBinding.message_id,
++                    )
++                    .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
++                    .where(VideoPart.id == part_id, VideoPart.status == "ready")
++                )
++            ).mappings().first()
++        if row is None:
++            raise PlaybackNotFound("video part not found or is not Telegram-linked")
++        total = int(row["final_bytes"] or row["expected_bytes"] or 0)
++        requested, status = self._range_or_full(range_header, total)
++        reader = self._reader_for_channel(int(row["channel_id"]))
++        iterator = reader.iter_document_range(
++            int(row["message_id"]),
++            expected_name=str(row["part_file_name"]),
++            expected_size=total,
++            offset=requested.start,
++            length=requested.length,
++        )
++        return StreamPlan(
++            status_code=status,
++            media_type="video/mp2t",
++            content_length=requested.length,
++            content_range=requested.content_range if status == 206 else None,
++            iterator=iterator,
++        )
+diff --git a/apps/api/app/telegram/registry.py b/apps/api/app/telegram/registry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a687e56c85f17bdf42db5d473fafb895b0521a8a
+--- /dev/null
++++ b/apps/api/app/telegram/registry.py
+@@ -0,0 +1,344 @@
++from __future__ import annotations
++
++from collections import defaultdict
++from datetime import datetime
++from typing import Any
++
++from sqlalchemy import func, select
++from sqlalchemy.dialects.mysql import insert as mysql_insert
++
++from streamhub_common.db import SessionLocal
++from streamhub_common.models import (
++    TelegramChannelFile,
++    TelegramChannelState,
++    TelegramVideoPartBinding,
++    VideoPart,
++)
++from streamhub_common.telegram_names import canonical_part_identity
++
++from .storage import TelegramScanResult
++
++
++def _iso(value: datetime | None) -> str | None:
++    if value is None:
++        return None
++    return value.isoformat(timespec="milliseconds") + ("Z" if value.tzinfo is None else "")
++
++
++class TelegramRegistry:
++    async def last_message_id(self, channel_id: int) -> int:
++        async with SessionLocal() as db:
++            state = await db.get(TelegramChannelState, channel_id)
++            if state is not None:
++                return int(state.last_scanned_message_id or 0)
++            value = await db.scalar(
++                select(func.coalesce(func.max(TelegramChannelFile.message_id), 0)).where(
++                    TelegramChannelFile.channel_id == channel_id
++                )
++            )
++            return int(value or 0)
++
++    async def store_scan(self, scan: TelegramScanResult) -> None:
++        async with SessionLocal() as db:
++            if scan.files:
++                table = TelegramChannelFile.__table__
++                values = [
++                    {
++                        "channel_id": item.channel_id,
++                        "message_id": item.message_id,
++                        "file_name": item.file_name,
++                        "bytes": item.bytes,
++                        "mime_type": item.mime_type,
++                        "document_id": item.document_id,
++                        "message_date_utc": item.message_date_utc,
++                    }
++                    for item in scan.files
++                ]
++                for start in range(0, len(values), 500):
++                    stmt = mysql_insert(table).values(values[start : start + 500])
++                    await db.execute(
++                        stmt.on_duplicate_key_update(
++                            file_name=stmt.inserted.file_name,
++                            bytes=stmt.inserted.bytes,
++                            mime_type=stmt.inserted.mime_type,
++                            document_id=stmt.inserted.document_id,
++                            message_date_utc=stmt.inserted.message_date_utc,
++                            updated_at=func.current_timestamp(),
++                        )
++                    )
++
++            state = await db.get(TelegramChannelState, scan.channel_id)
++            now = datetime.utcnow()
++            if state is None:
++                state = TelegramChannelState(
++                    channel_id=scan.channel_id,
++                    channel_title=scan.channel_title,
++                    account_id=scan.account_id,
++                    account_display=scan.account_display,
++                    last_scanned_message_id=scan.highest_message_id,
++                    last_scan_at_utc=now,
++                    last_error=None,
++                )
++                db.add(state)
++            else:
++                state.channel_title = scan.channel_title
++                state.account_id = scan.account_id
++                state.account_display = scan.account_display
++                state.last_scanned_message_id = max(
++                    int(state.last_scanned_message_id or 0), int(scan.highest_message_id or 0)
++                )
++                state.last_scan_at_utc = now
++                state.last_error = None
++            await db.commit()
++
++    async def record_error(self, channel_id: int, error: str) -> None:
++        async with SessionLocal() as db:
++            state = await db.get(TelegramChannelState, channel_id)
++            if state is None:
++                state = TelegramChannelState(channel_id=channel_id, last_error=error[:8000])
++                db.add(state)
++            else:
++                state.last_error = error[:8000]
++            await db.commit()
++
++    async def unresolved_ready_file_names(self) -> list[str]:
++        async with SessionLocal() as db:
++            rows = (
++                await db.execute(
++                    select(VideoPart.file_name)
++                    .outerjoin(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
++                    .where(VideoPart.status == "ready", TelegramVideoPartBinding.part_id.is_(None))
++                    .distinct()
++                    .order_by(VideoPart.file_name)
++                )
++            ).scalars().all()
++            return [str(name) for name in rows if name]
++
++    async def match_ready_parts(self, channel_id: int) -> dict[str, int]:
++        async with SessionLocal() as db:
++            parts = (
++                await db.execute(
++                    select(VideoPart)
++                    .outerjoin(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
++                    .where(VideoPart.status == "ready", TelegramVideoPartBinding.part_id.is_(None))
++                )
++            ).scalars().all()
++            if not parts:
++                return {"bound": 0, "missing": 0, "conflict": 0, "size_mismatch": 0}
++
++            sizes = sorted({int(part.final_bytes or part.expected_bytes or 0) for part in parts if int(part.final_bytes or part.expected_bytes or 0) > 0})
++            names = sorted({str(part.file_name) for part in parts})
++            candidate_rows: list[TelegramChannelFile] = []
++            if sizes:
++                candidate_rows.extend(
++                    (
++                        await db.execute(
++                            select(TelegramChannelFile).where(
++                                TelegramChannelFile.channel_id == channel_id,
++                                TelegramChannelFile.bytes.in_(sizes),
++                            )
++                        )
++                    ).scalars().all()
++                )
++            if names:
++                candidate_rows.extend(
++                    (
++                        await db.execute(
++                            select(TelegramChannelFile).where(
++                                TelegramChannelFile.channel_id == channel_id,
++                                TelegramChannelFile.file_name.in_(names),
++                            )
++                        )
++                    ).scalars().all()
++                )
++
++            unique: dict[tuple[int, int], TelegramChannelFile] = {
++                (int(row.channel_id), int(row.message_id)): row for row in candidate_rows
++            }
++            files = list(unique.values())
++            used = {
++                (int(channel), int(message))
++                for channel, message in (
++                    await db.execute(
++                        select(
++                            TelegramVideoPartBinding.channel_id,
++                            TelegramVideoPartBinding.message_id,
++                        ).where(TelegramVideoPartBinding.channel_id == channel_id)
++                    )
++                ).all()
++            }
++
++            by_name: dict[str, list[TelegramChannelFile]] = defaultdict(list)
++            by_identity: dict[tuple[str, int, int, int], list[TelegramChannelFile]] = defaultdict(list)
++            for row in files:
++                by_name[str(row.file_name)].append(row)
++                identity = canonical_part_identity(row.file_name)
++                if identity is not None:
++                    by_identity[identity].append(row)
++
++            stats = {"bound": 0, "missing": 0, "conflict": 0, "size_mismatch": 0}
++            for part in parts:
++                name = str(part.file_name)
++                size = int(part.final_bytes or part.expected_bytes or 0)
++                exact_name = by_name.get(name, [])
++                exact_size = [row for row in exact_name if int(row.bytes or 0) == size]
++                match_rows = exact_size
++                matched_by = "exact_filename_size"
++                identity = canonical_part_identity(name)
++                if not match_rows and identity is not None:
++                    match_rows = [
++                        row for row in by_identity.get(identity, []) if int(row.bytes or 0) == size
++                    ]
++                    matched_by = "canonical_part_identity_size"
++                free = [
++                    row for row in match_rows if (int(row.channel_id), int(row.message_id)) not in used
++                ]
++                if len(match_rows) == 1 and len(free) == 1:
++                    row = free[0]
++                    db.add(
++                        TelegramVideoPartBinding(
++                            part_id=part.id,
++                            channel_id=int(row.channel_id),
++                            message_id=int(row.message_id),
++                            matched_by=matched_by,
++                        )
++                    )
++                    used.add((int(row.channel_id), int(row.message_id)))
++                    stats["bound"] += 1
++                elif len(match_rows) > 1 or (match_rows and not free):
++                    stats["conflict"] += 1
++                elif exact_name or (identity is not None and by_identity.get(identity)):
++                    stats["size_mismatch"] += 1
++                else:
++                    stats["missing"] += 1
++            await db.commit()
++            return stats
++
++    async def part_bindings(self, channel_id: int, *, session_id: str | None = None) -> list[dict[str, Any]]:
++        async with SessionLocal() as db:
++            query = (
++                select(VideoPart, TelegramVideoPartBinding, TelegramChannelFile)
++                .outerjoin(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
++                .outerjoin(
++                    TelegramChannelFile,
++                    (TelegramChannelFile.channel_id == TelegramVideoPartBinding.channel_id)
++                    & (TelegramChannelFile.message_id == TelegramVideoPartBinding.message_id),
++                )
++                .where(VideoPart.status == "ready")
++                .order_by(VideoPart.created_at, VideoPart.part_no)
++            )
++            if session_id:
++                import uuid
++
++                try:
++                    parsed = uuid.UUID(session_id)
++                except ValueError:
++                    return []
++                query = query.where(VideoPart.video_session_id == parsed)
++            rows = (await db.execute(query)).all()
++
++            used_message_ids = {
++                int(message_id)
++                for (message_id,) in (
++                    await db.execute(
++                        select(TelegramVideoPartBinding.message_id).where(
++                            TelegramVideoPartBinding.channel_id == channel_id
++                        )
++                    )
++                ).all()
++            }
++
++            result: list[dict[str, Any]] = []
++            for part, binding, tg_file in rows:
++                part_bytes = int(part.final_bytes or part.expected_bytes or 0)
++                payload: dict[str, Any] = {
++                    "part_id": str(part.id),
++                    "session_id": str(part.video_session_id),
++                    "part_no": int(part.part_no),
++                    "file_name": part.file_name,
++                    "part_bytes": part_bytes,
++                    "status": "missing",
++                    "channel_id": int(binding.channel_id) if binding else None,
++                    "message_id": int(binding.message_id) if binding else None,
++                    "matched_by": binding.matched_by if binding else None,
++                    "linked_at_utc": _iso(binding.linked_at_utc) if binding else None,
++                    "telegram_bytes": int(tg_file.bytes) if tg_file else None,
++                    "mime_type": tg_file.mime_type if tg_file else None,
++                    "document_id": int(tg_file.document_id) if tg_file else None,
++                    "message_date_utc": _iso(tg_file.message_date_utc) if tg_file else None,
++                    "candidate_count": 0,
++                    "same_name_candidates": [],
++                }
++                if binding is not None:
++                    payload["status"] = "linked" if int(binding.channel_id) == channel_id else "linked_other_channel"
++                    result.append(payload)
++                    continue
++
++                same_name = (
++                    await db.execute(
++                        select(TelegramChannelFile)
++                        .where(
++                            TelegramChannelFile.channel_id == channel_id,
++                            TelegramChannelFile.file_name == part.file_name,
++                        )
++                        .order_by(TelegramChannelFile.message_id)
++                        .limit(20)
++                    )
++                ).scalars().all()
++                payload["same_name_candidates"] = [
++                    {
++                        "message_id": int(item.message_id),
++                        "bytes": int(item.bytes),
++                        "mime_type": item.mime_type,
++                        "used": int(item.message_id) in used_message_ids,
++                    }
++                    for item in same_name
++                ]
++                exact = [item for item in same_name if int(item.bytes) == part_bytes]
++                payload["candidate_count"] = len(exact)
++                if len(exact) > 1:
++                    payload["status"] = "conflict"
++                elif len(exact) == 1:
++                    payload["status"] = "conflict" if int(exact[0].message_id) in used_message_ids else "match_pending"
++                elif same_name:
++                    payload["status"] = "size_mismatch"
++                result.append(payload)
++            return result
++
++    async def status(self, channel_id: int) -> dict[str, Any]:
++        async with SessionLocal() as db:
++            state = await db.get(TelegramChannelState, channel_id)
++            file_count = int(
++                await db.scalar(
++                    select(func.count()).select_from(TelegramChannelFile).where(
++                        TelegramChannelFile.channel_id == channel_id
++                    )
++                )
++                or 0
++            )
++            bound_count = int(
++                await db.scalar(
++                    select(func.count()).select_from(TelegramVideoPartBinding).where(
++                        TelegramVideoPartBinding.channel_id == channel_id
++                    )
++                )
++                or 0
++            )
++            ready_count = int(
++                await db.scalar(
++                    select(func.count()).select_from(VideoPart).where(VideoPart.status == "ready")
++                )
++                or 0
++            )
++            return {
++                "channel_id": channel_id,
++                "channel_title": state.channel_title if state else None,
++                "account_id": int(state.account_id) if state and state.account_id is not None else None,
++                "account_display": state.account_display if state else None,
++                "last_scanned_message_id": int(state.last_scanned_message_id or 0) if state else 0,
++                "last_scan_at_utc": _iso(state.last_scan_at_utc) if state else None,
++                "last_error": state.last_error if state else None,
++                "catalog_files": file_count,
++                "bound_parts": bound_count,
++                "ready_parts": ready_count,
++            }
+diff --git a/apps/api/app/telegram/runtime.py b/apps/api/app/telegram/runtime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a1d0398cddf18adab8739a8eec65c4d33d6a15f6
+--- /dev/null
++++ b/apps/api/app/telegram/runtime.py
+@@ -0,0 +1,208 @@
++from __future__ import annotations
++
++import asyncio
++from datetime import datetime, timezone
++from typing import Any
++
++from streamhub_common.settings import get_settings
++
++from .registry import TelegramRegistry
++from .storage import (
++    TelegramAuthRequired,
++    TelegramConfig,
++    TelegramFileRecord,
++    TelegramMediaReader,
++    TelegramStorageError,
++)
++
++
++def _iso_now() -> str:
++    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
++
++
++def _file_payload(item: TelegramFileRecord) -> dict[str, Any]:
++    return {
++        "message_id": int(item.message_id),
++        "file_name": item.file_name,
++        "bytes": int(item.bytes),
++        "mime_type": item.mime_type,
++        "document_id": int(item.document_id),
++        "message_date_utc": item.message_date_utc.isoformat() + "Z" if item.message_date_utc else None,
++    }
++
++
++class TelegramRuntime:
++    """Application owner of the one read-only Telegram user connection."""
++
++    def __init__(self) -> None:
++        settings = get_settings()
++        self.registry = TelegramRegistry()
++        self.sync_interval_seconds = settings.telegram_sync_interval_seconds
++        self.max_parallel_downloads = settings.telegram_max_parallel_downloads
++        self.config: TelegramConfig | None = None
++        self.reader: TelegramMediaReader | None = None
++        self._sync_lock = asyncio.Lock()
++        self._task: asyncio.Task[None] | None = None
++        self._runtime: dict[str, Any] = {
++            "state": "not_configured",
++            "last_error": None,
++            "last_sync_at_utc": None,
++            "last_scanned_messages": 0,
++            "last_discovered_files": 0,
++        }
++
++    def _set(self, **fields: Any) -> None:
++        self._runtime.update(fields)
++
++    async def start(self) -> None:
++        try:
++            config = TelegramConfig.from_settings(get_settings())
++        except TelegramStorageError as exc:
++            self._set(state="not_configured", last_error=str(exc))
++            return
++        config.state_root.mkdir(parents=True, exist_ok=True)
++        self.config = config
++        self.reader = TelegramMediaReader(config, max_parallel_downloads=self.max_parallel_downloads)
++        self._set(state="idle", last_error=None)
++        if self._task is None or self._task.done():
++            self._task = asyncio.create_task(self._loop(), name="telegram-readonly-sync")
++
++    async def stop(self) -> None:
++        if self._task is not None:
++            self._task.cancel()
++            try:
++                await self._task
++            except asyncio.CancelledError:
++                pass
++            self._task = None
++        if self.reader is not None:
++            await self.reader.close()
++
++    async def _loop(self) -> None:
++        await asyncio.sleep(3)
++        while True:
++            try:
++                await self.sync_once(reconcile_missing=False)
++            except Exception:
++                pass
++            await asyncio.sleep(self.sync_interval_seconds)
++
++    def snapshot(self) -> dict[str, Any]:
++        return dict(self._runtime)
++
++    async def status(self) -> dict[str, Any]:
++        if self.config is None:
++            return {
++                "ok": True,
++                "configured": False,
++                "config_error": self._runtime.get("last_error"),
++                "runtime": self.snapshot(),
++            }
++        return {
++            "ok": True,
++            "configured": True,
++            "session_name": self.config.session_name,
++            "session_present": self.config.session_file.is_file(),
++            "channel": await self.registry.status(self.config.channel_id),
++            "runtime": self.snapshot(),
++        }
++
++    def require_reader(self) -> TelegramMediaReader:
++        if self.config is None or self.reader is None:
++            raise TelegramStorageError(self._runtime.get("last_error") or "Telegram is not configured")
++        return self.reader
++
++    async def sync_once(self, *, reconcile_missing: bool = False) -> dict[str, Any]:
++        config = self.config
++        reader = self.require_reader()
++        assert config is not None
++        async with self._sync_lock:
++            self._set(state="syncing", last_error=None)
++            min_message_id = await self.registry.last_message_id(config.channel_id)
++            try:
++                scan = await reader.scan(min_message_id=min_message_id)
++            except Exception as exc:
++                try:
++                    await self.registry.record_error(config.channel_id, str(exc))
++                except Exception:
++                    pass
++                self._set(
++                    state="auth_required" if isinstance(exc, TelegramAuthRequired) else "error",
++                    last_error=str(exc),
++                )
++                raise
++
++            if scan.channel_id != config.channel_id:
++                error = f"configured channel={config.channel_id}, Telegram returned channel={scan.channel_id}"
++                await self.registry.record_error(config.channel_id, error)
++                self._set(state="error", last_error=error)
++                raise TelegramStorageError(error)
++
++            await self.registry.store_scan(scan)
++            first_matches = await self.registry.match_ready_parts(scan.channel_id)
++            reconcile_result = None
++            reconcile_scan = None
++            unresolved_names: list[str] = []
++            final_matches = dict(first_matches)
++            total_bound = int(first_matches.get("bound", 0) or 0)
++            if reconcile_missing:
++                unresolved_names = await self.registry.unresolved_ready_file_names()
++                if unresolved_names:
++                    reconcile_result = await reader.scan_file_names(set(unresolved_names))
++                    reconcile_scan = reconcile_result.scan
++                    if reconcile_scan.channel_id != config.channel_id:
++                        raise TelegramStorageError(
++                            f"reconcile returned channel={reconcile_scan.channel_id}, expected={config.channel_id}"
++                        )
++                    await self.registry.store_scan(reconcile_scan)
++                    second_matches = await self.registry.match_ready_parts(reconcile_scan.channel_id)
++                    total_bound += int(second_matches.get("bound", 0) or 0)
++                    final_matches = dict(second_matches)
++                    final_matches["bound"] = total_bound
++
++            scanned_total = scan.scanned_messages + (reconcile_scan.scanned_messages if reconcile_scan else 0)
++            discovered_total = len(scan.files) + (len(reconcile_scan.files) if reconcile_scan else 0)
++            self._set(
++                state="ready",
++                last_error=None,
++                last_sync_at_utc=_iso_now(),
++                last_scanned_messages=scanned_total,
++                last_discovered_files=discovered_total,
++            )
++            return {
++                "channel_id": scan.channel_id,
++                "channel_title": scan.channel_title,
++                "account_id": scan.account_id,
++                "account_display": scan.account_display,
++                "from_message_id": min_message_id,
++                "highest_message_id": max(
++                    scan.highest_message_id,
++                    reconcile_scan.highest_message_id if reconcile_scan else 0,
++                ),
++                "scanned_messages": scanned_total,
++                "discovered_files": discovered_total,
++                "incremental": {
++                    "scanned_messages": scan.scanned_messages,
++                    "discovered_files": len(scan.files),
++                },
++                "reconcile": {
++                    "enabled": bool(reconcile_missing),
++                    "performed": reconcile_scan is not None,
++                    "expected_file_names": len(unresolved_names),
++                    "scanned_messages": reconcile_scan.scanned_messages if reconcile_scan else 0,
++                    "scanned_documents": reconcile_result.scanned_documents if reconcile_result else 0,
++                    "discovered_files": len(reconcile_scan.files) if reconcile_scan else 0,
++                    "matched_file_names": list(reconcile_result.matched_file_names) if reconcile_result else [],
++                    "near_documents": [_file_payload(x) for x in reconcile_result.near_documents] if reconcile_result else [],
++                    "recent_documents": [_file_payload(x) for x in reconcile_result.recent_documents] if reconcile_result else [],
++                },
++                "matches": final_matches,
++            }
++
++    async def bindings(self, *, session_id: str | None = None) -> list[dict[str, Any]]:
++        if self.config is None:
++            raise TelegramStorageError(self._runtime.get("last_error") or "Telegram is not configured")
++        return await self.registry.part_bindings(self.config.channel_id, session_id=session_id)
++
++
++telegram_runtime = TelegramRuntime()
+diff --git a/apps/api/app/telegram/storage.py b/apps/api/app/telegram/storage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..62f28d5767c466fc63648cf1a6669c32adfaa1c9
+--- /dev/null
++++ b/apps/api/app/telegram/storage.py
+@@ -0,0 +1,418 @@
++from __future__ import annotations
++
++import asyncio
++import re
++from collections import OrderedDict
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Any, AsyncIterator
++
++from telethon import TelegramClient, utils
++from telethon.tl.types import DocumentAttributeFilename
++
++from streamhub_common.settings import Settings
++from streamhub_common.telegram_names import canonical_part_identity, filename_tokens, filenames_equivalent
++
++
++_DOWNLOAD_CHUNK = 512 * 1024
++_MESSAGE_CACHE_SIZE = 128
++_DIAGNOSTIC_RECENT_LIMIT = 40
++_DIAGNOSTIC_NEAR_LIMIT = 120
++
++
++class TelegramStorageError(RuntimeError):
++    pass
++
++
++class TelegramAuthRequired(TelegramStorageError):
++    pass
++
++
++@dataclass(frozen=True)
++class TelegramConfig:
++    api_id: int
++    api_hash: str
++    channel_id: int
++    session_name: str
++    state_root: Path
++
++    @classmethod
++    def from_settings(cls, settings: Settings) -> "TelegramConfig":
++        raw_api_id = str(settings.telegram_api_id or "").strip()
++        api_hash = str(settings.telegram_api_hash or "").strip()
++        raw_channel_id = str(settings.telegram_channel_id or "").strip()
++        session_name = str(settings.telegram_session_name or "").strip()
++        missing = [
++            name
++            for name, value in (
++                ("TELEGRAM_API_ID", raw_api_id),
++                ("TELEGRAM_API_HASH", api_hash),
++                ("TELEGRAM_CHANNEL_ID", raw_channel_id),
++                ("SESSION_NAME", session_name),
++            )
++            if value is None or value == ""
++        ]
++        if missing:
++            raise TelegramStorageError("not configured: " + ", ".join(missing))
++        try:
++            api_id = int(raw_api_id)
++        except ValueError as exc:
++            raise TelegramStorageError("TELEGRAM_API_ID must be numeric") from exc
++        try:
++            channel_id = int(raw_channel_id)
++        except ValueError as exc:
++            raise TelegramStorageError("TELEGRAM_CHANNEL_ID must be numeric") from exc
++        if api_id <= 0:
++            raise TelegramStorageError("TELEGRAM_API_ID must be positive")
++        if channel_id >= 0:
++            raise TelegramStorageError("TELEGRAM_CHANNEL_ID must be a full channel peer id like -100...")
++        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", session_name):
++            raise TelegramStorageError("TELEGRAM_SESSION_NAME may contain only A-Z, a-z, 0-9, _ and -")
++        return cls(
++            api_id=api_id,
++            api_hash=api_hash,
++            channel_id=channel_id,
++            session_name=session_name,
++            state_root=Path(settings.telegram_state_root).resolve(),
++        )
++
++    @property
++    def session_base(self) -> Path:
++        return self.state_root / self.session_name
++
++    @property
++    def session_file(self) -> Path:
++        return self.state_root / f"{self.session_name}.session"
++
++
++@dataclass(frozen=True)
++class TelegramFileRecord:
++    channel_id: int
++    message_id: int
++    file_name: str
++    bytes: int
++    mime_type: str | None
++    document_id: int
++    message_date_utc: datetime | None
++
++
++@dataclass(frozen=True)
++class TelegramScanResult:
++    channel_id: int
++    channel_title: str
++    account_id: int
++    account_display: str
++    highest_message_id: int
++    scanned_messages: int
++    files: tuple[TelegramFileRecord, ...]
++
++
++@dataclass(frozen=True)
++class TelegramReconcileScan:
++    scan: TelegramScanResult
++    scanned_documents: int
++    expected_file_names: tuple[str, ...]
++    matched_file_names: tuple[str, ...]
++    recent_documents: tuple[TelegramFileRecord, ...]
++    near_documents: tuple[TelegramFileRecord, ...]
++
++
++def _display_name(entity: Any) -> str:
++    first = str(getattr(entity, "first_name", "") or "").strip()
++    last = str(getattr(entity, "last_name", "") or "").strip()
++    username = str(getattr(entity, "username", "") or "").strip()
++    name = " ".join(x for x in (first, last) if x)
++    if username:
++        return f"{name} (@{username})" if name else f"@{username}"
++    return name or str(getattr(entity, "id", "unknown"))
++
++
++def _channel_title(entity: Any) -> str:
++    return str(getattr(entity, "title", None) or getattr(entity, "username", None) or getattr(entity, "id", "channel"))
++
++
++def _file_name(message: Any) -> str | None:
++    file_obj = getattr(message, "file", None)
++    name = str(getattr(file_obj, "name", "") or "").strip()
++    if name:
++        return name
++    document = getattr(message, "document", None)
++    for attr in getattr(document, "attributes", None) or ():
++        if isinstance(attr, DocumentAttributeFilename):
++            value = str(attr.file_name or "").strip()
++            if value:
++                return value
++    return None
++
++
++class TelegramMediaReader:
++    """Single read-only Telethon client shared by indexing and media reads."""
++
++    def __init__(self, config: TelegramConfig, *, max_parallel_downloads: int = 4) -> None:
++        self.config = config
++        self._client = TelegramClient(str(config.session_base), config.api_id, config.api_hash)
++        self._connect_lock = asyncio.Lock()
++        self._message_lock = asyncio.Lock()
++        self._download_slots = asyncio.Semaphore(max(1, int(max_parallel_downloads)))
++        self._channel: Any | None = None
++        self._normalized_channel_id: int | None = None
++        self._message_cache: OrderedDict[int, Any] = OrderedDict()
++
++    async def _resolve_channel(self) -> Any:
++        configured = self.config.channel_id
++        async for dialog in self._client.iter_dialogs():
++            entity = dialog.entity
++            try:
++                peer_id = int(utils.get_peer_id(entity))
++            except Exception:
++                continue
++            raw_id = int(getattr(entity, "id", 0) or 0)
++            if peer_id == configured or raw_id == configured:
++                return entity
++        try:
++            return await self._client.get_entity(configured)
++        except Exception as exc:
++            raise TelegramStorageError(f"Telegram channel {configured} is not available to this account") from exc
++
++    async def ensure_connected(self) -> None:
++        if self._client.is_connected() and self._channel is not None:
++            return
++        async with self._connect_lock:
++            if not self.config.session_file.is_file():
++                raise TelegramAuthRequired(
++                    f"Telegram session is missing: {self.config.session_file}. Run .\\telegram-auth.ps1"
++                )
++            if not self._client.is_connected():
++                await self._client.connect()
++            if not await self._client.is_user_authorized():
++                raise TelegramAuthRequired("Telegram user session is no longer authorized")
++            if self._channel is None:
++                channel = await self._resolve_channel()
++                normalized = int(utils.get_peer_id(channel))
++                if normalized != self.config.channel_id:
++                    raise TelegramStorageError(
++                        f"TELEGRAM_CHANNEL_ID={self.config.channel_id}, Telegram resolved peer_id={normalized}"
++                    )
++                self._channel = channel
++                self._normalized_channel_id = normalized
++
++    async def close(self) -> None:
++        self._message_cache.clear()
++        self._channel = None
++        self._normalized_channel_id = None
++        if self._client.is_connected():
++            await self._client.disconnect()
++
++    def _record_from_message(self, message: Any) -> TelegramFileRecord | None:
++        document = getattr(message, "document", None)
++        if document is None:
++            return None
++        name = _file_name(message)
++        if not name:
++            return None
++        message_date = getattr(message, "date", None)
++        if isinstance(message_date, datetime):
++            if message_date.tzinfo is None:
++                message_date = message_date.replace(tzinfo=timezone.utc)
++            message_date = message_date.astimezone(timezone.utc).replace(tzinfo=None)
++        else:
++            message_date = None
++        assert self._normalized_channel_id is not None
++        return TelegramFileRecord(
++            channel_id=self._normalized_channel_id,
++            message_id=int(message.id),
++            file_name=name,
++            bytes=int(getattr(document, "size", 0) or 0),
++            mime_type=str(getattr(document, "mime_type", "") or "") or None,
++            document_id=int(getattr(document, "id", 0) or 0),
++            message_date_utc=message_date,
++        )
++
++    async def _scan_header(self) -> tuple[Any, str]:
++        await self.ensure_connected()
++        me = await self._client.get_me()
++        if me is None:
++            raise TelegramAuthRequired("Telegram did not return the authorized user")
++        assert self._channel is not None
++        return me, _channel_title(self._channel)
++
++    async def scan(self, *, min_message_id: int = 0) -> TelegramScanResult:
++        me, channel_title = await self._scan_header()
++        assert self._channel is not None
++        assert self._normalized_channel_id is not None
++        watermark = max(0, int(min_message_id or 0))
++        highest = watermark
++        scanned = 0
++        files: list[TelegramFileRecord] = []
++        async for message in self._client.iter_messages(self._channel):
++            message_id = int(getattr(message, "id", 0) or 0)
++            if message_id <= watermark:
++                break
++            scanned += 1
++            highest = max(highest, message_id)
++            record = self._record_from_message(message)
++            if record is not None:
++                files.append(record)
++                self._remember(message)
++        return TelegramScanResult(
++            channel_id=self._normalized_channel_id,
++            channel_title=channel_title,
++            account_id=int(me.id),
++            account_display=_display_name(me),
++            highest_message_id=highest,
++            scanned_messages=scanned,
++            files=tuple(files),
++        )
++
++    async def scan_file_names(self, file_names: set[str], *, max_messages: int = 50000) -> TelegramReconcileScan:
++        wanted = {str(name).strip() for name in file_names if str(name).strip()}
++        wanted_tokens: set[str] = set()
++        wanted_identities = {
++            identity for name in wanted if (identity := canonical_part_identity(name)) is not None
++        }
++        for name in wanted:
++            wanted_tokens.update(filename_tokens(name))
++        me, channel_title = await self._scan_header()
++        assert self._channel is not None
++        assert self._normalized_channel_id is not None
++        if not wanted:
++            empty = TelegramScanResult(
++                self._normalized_channel_id, channel_title, int(me.id), _display_name(me), 0, 0, ()
++            )
++            return TelegramReconcileScan(empty, 0, (), (), (), ())
++
++        highest = scanned = scanned_documents = 0
++        exact_files: list[TelegramFileRecord] = []
++        recent_documents: list[TelegramFileRecord] = []
++        near_documents: list[TelegramFileRecord] = []
++        matched_names: set[str] = set()
++        async for message in self._client.iter_messages(self._channel):
++            scanned += 1
++            highest = max(highest, int(getattr(message, "id", 0) or 0))
++            record = self._record_from_message(message)
++            if record is not None:
++                scanned_documents += 1
++                if len(recent_documents) < _DIAGNOSTIC_RECENT_LIMIT:
++                    recent_documents.append(record)
++                record_identity = canonical_part_identity(record.file_name)
++                is_exact = record.file_name in wanted
++                is_canonical = record_identity is not None and record_identity in wanted_identities
++                if is_exact or is_canonical:
++                    exact_files.append(record)
++                    for expected in wanted:
++                        if filenames_equivalent(expected, record.file_name):
++                            matched_names.add(expected)
++                    self._remember(message)
++                elif (
++                    len(near_documents) < _DIAGNOSTIC_NEAR_LIMIT
++                    and wanted_tokens
++                    and filename_tokens(record.file_name) & wanted_tokens
++                ):
++                    near_documents.append(record)
++            if scanned >= max(1, int(max_messages)):
++                break
++        scan = TelegramScanResult(
++            self._normalized_channel_id,
++            channel_title,
++            int(me.id),
++            _display_name(me),
++            highest,
++            scanned,
++            tuple(exact_files),
++        )
++        return TelegramReconcileScan(
++            scan,
++            scanned_documents,
++            tuple(sorted(wanted)),
++            tuple(sorted(matched_names)),
++            tuple(recent_documents),
++            tuple(near_documents),
++        )
++
++    def _remember(self, message: Any) -> None:
++        message_id = int(getattr(message, "id", 0) or 0)
++        if message_id <= 0:
++            return
++        self._message_cache[message_id] = message
++        self._message_cache.move_to_end(message_id)
++        while len(self._message_cache) > _MESSAGE_CACHE_SIZE:
++            self._message_cache.popitem(last=False)
++
++    async def _message(self, message_id: int) -> Any:
++        await self.ensure_connected()
++        cached = self._message_cache.get(int(message_id))
++        if cached is not None:
++            self._message_cache.move_to_end(int(message_id))
++            return cached
++        async with self._message_lock:
++            cached = self._message_cache.get(int(message_id))
++            if cached is not None:
++                self._message_cache.move_to_end(int(message_id))
++                return cached
++            assert self._channel is not None
++            message = await self._client.get_messages(self._channel, ids=int(message_id))
++            if message is None or getattr(message, "document", None) is None:
++                raise TelegramStorageError(f"Telegram message {message_id} does not contain a document")
++            self._remember(message)
++            return message
++
++    async def validate_document(self, message_id: int, *, expected_name: str, expected_size: int) -> Any:
++        message = await self._message(message_id)
++        document = message.document
++        actual_name = _file_name(message)
++        actual_size = int(getattr(document, "size", 0) or 0)
++        if not filenames_equivalent(expected_name, actual_name or ""):
++            raise TelegramStorageError(
++                f"Telegram message {message_id}: filename no longer matches part: {actual_name!r} != {expected_name!r}"
++            )
++        if actual_size != int(expected_size):
++            raise TelegramStorageError(
++                f"Telegram message {message_id}: size changed: {actual_size} != {expected_size}"
++            )
++        return document
++
++    async def iter_document_range(
++        self,
++        message_id: int,
++        *,
++        expected_name: str,
++        expected_size: int,
++        offset: int,
++        length: int,
++    ) -> AsyncIterator[bytes]:
++        if offset < 0 or length <= 0 or offset + length > int(expected_size):
++            raise TelegramStorageError(
++                f"invalid byte range offset={offset} length={length} size={expected_size}"
++            )
++        document = await self.validate_document(
++            message_id, expected_name=expected_name, expected_size=expected_size
++        )
++        async with self._download_slots:
++            remaining = int(length)
++            stream = self._client.iter_download(
++                document,
++                offset=int(offset),
++                chunk_size=_DOWNLOAD_CHUNK,
++                request_size=_DOWNLOAD_CHUNK,
++                file_size=int(expected_size),
++            )
++            try:
++                async for chunk in stream:
++                    if remaining <= 0:
++                        break
++                    data = bytes(chunk)
++                    if not data:
++                        continue
++                    if len(data) > remaining:
++                        data = data[:remaining]
++                    remaining -= len(data)
++                    yield data
++                    if remaining == 0:
++                        break
++            finally:
++                await stream.close()
++            if remaining != 0:
++                raise TelegramStorageError(
++                    f"Telegram download ended early: message={message_id}, remaining={remaining} bytes"
++                )
+diff --git a/apps/web/package.json b/apps/web/package.json
+index 537f6450f4f99d8ddad13dce448018caa185a52c..cae7d0bbf2fbab0c0a4f687d04bf41f3c80fe8c2 100644
+--- a/apps/web/package.json
++++ b/apps/web/package.json
+@@ -13,7 +13,8 @@
+     "vite": "latest",
+     "typescript": "latest",
+     "react": "latest",
+-    "react-dom": "latest"
++    "react-dom": "latest",
++    "hls.js": "latest"
+   },
+   "devDependencies": {
+     "@types/react": "latest",
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 052ece5d98fc6b919127e5bb7cb6083580418f90..15d09483693d6b9a01d658745c91cba94998cacf 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -1,4 +1,5 @@
+-import React, { useEffect, useMemo, useState } from "react";
++import React, { useEffect, useMemo, useRef, useState } from "react";
++import Hls from "hls.js";
+ import { createRoot } from "react-dom/client";
+ import "./styles.css";
+ 
+@@ -99,6 +100,55 @@ type VideoPart = {
+   job?: VideoPartJob | null;
+ };
+ 
++type TelegramBinding = {
++  part_id: string;
++  session_id: string;
++  part_no: number;
++  file_name: string;
++  part_bytes: number;
++  status: "linked" | "missing" | "size_mismatch" | "conflict" | "match_pending" | "linked_other_channel" | string;
++  channel_id?: number | null;
++  message_id?: number | null;
++  matched_by?: string | null;
++  telegram_bytes?: number | null;
++};
++
++type TelegramStatus = {
++  ok: boolean;
++  configured: boolean;
++  session_name?: string;
++  session_present?: boolean;
++  config_error?: string | null;
++  channel?: {
++    channel_id: number;
++    channel_title?: string | null;
++    account_display?: string | null;
++    last_scanned_message_id: number;
++    last_scan_at_utc?: string | null;
++    catalog_files: number;
++    bound_parts: number;
++    ready_parts: number;
++    last_error?: string | null;
++  };
++  runtime: {
++    state: string;
++    last_error?: string | null;
++    last_sync_at_utc?: string | null;
++    last_scanned_messages?: number;
++    last_discovered_files?: number;
++  };
++};
++
++type PlaybackStatus = {
++  video_session_id: string;
++  playable: boolean;
++  playback_error?: string | null;
++  linked_segment_count: number;
++  first_segment_no?: number | null;
++  last_segment_no?: number | null;
++  playlist_url: string;
++};
++
+ type PartPlan = {
+   mode: "manual" | "target" | "count";
+   from_segment_no: number;
+@@ -363,6 +413,27 @@ function VideoProgressBar({ session, progress }: { session: VideoSession; progre
+   );
+ }
+ 
++function TelegramVideoPlayer({ playlistUrl }: { playlistUrl: string }) {
++  const videoRef = useRef<HTMLVideoElement | null>(null);
++
++  useEffect(() => {
++    const video = videoRef.current;
++    if (!video) return;
++    const source = `${API}${playlistUrl}`;
++    if (video.canPlayType("application/vnd.apple.mpegurl")) {
++      video.src = source;
++      return () => { video.removeAttribute("src"); video.load(); };
++    }
++    if (!Hls.isSupported()) return;
++    const hls = new Hls();
++    hls.loadSource(source);
++    hls.attachMedia(video);
++    return () => hls.destroy();
++  }, [playlistUrl]);
++
++  return <video ref={videoRef} className="telegram-player" controls preload="metadata" />;
++}
++
+ function App() {
+   const [events, setEvents] = useState<MediaEvent[]>([]);
+   const [trashEvents, setTrashEvents] = useState<MediaEvent[]>([]);
+@@ -382,6 +453,10 @@ function App() {
+   const [partPlan, setPartPlan] = useState<PartPlan | null>(null);
+   const [partPlanAll, setPartPlanAll] = useState<PartPlanAll | null>(null);
+   const [partAction, setPartAction] = useState(false);
++  const [telegramBindings, setTelegramBindings] = useState<Record<string, TelegramBinding>>({});
++  const [telegramStatus, setTelegramStatus] = useState<TelegramStatus | null>(null);
++  const [telegramSyncing, setTelegramSyncing] = useState(false);
++  const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus | null>(null);
+   const [messages, setMessages] = useState<Message[]>([]);
+   const [progressBySession, setProgressBySession] = useState<Record<string, CaptureProgress>>({});
+   const [videoProgressBySession, setVideoProgressBySession] = useState<Record<string, VideoCaptureProgress>>({});
+@@ -441,6 +516,54 @@ function App() {
+     setVideoParts(data.items || []);
+   }
+ 
++  async function loadTelegramStatus() {
++    const res = await fetch(`${API}/api/v1/telegram/status`, { cache: "no-store" });
++    if (!res.ok) throw new Error(await res.text());
++    setTelegramStatus(await res.json() as TelegramStatus);
++  }
++
++  async function loadTelegramBindings(sessionId: string) {
++    const res = await fetch(`${API}/api/v1/telegram/bindings?session_id=${encodeURIComponent(sessionId)}`, { cache: "no-store" });
++    if (!res.ok) {
++      setTelegramBindings({});
++      return;
++    }
++    const data = await res.json() as { bindings?: TelegramBinding[] };
++    setTelegramBindings(Object.fromEntries((data.bindings || []).map((item) => [item.part_id, item])));
++  }
++
++  async function loadPlaybackStatus(sessionId: string) {
++    const res = await fetch(`${API}/api/v1/playback/video-sessions/${sessionId}`, { cache: "no-store" });
++    if (!res.ok) {
++      setPlaybackStatus(null);
++      return;
++    }
++    setPlaybackStatus(await res.json() as PlaybackStatus);
++  }
++
++  async function refreshTelegramForSession(sessionId: string) {
++    await Promise.allSettled([
++      loadTelegramStatus(),
++      loadTelegramBindings(sessionId),
++      loadPlaybackStatus(sessionId),
++    ]);
++  }
++
++  async function syncTelegram() {
++    if (!selectedVideo) return;
++    setTelegramSyncing(true);
++    try {
++      const res = await fetch(`${API}/api/v1/telegram/sync`, { method: "POST" });
++      if (!res.ok) throw new Error(await res.text());
++      await refreshTelegramForSession(selectedVideo.id);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setTelegramSyncing(false);
++    }
++  }
++
+   async function loadOutputSettings() {
+     try {
+       const res = await fetch(`${API}/api/v1/storage/output-settings`, { cache: "no-store" });
+@@ -605,6 +728,7 @@ function App() {
+       const next = loadedSegments.find((segment) => segment.storage_state === "archive_ready" && segment.integrity_state === "hashed" && !reserved.has(segment.segment_no))?.segment_no || loadedSegments[0]?.segment_no || 1;
+       setPartFromSegment(next);
+       setPartToSegment(next);
++      await refreshTelegramForSession(session.id);
+       setError(null);
+     } catch (e) {
+       setError(String(e));
+@@ -949,6 +1073,15 @@ function App() {
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [selectedVideo?.id, activePartBuild]);
+ 
++  useEffect(() => {
++    if (!selectedVideo) return;
++    const timer = window.setInterval(() => {
++      refreshTelegramForSession(selectedVideo.id).catch((e) => console.warn("telegram status poll failed", e));
++    }, 5000);
++    return () => window.clearInterval(timer);
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [selectedVideo?.id]);
++
+   const monitoredChatIds = useMemo(
+     () => view === "events"
+       ? events.flatMap((event) => event.chat_sessions).filter(isCaptureBusy).map((session) => session.id)
+@@ -1189,12 +1322,40 @@ function App() {
+             </div>
+           )}
+         </section>
++        <section className="video-block telegram-storage-block">
++          <div className="row telegram-storage-head">
++            <div>
++              <div className="section-label">TELEGRAM STORAGE</div>
++              <div className="muted small">Read-only user session · parts are uploaded manually as Telegram documents.</div>
++            </div>
++            <button disabled={telegramSyncing || !telegramStatus?.configured} onClick={syncTelegram}>{telegramSyncing ? "Syncing…" : "Telegram sync"}</button>
++          </div>
++          {!telegramStatus?.configured ? (
++            <div className="inline-error small">Telegram не настроен: {telegramStatus?.config_error || "заполните .env и выполните telegram-auth.ps1"}</div>
++          ) : (
++            <div className="telegram-storage-summary">
++              <div><span>Runtime</span><strong>{telegramStatus.runtime.state}</strong></div>
++              <div><span>Session</span><strong>{telegramStatus.session_present ? telegramStatus.session_name : "missing"}</strong></div>
++              <div><span>Channel</span><strong>{telegramStatus.channel?.channel_title || telegramStatus.channel?.channel_id || "—"}</strong></div>
++              <div><span>Catalog / linked</span><strong>{telegramStatus.channel?.catalog_files || 0} / {telegramStatus.channel?.bound_parts || 0}</strong></div>
++            </div>
++          )}
++          {playbackStatus?.playable ? (
++            <div className="telegram-playback">
++              <div className="muted small">Telegram playback · segments {playbackStatus.first_segment_no}–{playbackStatus.last_segment_no} · {playbackStatus.linked_segment_count} linked</div>
++              <TelegramVideoPlayer playlistUrl={playbackStatus.playlist_url} />
++            </div>
++          ) : playbackStatus?.playback_error ? (
++            <div className="muted small">Playback: {playbackStatus.playback_error}</div>
++          ) : null}
++        </section>
+         <section className="video-block">
+           <div className="section-label">PARTS / BUILD QUEUE</div>
+           {videoParts.length === 0 ? <div className="empty-child">Parts ещё не создавались</div> : (
+             <div className="part-list">
+               {videoParts.map((part) => {
+                 const job = part.job;
++                const telegram = telegramBindings[part.id];
+                 const progressTotal = job?.total_bytes || part.expected_bytes || 1;
+                 const progressBytes = job?.progress_bytes || (part.status === "ready" ? (part.final_bytes || part.expected_bytes) : 0);
+                 const progressPercent = Math.max(0, Math.min(100, Math.round((progressBytes / progressTotal) * 100)));
+@@ -1210,6 +1371,13 @@ function App() {
+                     )}
+                     {part.sha256 && <div className="muted small hash-line">sha256 <code>{part.sha256}</code></div>}
+                     <div className="muted small path-cell"><code>{part.relative_path}</code></div>
++                    {part.status === "ready" && (
++                      <div className={`telegram-part-status telegram-part-status-${telegram?.status || "missing"}`}>
++                        Telegram: <strong>{telegram?.status || "missing"}</strong>
++                        {telegram?.message_id != null && <> · message <code>{telegram.message_id}</code></>}
++                        {telegram?.matched_by && <> · {telegram.matched_by}</>}
++                      </div>
++                    )}
+                     {(part.last_error || job?.last_error) && <div className="inline-error small">{part.last_error || job?.last_error}</div>}
+                     <div className="actions part-row-actions">
+                       {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index b23a9c9152f5e5e2e30a4e26d28df22d1c88833b..56c0b655aeaa0806876e6d49eec6d093791d816e 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -170,3 +170,16 @@ td { font-variant-numeric: tabular-nums; }
+ .part-plan-all-row:last-child { border-bottom: 0; }
+ .part-plan-all-row span { color: #6b7280; text-align: right; }
+ @media (max-width: 760px) { .part-plan-all-row { flex-direction: column; gap: 4px; } .part-plan-all-row span { text-align: left; } }
++
++.telegram-storage-head { align-items: flex-start; gap: 16px; }
++.telegram-storage-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
++.telegram-storage-summary > div { display: flex; flex-direction: column; gap: 4px; padding: 10px; border: 1px solid #e2e5ea; border-radius: 9px; background: #fafbfc; min-width: 0; }
++.telegram-storage-summary span { color: #6b7280; font-size: 12px; }
++.telegram-storage-summary strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.telegram-playback { display: grid; gap: 8px; margin-top: 14px; }
++.telegram-player { width: 100%; max-height: 65vh; background: #111; border-radius: 10px; }
++.telegram-part-status { margin-top: 6px; font-size: 12px; color: #6b7280; }
++.telegram-part-status-linked { color: #166534; }
++.telegram-part-status-conflict, .telegram-part-status-size_mismatch, .telegram-part-status-linked_other_channel { color: #b45309; }
++.telegram-part-status-missing { color: #6b7280; }
++@media (max-width: 760px) { .telegram-storage-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+diff --git a/docker-compose.yml b/docker-compose.yml
+index a183add2ef291416d2d067e2dfc2b05f7960f3b8..8366aaa7b1f11a9af47dcf5d17b10d243e93e7bc 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -133,6 +133,8 @@ services:
+     restart: unless-stopped
+     ports:
+       - "${API_PUBLIC_PORT:-18741}:8000"
++    volumes:
++      - ./telegram_state:/telegram_state
+     depends_on:
+       migrate:
+         condition: service_completed_successfully
+diff --git a/migrations/versions/0009_telegram_storage.py b/migrations/versions/0009_telegram_storage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2879e0ddeba667bd5adae1718aa57b6974edef45
+--- /dev/null
++++ b/migrations/versions/0009_telegram_storage.py
+@@ -0,0 +1,233 @@
++"""telegram read-only part storage and byte offsets
++
++Revision ID: 0009_telegram_storage
++Revises: 0008_video_parts
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0009_telegram_storage"
++down_revision = "0008_video_parts"
++branch_labels = None
++depends_on = None
++
++
++def _table_exists(name: str) -> bool:
++    return name in sa.inspect(op.get_bind()).get_table_names()
++
++
++def _column_exists(table_name: str, column_name: str) -> bool:
++    return column_name in {
++        column["name"] for column in sa.inspect(op.get_bind()).get_columns(table_name)
++    }
++
++
++def _require_columns(table_name: str, expected: set[str]) -> None:
++    actual = {
++        column["name"] for column in sa.inspect(op.get_bind()).get_columns(table_name)
++    }
++    missing = expected - actual
++    if missing:
++        raise RuntimeError(
++            f"cannot resume 0009_telegram_storage: {table_name} exists but misses columns: "
++            + ", ".join(sorted(missing))
++        )
++
++
++def _ensure_index(table_name: str, index_name: str, columns: list[str]) -> None:
++    existing = {
++        item["name"] for item in sa.inspect(op.get_bind()).get_indexes(table_name)
++    }
++    if index_name not in existing:
++        op.create_index(index_name, table_name, columns)
++
++
++def _backfill_part_offsets() -> None:
++    bind = op.get_bind()
++    rows = bind.execute(
++        sa.text(
++            "SELECT id,part_id,expected_bytes FROM video_part_segments "
++            "ORDER BY part_id,segment_no,id"
++        )
++    ).mappings()
++    current_part = None
++    offset = 0
++    updates: list[dict[str, object]] = []
++    statement = sa.text(
++        "UPDATE video_part_segments SET part_offset_bytes=:offset WHERE id=:id"
++    )
++    for row in rows:
++        part_id = row["part_id"]
++        if part_id != current_part:
++            current_part = part_id
++            offset = 0
++        updates.append({"offset": offset, "id": row["id"]})
++        offset += int(row["expected_bytes"] or 0)
++        if len(updates) >= 1000:
++            bind.execute(statement, updates)
++            updates.clear()
++    if updates:
++        bind.execute(statement, updates)
++
++
++def upgrade() -> None:
++    # MySQL DDL is non-transactional. Like 0008, keep this migration resumable if
++    # an earlier attempt stopped after adding the column or creating one table.
++    if not _column_exists("video_part_segments", "part_offset_bytes"):
++        op.add_column(
++            "video_part_segments",
++            sa.Column(
++                "part_offset_bytes",
++                sa.BigInteger(),
++                nullable=False,
++                server_default="0",
++            ),
++        )
++    _backfill_part_offsets()
++
++    if not _table_exists("telegram_channel_state"):
++        op.create_table(
++            "telegram_channel_state",
++            sa.Column("channel_id", sa.BigInteger(), nullable=False),
++            sa.Column("channel_title", sa.String(length=255), nullable=True),
++            sa.Column("account_id", sa.BigInteger(), nullable=True),
++            sa.Column("account_display", sa.String(length=255), nullable=True),
++            sa.Column(
++                "last_scanned_message_id",
++                mysql.BIGINT(unsigned=True),
++                nullable=False,
++                server_default="0",
++            ),
++            sa.Column("last_scan_at_utc", mysql.DATETIME(fsp=6), nullable=True),
++            sa.Column("last_error", sa.Text(), nullable=True),
++            sa.Column(
++                "created_at",
++                mysql.DATETIME(fsp=6),
++                nullable=False,
++                server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++            ),
++            sa.Column(
++                "updated_at",
++                mysql.DATETIME(fsp=6),
++                nullable=False,
++                server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++            ),
++            sa.PrimaryKeyConstraint("channel_id"),
++        )
++    _require_columns(
++        "telegram_channel_state",
++        {
++            "channel_id",
++            "channel_title",
++            "account_id",
++            "account_display",
++            "last_scanned_message_id",
++            "last_scan_at_utc",
++            "last_error",
++            "created_at",
++            "updated_at",
++        },
++    )
++
++    if not _table_exists("telegram_channel_files"):
++        op.create_table(
++            "telegram_channel_files",
++            sa.Column("channel_id", sa.BigInteger(), nullable=False),
++            sa.Column("message_id", mysql.BIGINT(unsigned=True), nullable=False),
++            sa.Column("file_name", sa.String(length=255), nullable=False),
++            sa.Column("bytes", sa.BigInteger(), nullable=False),
++            sa.Column("mime_type", sa.String(length=255), nullable=True),
++            sa.Column("document_id", sa.BigInteger(), nullable=False),
++            sa.Column("message_date_utc", mysql.DATETIME(fsp=6), nullable=True),
++            sa.Column(
++                "discovered_at_utc",
++                mysql.DATETIME(fsp=6),
++                nullable=False,
++                server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++            ),
++            sa.Column(
++                "updated_at",
++                mysql.DATETIME(fsp=6),
++                nullable=False,
++                server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++            ),
++            sa.PrimaryKeyConstraint("channel_id", "message_id"),
++        )
++    _require_columns(
++        "telegram_channel_files",
++        {
++            "channel_id",
++            "message_id",
++            "file_name",
++            "bytes",
++            "mime_type",
++            "document_id",
++            "message_date_utc",
++            "discovered_at_utc",
++            "updated_at",
++        },
++    )
++    _ensure_index(
++        "telegram_channel_files",
++        "ix_telegram_files_name_size",
++        ["channel_id", "file_name", "bytes"],
++    )
++    _ensure_index(
++        "telegram_channel_files",
++        "ix_telegram_files_document",
++        ["document_id"],
++    )
++
++    if not _table_exists("telegram_video_part_bindings"):
++        op.create_table(
++            "telegram_video_part_bindings",
++            sa.Column("part_id", sa.BINARY(16), nullable=False),
++            sa.Column("channel_id", sa.BigInteger(), nullable=False),
++            sa.Column("message_id", mysql.BIGINT(unsigned=True), nullable=False),
++            sa.Column(
++                "matched_by",
++                sa.String(length=64),
++                nullable=False,
++                server_default="exact_filename_size",
++            ),
++            sa.Column(
++                "linked_at_utc",
++                mysql.DATETIME(fsp=6),
++                nullable=False,
++                server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++            ),
++            sa.ForeignKeyConstraint(
++                ["part_id"], ["video_parts.id"], ondelete="CASCADE"
++            ),
++            sa.ForeignKeyConstraint(
++                ["channel_id", "message_id"],
++                [
++                    "telegram_channel_files.channel_id",
++                    "telegram_channel_files.message_id",
++                ],
++                ondelete="RESTRICT",
++                name="fk_telegram_binding_file",
++            ),
++            sa.PrimaryKeyConstraint("part_id"),
++            sa.UniqueConstraint(
++                "channel_id",
++                "message_id",
++                name="uq_telegram_binding_message",
++            ),
++        )
++    _require_columns(
++        "telegram_video_part_bindings",
++        {"part_id", "channel_id", "message_id", "matched_by", "linked_at_utc"},
++    )
++
++
++def downgrade() -> None:
++    op.drop_table("telegram_video_part_bindings")
++    op.drop_index("ix_telegram_files_document", table_name="telegram_channel_files")
++    op.drop_index("ix_telegram_files_name_size", table_name="telegram_channel_files")
++    op.drop_table("telegram_channel_files")
++    op.drop_table("telegram_channel_state")
++    op.drop_column("video_part_segments", "part_offset_bytes")
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index ffd1f11ec266057cc5c3d60ae5abc987d74ae449..bc17a3a8c4744c1f957da036d38af8a363caa319 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -7,6 +7,7 @@ from sqlalchemy import (
+     BigInteger,
+     Boolean,
+     ForeignKey,
++    ForeignKeyConstraint,
+     Index,
+     Integer,
+     JSON,
+@@ -338,6 +339,64 @@ class VideoPartSegment(Base):
+     segment_no: Mapped[int] = mapped_column(Integer)
+     expected_bytes: Mapped[int] = mapped_column(BigInteger)
+     source_sha256: Mapped[str | None] = mapped_column(String(64))
++    part_offset_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
++
++
++class TelegramChannelState(Base):
++    __tablename__ = "telegram_channel_state"
++
++    channel_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
++    channel_title: Mapped[str | None] = mapped_column(String(255))
++    account_id: Mapped[int | None] = mapped_column(BigInteger)
++    account_display: Mapped[str | None] = mapped_column(String(255))
++    last_scanned_message_id: Mapped[int] = mapped_column(
++        BigInteger().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"), default=0
++    )
++    last_scan_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    last_error: Mapped[str | None] = mapped_column(Text)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
++class TelegramChannelFile(Base):
++    __tablename__ = "telegram_channel_files"
++    __table_args__ = (
++        Index("ix_telegram_files_name_size", "channel_id", "file_name", "bytes"),
++        Index("ix_telegram_files_document", "document_id"),
++    )
++
++    channel_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
++    message_id: Mapped[int] = mapped_column(
++        BigInteger().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"), primary_key=True
++    )
++    file_name: Mapped[str] = mapped_column(String(255))
++    bytes: Mapped[int] = mapped_column(BigInteger)
++    mime_type: Mapped[str | None] = mapped_column(String(255))
++    document_id: Mapped[int] = mapped_column(BigInteger)
++    message_date_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    discovered_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
++class TelegramVideoPartBinding(Base):
++    __tablename__ = "telegram_video_part_bindings"
++    __table_args__ = (
++        UniqueConstraint("channel_id", "message_id", name="uq_telegram_binding_message"),
++        ForeignKeyConstraint(
++            ["channel_id", "message_id"],
++            ["telegram_channel_files.channel_id", "telegram_channel_files.message_id"],
++            ondelete="RESTRICT",
++            name="fk_telegram_binding_file",
++        ),
++    )
++
++    part_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("video_parts.id", ondelete="CASCADE"), primary_key=True
++    )
++    channel_id: Mapped[int] = mapped_column(BigInteger)
++    message_id: Mapped[int] = mapped_column(BigInteger().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"))
++    matched_by: Mapped[str] = mapped_column(String(64), default="exact_filename_size")
++    linked_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+ 
+ 
+ class VideoPartBuildJob(Base):
+diff --git a/packages/python_common/streamhub_common/settings.py b/packages/python_common/streamhub_common/settings.py
+index 4356122e537365df44d49a14e846892df78bec53..98151ea2a9cc8ba0a39dad77b1d40de1473e0b24 100644
+--- a/packages/python_common/streamhub_common/settings.py
++++ b/packages/python_common/streamhub_common/settings.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ from functools import lru_cache
+ 
+-from pydantic import Field
++from pydantic import AliasChoices, Field
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
+ 
+@@ -59,6 +59,16 @@ class Settings(BaseSettings):
+     part_build_allow_during_capture: bool = Field(default=False, alias="PART_BUILD_ALLOW_DURING_CAPTURE")
+     part_build_lease_seconds: int = Field(default=30, ge=10, alias="PART_BUILD_LEASE_SECONDS")
+ 
++    telegram_api_id: str | None = Field(default=None, alias="TELEGRAM_API_ID")
++    telegram_api_hash: str | None = Field(default=None, alias="TELEGRAM_API_HASH")
++    telegram_channel_id: str | None = Field(default=None, alias="TELEGRAM_CHANNEL_ID")
++    telegram_session_name: str | None = Field(
++        default=None, validation_alias=AliasChoices("TELEGRAM_SESSION_NAME", "SESSION_NAME")
++    )
++    telegram_state_root: str = Field(default="/telegram_state", alias="TELEGRAM_STATE_ROOT")
++    telegram_sync_interval_seconds: int = Field(default=20, ge=5, alias="TELEGRAM_SYNC_INTERVAL_SECONDS")
++    telegram_max_parallel_downloads: int = Field(default=4, ge=1, le=16, alias="TELEGRAM_MAX_PARALLEL_DOWNLOADS")
++
+     twitch_client_id: str = Field(alias="TWITCH_CLIENT_ID")
+     twitch_client_secret: str | None = Field(default=None, alias="TWITCH_CLIENT_SECRET")
+     twitch_legacy_oauth_token: str | None = Field(default=None, alias="TWITCH_LEGACY_OAUTH_TOKEN")
+diff --git a/packages/python_common/streamhub_common/telegram_names.py b/packages/python_common/streamhub_common/telegram_names.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10674d45c5b79ddc2d7ce6af4e99aa2efa2c715b
+--- /dev/null
++++ b/packages/python_common/streamhub_common/telegram_names.py
+@@ -0,0 +1,81 @@
++from __future__ import annotations
++
++import re
++from pathlib import PurePath
++
++
++_PART_RE = re.compile(r"(?:^|_+)part_?(\d{1,9})(?:_+|\.|$)", re.IGNORECASE)
++_SEG_RE = re.compile(
++    r"(?:^|_+)(?:seg_?|s)(\d{1,9})[-_]+(?:seg_?|s)?(\d{1,9})(?:_+|\.|$)",
++    re.IGNORECASE,
++)
++
++
++def _stem(name: str) -> str:
++    return PurePath(str(name).strip()).name.lower()
++
++
++def canonical_part_identity(name: str) -> tuple[str, int, int, int] | None:
++    """Return the stable identity encoded in a modern StreamHub part filename.
++
++    Current StreamHub names look like::
++
++        vp_<sessionhex>__part0001__s000001-s000011.ts
++
++    The previous StreamHub used ``part_000001__seg_...``. Telegram Desktop may
++    normalize punctuation during a manual document upload, so identity matching
++    deliberately ignores separators while retaining the session UUID, part number
++    and segment range. Legacy names without the ``vp_<session>`` prefix continue to
++    require literal filename equality.
++    """
++
++    value = _stem(name)
++    if not value.startswith("vp_"):
++        return None
++
++    part_match = _PART_RE.search(value)
++    seg_match = _SEG_RE.search(value)
++    if part_match is None or seg_match is None:
++        return None
++
++    session_text = value[3 : part_match.start()]
++    session_hex = re.sub(r"[^0-9a-f]", "", session_text)
++    if len(session_hex) != 32:
++        return None
++
++    part_no = int(part_match.group(1))
++    start_segment = int(seg_match.group(1))
++    end_segment = int(seg_match.group(2))
++    if part_no <= 0 or start_segment <= 0 or end_segment < start_segment:
++        return None
++    return session_hex, part_no, start_segment, end_segment
++
++
++def filenames_equivalent(expected_name: str, actual_name: str) -> bool:
++    expected = _stem(expected_name)
++    actual = _stem(actual_name)
++    if expected == actual:
++        return True
++    expected_identity = canonical_part_identity(expected)
++    return expected_identity is not None and expected_identity == canonical_part_identity(actual)
++
++
++def filename_tokens(name: str) -> set[str]:
++    identity = canonical_part_identity(name)
++    if identity is not None:
++        session_hex, part_no, start_segment, end_segment = identity
++        return {
++            f"session:{session_hex}",
++            f"part:{part_no:06d}",
++            f"seg:{start_segment:06d}-{end_segment:06d}",
++        }
++
++    value = _stem(name)
++    tokens: set[str] = set()
++    part = _PART_RE.search(value)
++    if part:
++        tokens.add(f"part:{int(part.group(1)):06d}")
++    seg = _SEG_RE.search(value)
++    if seg:
++        tokens.add(f"seg:{int(seg.group(1)):06d}-{int(seg.group(2)):06d}")
++    return tokens
+diff --git a/requirements.txt b/requirements.txt
+index 4528aa74d4ebd734ebaca45af465b443c3851667..c887b9336428694dea548d9d3b96723c67b4ec6a 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -11,3 +11,4 @@ cryptography>=44,<47
+ PyJWT>=2.10,<3
+ websockets>=14,<16
+ python-multipart>=0.0.20,<1
++Telethon>=1.45,<2
+diff --git a/telegram-auth.ps1 b/telegram-auth.ps1
+new file mode 100644
+index 0000000000000000000000000000000000000000..41f4be2aa27beac058cc0573c89149fdda185d83
+--- /dev/null
++++ b/telegram-auth.ps1
+@@ -0,0 +1,17 @@
++$ErrorActionPreference = "Stop"
++Set-Location $PSScriptRoot
++
++$VenvDir = Join-Path $PSScriptRoot ".venv-telegram"
++$PythonExe = Join-Path $VenvDir "Scripts\python.exe"
++$Requirements = Join-Path $PSScriptRoot "tools\telegram_storage\requirements.txt"
++
++if (-not (Test-Path $PythonExe)) {
++    Write-Host "Creating local Telegram authorization environment..."
++    python -m venv $VenvDir
++}
++
++& $PythonExe -m pip install --disable-pip-version-check -q -r $Requirements
++if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
++
++& $PythonExe .\tools\telegram_storage\auth_qr.py
++exit $LASTEXITCODE
+diff --git a/tests/test_telegram_storage.py b/tests/test_telegram_storage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..108f7113244d84dd98b9a3d57c764798ee65f8ca
+--- /dev/null
++++ b/tests/test_telegram_storage.py
+@@ -0,0 +1,97 @@
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++
++def load_telegram_names():
++    root = Path(__file__).resolve().parents[1]
++    path = root / "packages/python_common/streamhub_common/telegram_names.py"
++    spec = importlib.util.spec_from_file_location("streamhub_test_telegram_names", path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_current_part_name_survives_telegram_punctuation_normalization():
++    names = load_telegram_names()
++    expected = "vp_207cbe6fb58f4b35a18d3767a71683e2__part0001__s000001-s000011.ts"
++    normalized = "vp_207cbe6f_b58f_4b35_a18d_3767a71683e2_part0001_s000001_s000011.ts"
++    assert names.canonical_part_identity(expected) == (
++        "207cbe6fb58f4b35a18d3767a71683e2",
++        1,
++        1,
++        11,
++    )
++    assert names.filenames_equivalent(expected, normalized)
++    assert not names.filenames_equivalent(expected, normalized.replace("s000011", "s000012"))
++
++
++def test_legacy_part_name_is_still_understood_for_reconciliation():
++    names = load_telegram_names()
++    legacy = "vp_207cbe6f-b58f-4b35-a18d-3767a71683e2__part_000001__seg_000001-000011.ts"
++    normalized = "vp_207cbe6f_b58f_4b35_a18d_3767a71683e2_part_000001_seg_000001_000011.ts"
++    assert names.canonical_part_identity(legacy) == (
++        "207cbe6fb58f4b35a18d3767a71683e2",
++        1,
++        1,
++        11,
++    )
++    assert names.filenames_equivalent(legacy, normalized)
++
++
++def test_telegram_storage_is_read_only_user_session_pipeline():
++    root = Path(__file__).resolve().parents[1]
++    storage = (root / "apps/api/app/telegram/storage.py").read_text()
++    runtime = (root / "apps/api/app/telegram/runtime.py").read_text()
++    routes = (root / "apps/api/app/routers/telegram.py").read_text()
++    compose = (root / "docker-compose.yml").read_text()
++
++    assert "TelegramClient" in storage
++    assert "is_user_authorized" in storage
++    assert "iter_messages" in storage
++    assert "iter_download" in storage
++    assert "send_message" not in storage
++    assert "send_file" not in storage
++    assert "upload_file" not in storage
++    assert "bot_token" not in storage.lower()
++    assert "telegram-readonly-sync" in runtime
++    assert '@router.post("/sync")' in routes
++    assert "./telegram_state:/telegram_state" in compose
++
++
++def test_telegram_schema_binds_part_to_channel_message_and_backfills_offsets():
++    root = Path(__file__).resolve().parents[1]
++    migration = (root / "migrations/versions/0009_telegram_storage.py").read_text()
++    models = (root / "packages/python_common/streamhub_common/models.py").read_text()
++    video = (root / "apps/api/app/routers/video.py").read_text()
++
++    assert 'down_revision = "0008_video_parts"' in migration
++    for table in ("telegram_channel_state", "telegram_channel_files", "telegram_video_part_bindings"):
++        assert f'"{table}"' in migration
++    assert 'op.add_column(' in migration
++    assert '"part_offset_bytes"' in migration
++    assert "ORDER BY part_id,segment_no,id" in migration
++    assert 'name="uq_telegram_binding_message"' in migration
++    assert 'name="fk_telegram_binding_file"' in migration
++    assert "class TelegramVideoPartBinding" in models
++    assert "part_offset_bytes: Mapped[int]" in models
++    assert "part_offset_bytes=part_offset_bytes" in video
++    assert "part_offset_bytes += int(segment.bytes)" in video
++
++
++def test_playback_reads_only_the_required_part_byte_range():
++    root = Path(__file__).resolve().parents[1]
++    playback = (root / "apps/api/app/telegram/playback.py").read_text()
++    routes = (root / "apps/api/app/routers/playback.py").read_text()
++    web = (root / "apps/web/src/main.tsx").read_text()
++
++    assert 'VideoPartSegment.part_offset_bytes' in playback
++    assert 'offset=int(row["part_offset_bytes"]) + requested.start' in playback
++    assert "iter_document_range" in playback
++    assert '@router.get("/segments/{part_id}/{segment_no}.ts")' in routes
++    assert '@router.get("/parts/{part_id}.ts")' in routes
++    assert "Telegram sync" in web
++    assert "telegramBindings[part.id]" in web
++    assert "TelegramVideoPlayer" in web
+diff --git a/tools/telegram_storage/auth_qr.py b/tools/telegram_storage/auth_qr.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d603e9adebcb1c8e12b9767ef8a0052a4e04ce54
+--- /dev/null
++++ b/tools/telegram_storage/auth_qr.py
+@@ -0,0 +1,156 @@
++from __future__ import annotations
++
++import asyncio
++import getpass
++import os
++import re
++import sys
++from pathlib import Path
++
++import qrcode
++from telethon import TelegramClient, errors, utils
++
++
++PROJECT_ROOT = Path(__file__).resolve().parents[2]
++ENV_PATH = PROJECT_ROOT / ".env"
++STATE_ROOT = PROJECT_ROOT / "telegram_state"
++QR_PATH = STATE_ROOT / "telegram-login-qr.png"
++
++
++def load_dotenv(path: Path) -> dict[str, str]:
++    if not path.is_file():
++        raise RuntimeError(f"missing {path}; create .env first")
++    result: dict[str, str] = {}
++    for raw in path.read_text(encoding="utf-8-sig").splitlines():
++        line = raw.strip()
++        if not line or line.startswith("#") or "=" not in line:
++            continue
++        key, value = line.split("=", 1)
++        value = value.strip()
++        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
++            value = value[1:-1]
++        result[key.strip()] = value
++    return result
++
++
++def require_config(env: dict[str, str]) -> tuple[int, str, str, int | None]:
++    session_name = (env.get("TELEGRAM_SESSION_NAME") or env.get("SESSION_NAME") or "").strip()
++    required = {
++        "TELEGRAM_API_ID": (env.get("TELEGRAM_API_ID") or "").strip(),
++        "TELEGRAM_API_HASH": (env.get("TELEGRAM_API_HASH") or "").strip(),
++        "SESSION_NAME": session_name,
++    }
++    missing = [key for key, value in required.items() if not value]
++    if missing:
++        raise RuntimeError("not configured: " + ", ".join(missing))
++    try:
++        api_id = int(required["TELEGRAM_API_ID"])
++    except ValueError as exc:
++        raise RuntimeError("TELEGRAM_API_ID must be numeric") from exc
++    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", session_name):
++        raise RuntimeError("SESSION_NAME may contain only A-Z, a-z, 0-9, _ and -")
++    raw_channel = (env.get("TELEGRAM_CHANNEL_ID") or "").strip()
++    channel_id = int(raw_channel) if raw_channel else None
++    return api_id, required["TELEGRAM_API_HASH"], session_name, channel_id
++
++
++def show_qr(url: str) -> None:
++    STATE_ROOT.mkdir(parents=True, exist_ok=True)
++    code = qrcode.QRCode(border=2)
++    code.add_data(url)
++    code.make(fit=True)
++    print("\nScan in Telegram: Settings -> Devices -> Link Desktop Device\n")
++    try:
++        code.print_ascii(invert=True)
++    except Exception:
++        pass
++    image = code.make_image(fill_color="black", back_color="white")
++    image.save(QR_PATH)
++    print(f"\nQR image: {QR_PATH}")
++    if os.name == "nt":
++        try:
++            os.startfile(QR_PATH)  # type: ignore[attr-defined]
++        except OSError:
++            pass
++
++
++async def resolve_channel(client: TelegramClient, configured: int):
++    async for dialog in client.iter_dialogs():
++        entity = dialog.entity
++        try:
++            peer_id = int(utils.get_peer_id(entity))
++            raw_id = int(getattr(entity, "id", 0) or 0)
++        except Exception:
++            continue
++        if peer_id == configured or raw_id == configured:
++            return entity
++    return await client.get_entity(configured)
++
++
++async def main() -> int:
++    env = load_dotenv(ENV_PATH)
++    api_id, api_hash, session_name, channel_id = require_config(env)
++    STATE_ROOT.mkdir(parents=True, exist_ok=True)
++    session_base = STATE_ROOT / session_name
++    client = TelegramClient(str(session_base), api_id, api_hash)
++    await client.connect()
++    try:
++        if not await client.is_user_authorized():
++            print("Starting Telegram user QR login.")
++            while not await client.is_user_authorized():
++                qr = await client.qr_login()
++                show_qr(qr.url)
++                try:
++                    await qr.wait()
++                except asyncio.TimeoutError:
++                    print("QR expired; creating another one...")
++                    continue
++                except errors.SessionPasswordNeededError:
++                    await client.sign_in(password=getpass.getpass("Telegram 2FA password: "))
++                    break
++        me = await client.get_me()
++        if me is None:
++            raise RuntimeError("Telegram did not return the authorized user")
++        print(f"Authorized user id={me.id} username=@{getattr(me, 'username', '') or '-'}")
++        print(f"Session: {session_base}.session")
++
++        if channel_id is not None:
++            channel = await resolve_channel(client, channel_id)
++            normalized = int(utils.get_peer_id(channel))
++            title = getattr(channel, "title", None) or getattr(channel, "username", None) or normalized
++            print(f"Channel: {title} | peer_id={normalized}")
++            if normalized != channel_id:
++                print(f"Set TELEGRAM_CHANNEL_ID={normalized} in .env")
++        else:
++            print("\nTELEGRAM_CHANNEL_ID is empty. Available channels/supergroups:")
++            shown = 0
++            async for dialog in client.iter_dialogs():
++                try:
++                    peer_id = int(utils.get_peer_id(dialog.entity))
++                except Exception:
++                    continue
++                if peer_id > -1000000000000:
++                    continue
++                title = getattr(dialog.entity, "title", None) or dialog.name
++                print(f"  {peer_id}  {title}")
++                shown += 1
++                if shown >= 100:
++                    break
++            print("Copy the required peer_id to TELEGRAM_CHANNEL_ID in .env.")
++        return 0
++    finally:
++        await client.disconnect()
++        try:
++            QR_PATH.unlink(missing_ok=True)
++        except OSError:
++            pass
++
++
++if __name__ == "__main__":
++    try:
++        raise SystemExit(asyncio.run(main()))
++    except KeyboardInterrupt:
++        raise SystemExit(130)
++    except Exception as exc:
++        print(f"ERROR: {exc}", file=sys.stderr)
++        raise SystemExit(1)
+diff --git a/tools/telegram_storage/requirements.txt b/tools/telegram_storage/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e5d37e26bd94191e5aaa8cd2a79b1f13803da9e
+--- /dev/null
++++ b/tools/telegram_storage/requirements.txt
+@@ -0,0 +1,2 @@
++Telethon>=1.45,<2
++qrcode[pil]>=8.2,<9
