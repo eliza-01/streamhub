@@ -466,7 +466,18 @@ async def mark_failed(job_id: int, part_id: uuid.UUID, exc: BaseException) -> No
 
 async def worker_loop(worker_no: int) -> None:
     while not shutdown.is_set():
-        claimed = await claim_job()
+        try:
+            claimed = await claim_job()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A transient DB/capture-state failure must not kill the durable queue worker.
+            logger.exception("part queue claim failed worker=%s; retrying", worker_no)
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=1.0)
+            except TimeoutError:
+                pass
+            continue
         if claimed is None:
             wakeup.clear()
             try:
@@ -480,6 +491,8 @@ async def worker_loop(worker_no: int) -> None:
             logger.info("part build start worker=%s job=%s part=%s", worker_no, job_id, part_id)
             await build_part(job_id, part_id)
             logger.info("part build ready worker=%s job=%s part=%s", worker_no, job_id, part_id)
+        except asyncio.CancelledError:
+            raise
         except (Exception, MemoryError) as exc:
             logger.exception("part build failed worker=%s job=%s part=%s", worker_no, job_id, part_id)
             await mark_failed(job_id, part_id, exc)
@@ -534,7 +547,16 @@ async def health_ready() -> dict:
         roots["root2"] = str(configured_output_root("root2"))
     for value in roots.values():
         Path(value).mkdir(parents=True, exist_ok=True)
-    return {"status": "ready", "workers": settings.part_build_workers, "chunk_bytes": settings.part_build_chunk_bytes, "roots": roots}
+    workers_alive = sum(1 for task in worker_tasks if not task.done())
+    if worker_tasks and workers_alive == 0:
+        raise HTTPException(503, "all part-builder workers stopped")
+    return {
+        "status": "ready",
+        "workers": settings.part_build_workers,
+        "workers_alive": workers_alive,
+        "chunk_bytes": settings.part_build_chunk_bytes,
+        "roots": roots,
+    }
 
 
 @app.post("/internal/v1/capture-priority/quiesce", dependencies=[Depends(require_internal_token)])

@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     video_stop_timeout_seconds: int = Field(default=20, ge=5, alias="VIDEO_STOP_TIMEOUT_SECONDS")
     part_build_workers: int = Field(default=2, ge=1, le=4, alias="PART_BUILD_WORKERS")
     part_build_chunk_bytes: int = Field(default=524288, ge=65536, alias="PART_BUILD_CHUNK_BYTES")
-    part_build_target_mib_default: int = Field(default=1024, ge=1, alias="PART_BUILD_TARGET_MIB_DEFAULT")
+    part_build_target_mib_default: int = Field(default=1990, ge=1, alias="PART_BUILD_TARGET_MIB_DEFAULT")
     part_build_allow_during_capture: bool = Field(default=False, alias="PART_BUILD_ALLOW_DURING_CAPTURE")
     part_build_lease_seconds: int = Field(default=30, ge=10, alias="PART_BUILD_LEASE_SECONDS")
 

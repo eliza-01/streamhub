@@ -163,3 +163,10 @@ td { font-variant-numeric: tabular-nums; }
   .part-plan { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .video-manager-session { grid-template-columns: 1fr; }
 }
+.part-plan-all { margin-top: 14px; display: grid; gap: 10px; }
+.part-plan-all .part-plan { margin-top: 0; }
+.part-plan-all-list { max-height: 320px; overflow: auto; border: 1px solid #e2e5ea; border-radius: 10px; background: #fff; }
+.part-plan-all-row { display: flex; justify-content: space-between; gap: 16px; padding: 9px 11px; border-bottom: 1px solid #eceff3; font-size: 12px; }
+.part-plan-all-row:last-child { border-bottom: 0; }
+.part-plan-all-row span { color: #6b7280; text-align: right; }
+@media (max-width: 760px) { .part-plan-all-row { flex-direction: column; gap: 4px; } .part-plan-all-row span { text-align: left; } }

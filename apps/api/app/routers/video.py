@@ -38,6 +38,7 @@ class PartPlanRequest(BaseModel):
     from_segment_no: int = Field(ge=1)
     to_segment_no: int | None = Field(default=None, ge=1)
     target_mib: int | None = Field(default=None, ge=1, le=102400)
+    segment_count: int | None = Field(default=None, ge=1, le=10000)
 
 
 class PartCreateRequest(PartPlanRequest):
@@ -120,12 +121,14 @@ async def plan_part_range(
     session = await db.get(VideoSession, session_id)
     if session is None or session.deleted_at_utc is not None:
         raise HTTPException(404, "video session not found")
-    if payload.mode not in {"manual", "target"}:
-        raise HTTPException(400, "mode must be manual or target")
+    if payload.mode not in {"manual", "target", "count"}:
+        raise HTTPException(400, "mode must be manual, target or count")
     if payload.mode == "manual" and payload.to_segment_no is None:
         raise HTTPException(400, "to_segment_no is required for manual mode")
     if payload.mode == "manual" and int(payload.to_segment_no or 0) < payload.from_segment_no:
         raise HTTPException(400, "to_segment_no must be >= from_segment_no")
+    if payload.mode == "count" and payload.segment_count is None:
+        raise HTTPException(400, "segment_count is required for count mode")
 
     stmt = (
         select(VideoSegment, VideoRun.run_no)
@@ -163,6 +166,7 @@ async def plan_part_range(
     total_duration = 0
     warnings: list[str] = []
     target_bytes = int((payload.target_mib or settings.part_build_target_mib_default) * 1024 * 1024)
+    requested_count = int(payload.segment_count or 0)
 
     for segment, row_run_no in rows:
         if segment.segment_no != expected_next:
@@ -183,9 +187,7 @@ async def plan_part_range(
             warnings.append(f"stopped_before_not_ready:{segment.segment_no}")
             break
         if segment.id in reserved_ids:
-            if payload.mode == "manual":
-                raise HTTPException(409, f"segment #{segment.segment_no} is already reserved by another part")
-            if not selected:
+            if payload.mode == "manual" or not selected:
                 raise HTTPException(409, f"segment #{segment.segment_no} is already reserved by another part")
             warnings.append(f"stopped_before_reserved:{segment.segment_no}")
             break
@@ -195,6 +197,8 @@ async def plan_part_range(
         expected_next += 1
         if payload.mode == "target" and total_bytes >= target_bytes:
             break
+        if payload.mode == "count" and len(selected) >= requested_count:
+            break
 
     if not selected:
         raise HTTPException(409, "no buildable segments are available from the requested start")
@@ -202,6 +206,8 @@ async def plan_part_range(
         raise HTTPException(409, "manual range is incomplete")
     if payload.mode == "target" and total_bytes < target_bytes:
         warnings.append("target_not_reached_before_available_range_end")
+    if payload.mode == "count" and len(selected) < requested_count:
+        warnings.append("segment_count_not_reached_before_available_range_end")
 
     plan = {
         "mode": payload.mode,
@@ -211,10 +217,130 @@ async def plan_part_range(
         "segment_count": len(selected),
         "expected_bytes": total_bytes,
         "duration_ms": total_duration,
-        "target_mib": payload.target_mib or settings.part_build_target_mib_default if payload.mode == "target" else None,
+        "target_mib": (payload.target_mib or settings.part_build_target_mib_default) if payload.mode == "target" else None,
+        "requested_segment_count": requested_count if payload.mode == "count" else None,
         "warnings": warnings,
     }
     return session, selected, int(run_no or 0), plan
+
+
+def _all_chunk_limit(payload: PartPlanRequest) -> int | None:
+    if payload.mode == "manual":
+        if payload.to_segment_no is None or payload.to_segment_no < payload.from_segment_no:
+            raise HTTPException(400, "valid to_segment_no is required for manual mode")
+        return int(payload.to_segment_no - payload.from_segment_no + 1)
+    if payload.mode == "count":
+        if payload.segment_count is None:
+            raise HTTPException(400, "segment_count is required for count mode")
+        return int(payload.segment_count)
+    if payload.mode == "target":
+        return None
+    raise HTTPException(400, "mode must be manual, target or count")
+
+
+async def plan_all_part_ranges(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    payload: PartPlanRequest,
+    *,
+    lock: bool = False,
+) -> tuple[VideoSession, list[tuple[list[VideoSegment], int, dict]], list[str]]:
+    session = await db.get(VideoSession, session_id)
+    if session is None or session.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    chunk_limit = _all_chunk_limit(payload)
+    target_bytes = int((payload.target_mib or settings.part_build_target_mib_default) * 1024 * 1024)
+
+    stmt = (
+        select(VideoSegment, VideoRun.run_no)
+        .join(VideoRun, VideoRun.id == VideoSegment.video_run_id)
+        .where(
+            VideoSegment.video_session_id == session_id,
+            VideoSegment.segment_no >= payload.from_segment_no,
+        )
+        .order_by(VideoSegment.segment_no)
+        .limit(100000)
+    )
+    if lock:
+        stmt = stmt.with_for_update()
+    rows = (await db.execute(stmt)).all()
+    if not rows:
+        raise HTTPException(409, "no segments are available from the requested start")
+
+    segment_ids = [segment.id for segment, _ in rows]
+    reserved_ids = set(
+        (await db.execute(select(VideoPartSegment.segment_id).where(VideoPartSegment.segment_id.in_(segment_ids)))).scalars().all()
+    ) if segment_ids else set()
+
+    plans: list[tuple[list[VideoSegment], int, dict]] = []
+    skipped: list[str] = []
+    current: list[VideoSegment] = []
+    current_run: int | None = None
+    current_bytes = 0
+    current_duration = 0
+    previous_no: int | None = None
+
+    def flush(*, partial: bool = False) -> None:
+        nonlocal current, current_run, current_bytes, current_duration
+        if not current or current_run is None:
+            return
+        warnings: list[str] = []
+        if partial:
+            warnings.append("partial_final_chunk")
+        plans.append((current, current_run, {
+            "mode": payload.mode,
+            "from_segment_no": current[0].segment_no,
+            "end_segment_no": current[-1].segment_no,
+            "run_no": current_run,
+            "segment_count": len(current),
+            "expected_bytes": current_bytes,
+            "duration_ms": current_duration,
+            "target_mib": (payload.target_mib or settings.part_build_target_mib_default) if payload.mode == "target" else None,
+            "requested_segment_count": int(payload.segment_count or 0) if payload.mode == "count" else None,
+            "warnings": warnings,
+        }))
+        current = []
+        current_run = None
+        current_bytes = 0
+        current_duration = 0
+
+    for segment, row_run_no in rows:
+        run_no = int(row_run_no)
+        buildable = (
+            segment.storage_state == "archive_ready"
+            and segment.integrity_state == "hashed"
+            and bool(segment.sha256)
+            and segment.id not in reserved_ids
+        )
+        boundary = bool(current) and (
+            (previous_no is not None and segment.segment_no != previous_no + 1)
+            or run_no != current_run
+        )
+        if boundary:
+            flush(partial=True)
+        if not buildable:
+            flush(partial=True)
+            reason = "reserved" if segment.id in reserved_ids else "not_ready"
+            skipped.append(f"{reason}:{segment.segment_no}")
+            previous_no = segment.segment_no
+            continue
+        if not current:
+            current_run = run_no
+        current.append(segment)
+        current_bytes += int(segment.bytes)
+        current_duration += int(segment.duration_ms)
+        previous_no = segment.segment_no
+
+        reached = (chunk_limit is not None and len(current) >= chunk_limit) or (
+            payload.mode == "target" and current_bytes >= target_bytes
+        )
+        if reached:
+            flush()
+
+    flush(partial=True)
+    if not plans:
+        raise HTTPException(409, "no buildable unreserved segments are available")
+    return session, plans, skipped
 
 
 def video_progress_percent(row: VideoSession) -> float | None:
@@ -637,28 +763,39 @@ async def plan_video_part(
     return plan
 
 
-@router.post("/video-sessions/{session_id}/parts")
-async def create_video_part(
+@router.post("/video-sessions/{session_id}/parts/plan-all")
+async def plan_all_video_parts(
     session_id: uuid.UUID,
-    payload: PartCreateRequest,
+    payload: PartPlanRequest,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
-    session, segments, run_no, plan = await plan_part_range(db, session_id, payload, lock=True)
-    part_no = int(
-        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
-        or 0
-    ) + 1
+    _session, planned, skipped = await plan_all_part_ranges(db, session_id, payload)
+    items = [plan for _segments, _run_no, plan in planned]
+    return {
+        "items": items,
+        "part_count": len(items),
+        "segment_count": sum(item["segment_count"] for item in items),
+        "expected_bytes": sum(item["expected_bytes"] for item in items),
+        "duration_ms": sum(item["duration_ms"] for item in items),
+        "skipped": skipped,
+    }
+
+
+async def _reserve_video_part(
+    db: AsyncSession,
+    *,
+    session: VideoSession,
+    session_id: uuid.UUID,
+    segments: list[VideoSegment],
+    run_no: int,
+    plan: dict,
+    part_no: int,
+    queued_status: str,
+) -> tuple[VideoPart, VideoPartBuildJob]:
     file_name = _part_file_name(session_id, part_no, segments[0].segment_no, segments[-1].segment_no)
     metadata = session.metadata_json or {}
     output_subdir = str(metadata.get("output_subdir") or "streamhub").strip("/\\")
     relative_path = f"{output_subdir}/twitch/events/{session.event_id}/video/{session.id}/parts/{file_name}"
-    active_capture = await db.scalar(
-        select(VideoSession.id)
-        .where(VideoSession.deleted_at_utc.is_(None), VideoSession.status.in_(ACTIVE_VIDEO_STATUSES))
-        .limit(1)
-    )
-    queued_status = "waiting_capture_idle" if active_capture is not None else "queued"
     part = VideoPart(
         id=uuid.uuid4(),
         video_session_id=session_id,
@@ -690,6 +827,34 @@ async def create_video_part(
         total_bytes=plan["expected_bytes"],
     )
     db.add(job)
+    return part, job
+
+
+async def _queued_part_status(db: AsyncSession) -> str:
+    active_capture = await db.scalar(
+        select(VideoSession.id)
+        .where(VideoSession.deleted_at_utc.is_(None), VideoSession.status.in_(ACTIVE_VIDEO_STATUSES))
+        .limit(1)
+    )
+    return "waiting_capture_idle" if active_capture is not None else "queued"
+
+
+@router.post("/video-sessions/{session_id}/parts")
+async def create_video_part(
+    session_id: uuid.UUID,
+    payload: PartCreateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
+    session, segments, run_no, plan = await plan_part_range(db, session_id, payload, lock=True)
+    part_no = int(
+        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
+        or 0
+    ) + 1
+    queued_status = await _queued_part_status(db)
+    part, job = await _reserve_video_part(
+        db, session=session, session_id=session_id, segments=segments, run_no=run_no, plan=plan, part_no=part_no, queued_status=queued_status
+    )
     await db.commit()
     await db.refresh(part)
     await db.refresh(job)
@@ -703,6 +868,51 @@ async def create_video_part(
     data["plan"] = plan
     data["builder_wakeup_error"] = wakeup_error
     return data
+
+
+@router.post("/video-sessions/{session_id}/parts/build-all")
+async def create_all_video_parts(
+    session_id: uuid.UUID,
+    payload: PartCreateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
+    session, planned, skipped = await plan_all_part_ranges(db, session_id, payload, lock=True)
+    next_part_no = int(
+        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
+        or 0
+    ) + 1
+    queued_status = await _queued_part_status(db)
+    created: list[tuple[VideoPart, VideoPartBuildJob, dict]] = []
+    for offset, (segments, run_no, plan) in enumerate(planned):
+        part, job = await _reserve_video_part(
+            db,
+            session=session,
+            session_id=session_id,
+            segments=segments,
+            run_no=run_no,
+            plan=plan,
+            part_no=next_part_no + offset,
+            queued_status=queued_status,
+        )
+        created.append((part, job, plan))
+    await db.commit()
+    for part, job, _plan in created:
+        await db.refresh(part)
+        await db.refresh(job)
+
+    wakeup_error = None
+    if created:
+        try:
+            await part_builder_post(f"/internal/v1/parts/{created[0][0].id}/enqueue", {})
+        except HTTPException as exc:
+            wakeup_error = str(exc.detail)
+    return {
+        "items": [{**part_dict(part, job), "plan": plan} for part, job, plan in created],
+        "part_count": len(created),
+        "skipped": skipped,
+        "builder_wakeup_error": wakeup_error,
+    }
 
 
 @router.get("/video-sessions/{session_id}/parts")

@@ -1,0 +1,755 @@
+diff --git a/.env.example b/.env.example
+index 0bd3103..8747bfa 100644
+--- a/.env.example
++++ b/.env.example
+@@ -178,6 +178,6 @@ VIDEO_SPOOL_MIN_FREE_BYTES=536870912
+ VIDEO_ARCHIVE_MIN_FREE_BYTES=1073741824
+ PART_BUILD_WORKERS=2
+ PART_BUILD_CHUNK_BYTES=524288
+-PART_BUILD_TARGET_MIB_DEFAULT=1024
++PART_BUILD_TARGET_MIB_DEFAULT=1990
+ PART_BUILD_ALLOW_DURING_CAPTURE=false
+ PART_BUILD_LEASE_SECONDS=30
+diff --git a/apps/api/app/routers/video.py b/apps/api/app/routers/video.py
+index a9e9f2d..ad9ceaa 100644
+--- a/apps/api/app/routers/video.py
++++ b/apps/api/app/routers/video.py
+@@ -38,6 +38,7 @@ class PartPlanRequest(BaseModel):
+     from_segment_no: int = Field(ge=1)
+     to_segment_no: int | None = Field(default=None, ge=1)
+     target_mib: int | None = Field(default=None, ge=1, le=102400)
++    segment_count: int | None = Field(default=None, ge=1, le=10000)
+ 
+ 
+ class PartCreateRequest(PartPlanRequest):
+@@ -120,12 +121,14 @@ async def plan_part_range(
+     session = await db.get(VideoSession, session_id)
+     if session is None or session.deleted_at_utc is not None:
+         raise HTTPException(404, "video session not found")
+-    if payload.mode not in {"manual", "target"}:
+-        raise HTTPException(400, "mode must be manual or target")
++    if payload.mode not in {"manual", "target", "count"}:
++        raise HTTPException(400, "mode must be manual, target or count")
+     if payload.mode == "manual" and payload.to_segment_no is None:
+         raise HTTPException(400, "to_segment_no is required for manual mode")
+     if payload.mode == "manual" and int(payload.to_segment_no or 0) < payload.from_segment_no:
+         raise HTTPException(400, "to_segment_no must be >= from_segment_no")
++    if payload.mode == "count" and payload.segment_count is None:
++        raise HTTPException(400, "segment_count is required for count mode")
+ 
+     stmt = (
+         select(VideoSegment, VideoRun.run_no)
+@@ -163,6 +166,7 @@ async def plan_part_range(
+     total_duration = 0
+     warnings: list[str] = []
+     target_bytes = int((payload.target_mib or settings.part_build_target_mib_default) * 1024 * 1024)
++    requested_count = int(payload.segment_count or 0)
+ 
+     for segment, row_run_no in rows:
+         if segment.segment_no != expected_next:
+@@ -183,9 +187,7 @@ async def plan_part_range(
+             warnings.append(f"stopped_before_not_ready:{segment.segment_no}")
+             break
+         if segment.id in reserved_ids:
+-            if payload.mode == "manual":
+-                raise HTTPException(409, f"segment #{segment.segment_no} is already reserved by another part")
+-            if not selected:
++            if payload.mode == "manual" or not selected:
+                 raise HTTPException(409, f"segment #{segment.segment_no} is already reserved by another part")
+             warnings.append(f"stopped_before_reserved:{segment.segment_no}")
+             break
+@@ -195,6 +197,8 @@ async def plan_part_range(
+         expected_next += 1
+         if payload.mode == "target" and total_bytes >= target_bytes:
+             break
++        if payload.mode == "count" and len(selected) >= requested_count:
++            break
+ 
+     if not selected:
+         raise HTTPException(409, "no buildable segments are available from the requested start")
+@@ -202,6 +206,8 @@ async def plan_part_range(
+         raise HTTPException(409, "manual range is incomplete")
+     if payload.mode == "target" and total_bytes < target_bytes:
+         warnings.append("target_not_reached_before_available_range_end")
++    if payload.mode == "count" and len(selected) < requested_count:
++        warnings.append("segment_count_not_reached_before_available_range_end")
+ 
+     plan = {
+         "mode": payload.mode,
+@@ -211,12 +217,132 @@ async def plan_part_range(
+         "segment_count": len(selected),
+         "expected_bytes": total_bytes,
+         "duration_ms": total_duration,
+-        "target_mib": payload.target_mib or settings.part_build_target_mib_default if payload.mode == "target" else None,
++        "target_mib": (payload.target_mib or settings.part_build_target_mib_default) if payload.mode == "target" else None,
++        "requested_segment_count": requested_count if payload.mode == "count" else None,
+         "warnings": warnings,
+     }
+     return session, selected, int(run_no or 0), plan
+ 
+ 
++def _all_chunk_limit(payload: PartPlanRequest) -> int | None:
++    if payload.mode == "manual":
++        if payload.to_segment_no is None or payload.to_segment_no < payload.from_segment_no:
++            raise HTTPException(400, "valid to_segment_no is required for manual mode")
++        return int(payload.to_segment_no - payload.from_segment_no + 1)
++    if payload.mode == "count":
++        if payload.segment_count is None:
++            raise HTTPException(400, "segment_count is required for count mode")
++        return int(payload.segment_count)
++    if payload.mode == "target":
++        return None
++    raise HTTPException(400, "mode must be manual, target or count")
++
++
++async def plan_all_part_ranges(
++    db: AsyncSession,
++    session_id: uuid.UUID,
++    payload: PartPlanRequest,
++    *,
++    lock: bool = False,
++) -> tuple[VideoSession, list[tuple[list[VideoSegment], int, dict]], list[str]]:
++    session = await db.get(VideoSession, session_id)
++    if session is None or session.deleted_at_utc is not None:
++        raise HTTPException(404, "video session not found")
++    chunk_limit = _all_chunk_limit(payload)
++    target_bytes = int((payload.target_mib or settings.part_build_target_mib_default) * 1024 * 1024)
++
++    stmt = (
++        select(VideoSegment, VideoRun.run_no)
++        .join(VideoRun, VideoRun.id == VideoSegment.video_run_id)
++        .where(
++            VideoSegment.video_session_id == session_id,
++            VideoSegment.segment_no >= payload.from_segment_no,
++        )
++        .order_by(VideoSegment.segment_no)
++        .limit(100000)
++    )
++    if lock:
++        stmt = stmt.with_for_update()
++    rows = (await db.execute(stmt)).all()
++    if not rows:
++        raise HTTPException(409, "no segments are available from the requested start")
++
++    segment_ids = [segment.id for segment, _ in rows]
++    reserved_ids = set(
++        (await db.execute(select(VideoPartSegment.segment_id).where(VideoPartSegment.segment_id.in_(segment_ids)))).scalars().all()
++    ) if segment_ids else set()
++
++    plans: list[tuple[list[VideoSegment], int, dict]] = []
++    skipped: list[str] = []
++    current: list[VideoSegment] = []
++    current_run: int | None = None
++    current_bytes = 0
++    current_duration = 0
++    previous_no: int | None = None
++
++    def flush(*, partial: bool = False) -> None:
++        nonlocal current, current_run, current_bytes, current_duration
++        if not current or current_run is None:
++            return
++        warnings: list[str] = []
++        if partial:
++            warnings.append("partial_final_chunk")
++        plans.append((current, current_run, {
++            "mode": payload.mode,
++            "from_segment_no": current[0].segment_no,
++            "end_segment_no": current[-1].segment_no,
++            "run_no": current_run,
++            "segment_count": len(current),
++            "expected_bytes": current_bytes,
++            "duration_ms": current_duration,
++            "target_mib": (payload.target_mib or settings.part_build_target_mib_default) if payload.mode == "target" else None,
++            "requested_segment_count": int(payload.segment_count or 0) if payload.mode == "count" else None,
++            "warnings": warnings,
++        }))
++        current = []
++        current_run = None
++        current_bytes = 0
++        current_duration = 0
++
++    for segment, row_run_no in rows:
++        run_no = int(row_run_no)
++        buildable = (
++            segment.storage_state == "archive_ready"
++            and segment.integrity_state == "hashed"
++            and bool(segment.sha256)
++            and segment.id not in reserved_ids
++        )
++        boundary = bool(current) and (
++            (previous_no is not None and segment.segment_no != previous_no + 1)
++            or run_no != current_run
++        )
++        if boundary:
++            flush(partial=True)
++        if not buildable:
++            flush(partial=True)
++            reason = "reserved" if segment.id in reserved_ids else "not_ready"
++            skipped.append(f"{reason}:{segment.segment_no}")
++            previous_no = segment.segment_no
++            continue
++        if not current:
++            current_run = run_no
++        current.append(segment)
++        current_bytes += int(segment.bytes)
++        current_duration += int(segment.duration_ms)
++        previous_no = segment.segment_no
++
++        reached = (chunk_limit is not None and len(current) >= chunk_limit) or (
++            payload.mode == "target" and current_bytes >= target_bytes
++        )
++        if reached:
++            flush()
++
++    flush(partial=True)
++    if not plans:
++        raise HTTPException(409, "no buildable unreserved segments are available")
++    return session, plans, skipped
++
++
+ def video_progress_percent(row: VideoSession) -> float | None:
+     if row.completeness_status == "complete":
+         return 100.0
+@@ -637,28 +763,39 @@ async def plan_video_part(
+     return plan
+ 
+ 
+-@router.post("/video-sessions/{session_id}/parts")
+-async def create_video_part(
++@router.post("/video-sessions/{session_id}/parts/plan-all")
++async def plan_all_video_parts(
+     session_id: uuid.UUID,
+-    payload: PartCreateRequest,
++    payload: PartPlanRequest,
+     db: AsyncSession = Depends(get_db),
+ ) -> dict:
+-    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
+-    session, segments, run_no, plan = await plan_part_range(db, session_id, payload, lock=True)
+-    part_no = int(
+-        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
+-        or 0
+-    ) + 1
++    _session, planned, skipped = await plan_all_part_ranges(db, session_id, payload)
++    items = [plan for _segments, _run_no, plan in planned]
++    return {
++        "items": items,
++        "part_count": len(items),
++        "segment_count": sum(item["segment_count"] for item in items),
++        "expected_bytes": sum(item["expected_bytes"] for item in items),
++        "duration_ms": sum(item["duration_ms"] for item in items),
++        "skipped": skipped,
++    }
++
++
++async def _reserve_video_part(
++    db: AsyncSession,
++    *,
++    session: VideoSession,
++    session_id: uuid.UUID,
++    segments: list[VideoSegment],
++    run_no: int,
++    plan: dict,
++    part_no: int,
++    queued_status: str,
++) -> tuple[VideoPart, VideoPartBuildJob]:
+     file_name = _part_file_name(session_id, part_no, segments[0].segment_no, segments[-1].segment_no)
+     metadata = session.metadata_json or {}
+     output_subdir = str(metadata.get("output_subdir") or "streamhub").strip("/\\")
+     relative_path = f"{output_subdir}/twitch/events/{session.event_id}/video/{session.id}/parts/{file_name}"
+-    active_capture = await db.scalar(
+-        select(VideoSession.id)
+-        .where(VideoSession.deleted_at_utc.is_(None), VideoSession.status.in_(ACTIVE_VIDEO_STATUSES))
+-        .limit(1)
+-    )
+-    queued_status = "waiting_capture_idle" if active_capture is not None else "queued"
+     part = VideoPart(
+         id=uuid.uuid4(),
+         video_session_id=session_id,
+@@ -690,6 +827,34 @@ async def create_video_part(
+         total_bytes=plan["expected_bytes"],
+     )
+     db.add(job)
++    return part, job
++
++
++async def _queued_part_status(db: AsyncSession) -> str:
++    active_capture = await db.scalar(
++        select(VideoSession.id)
++        .where(VideoSession.deleted_at_utc.is_(None), VideoSession.status.in_(ACTIVE_VIDEO_STATUSES))
++        .limit(1)
++    )
++    return "waiting_capture_idle" if active_capture is not None else "queued"
++
++
++@router.post("/video-sessions/{session_id}/parts")
++async def create_video_part(
++    session_id: uuid.UUID,
++    payload: PartCreateRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
++    session, segments, run_no, plan = await plan_part_range(db, session_id, payload, lock=True)
++    part_no = int(
++        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
++        or 0
++    ) + 1
++    queued_status = await _queued_part_status(db)
++    part, job = await _reserve_video_part(
++        db, session=session, session_id=session_id, segments=segments, run_no=run_no, plan=plan, part_no=part_no, queued_status=queued_status
++    )
+     await db.commit()
+     await db.refresh(part)
+     await db.refresh(job)
+@@ -705,6 +870,51 @@ async def create_video_part(
+     return data
+ 
+ 
++@router.post("/video-sessions/{session_id}/parts/build-all")
++async def create_all_video_parts(
++    session_id: uuid.UUID,
++    payload: PartCreateRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
++    session, planned, skipped = await plan_all_part_ranges(db, session_id, payload, lock=True)
++    next_part_no = int(
++        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
++        or 0
++    ) + 1
++    queued_status = await _queued_part_status(db)
++    created: list[tuple[VideoPart, VideoPartBuildJob, dict]] = []
++    for offset, (segments, run_no, plan) in enumerate(planned):
++        part, job = await _reserve_video_part(
++            db,
++            session=session,
++            session_id=session_id,
++            segments=segments,
++            run_no=run_no,
++            plan=plan,
++            part_no=next_part_no + offset,
++            queued_status=queued_status,
++        )
++        created.append((part, job, plan))
++    await db.commit()
++    for part, job, _plan in created:
++        await db.refresh(part)
++        await db.refresh(job)
++
++    wakeup_error = None
++    if created:
++        try:
++            await part_builder_post(f"/internal/v1/parts/{created[0][0].id}/enqueue", {})
++        except HTTPException as exc:
++            wakeup_error = str(exc.detail)
++    return {
++        "items": [{**part_dict(part, job), "plan": plan} for part, job, plan in created],
++        "part_count": len(created),
++        "skipped": skipped,
++        "builder_wakeup_error": wakeup_error,
++    }
++
++
+ @router.get("/video-sessions/{session_id}/parts")
+ async def list_video_parts(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+     session = await db.get(VideoSession, session_id)
+diff --git a/apps/video_part_builder/app/main.py b/apps/video_part_builder/app/main.py
+index 1f228ab..b6d4802 100644
+--- a/apps/video_part_builder/app/main.py
++++ b/apps/video_part_builder/app/main.py
+@@ -466,7 +466,18 @@ async def mark_failed(job_id: int, part_id: uuid.UUID, exc: BaseException) -> No
+ 
+ async def worker_loop(worker_no: int) -> None:
+     while not shutdown.is_set():
+-        claimed = await claim_job()
++        try:
++            claimed = await claim_job()
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            # A transient DB/capture-state failure must not kill the durable queue worker.
++            logger.exception("part queue claim failed worker=%s; retrying", worker_no)
++            try:
++                await asyncio.wait_for(shutdown.wait(), timeout=1.0)
++            except TimeoutError:
++                pass
++            continue
+         if claimed is None:
+             wakeup.clear()
+             try:
+@@ -480,6 +491,8 @@ async def worker_loop(worker_no: int) -> None:
+             logger.info("part build start worker=%s job=%s part=%s", worker_no, job_id, part_id)
+             await build_part(job_id, part_id)
+             logger.info("part build ready worker=%s job=%s part=%s", worker_no, job_id, part_id)
++        except asyncio.CancelledError:
++            raise
+         except (Exception, MemoryError) as exc:
+             logger.exception("part build failed worker=%s job=%s part=%s", worker_no, job_id, part_id)
+             await mark_failed(job_id, part_id, exc)
+@@ -534,7 +547,16 @@ async def health_ready() -> dict:
+         roots["root2"] = str(configured_output_root("root2"))
+     for value in roots.values():
+         Path(value).mkdir(parents=True, exist_ok=True)
+-    return {"status": "ready", "workers": settings.part_build_workers, "chunk_bytes": settings.part_build_chunk_bytes, "roots": roots}
++    workers_alive = sum(1 for task in worker_tasks if not task.done())
++    if worker_tasks and workers_alive == 0:
++        raise HTTPException(503, "all part-builder workers stopped")
++    return {
++        "status": "ready",
++        "workers": settings.part_build_workers,
++        "workers_alive": workers_alive,
++        "chunk_bytes": settings.part_build_chunk_bytes,
++        "roots": roots,
++    }
+ 
+ 
+ @app.post("/internal/v1/capture-priority/quiesce", dependencies=[Depends(require_internal_token)])
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 23e8405..052ece5 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -100,7 +100,7 @@ type VideoPart = {
+ };
+ 
+ type PartPlan = {
+-  mode: "manual" | "target";
++  mode: "manual" | "target" | "count";
+   from_segment_no: number;
+   end_segment_no: number;
+   run_no: number;
+@@ -108,9 +108,19 @@ type PartPlan = {
+   expected_bytes: number;
+   duration_ms: number;
+   target_mib?: number | null;
++  requested_segment_count?: number | null;
+   warnings: string[];
+ };
+ 
++type PartPlanAll = {
++  items: PartPlan[];
++  part_count: number;
++  segment_count: number;
++  expected_bytes: number;
++  duration_ms: number;
++  skipped: string[];
++};
++
+ type OutputRoot = {
+   key: string;
+   label: string;
+@@ -236,6 +246,17 @@ type ViewMode = "events" | "video-manager" | "trash" | "storage";
+ 
+ const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
+ const PROGRESS_POLL_MS = 5000;
++const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
++const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
++
++function storedPositiveInt(key: string, fallback: number) {
++  try {
++    const value = Number(window.localStorage.getItem(key));
++    return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
++  } catch {
++    return fallback;
++  }
++}
+ const CAPTURE_BUSY_STATUSES = new Set(["arming", "recording", "paused", "reconciling"]);
+ const CAPTURE_BUSY_COMPLETENESS = new Set(["collecting", "verifying"]);
+ const VIDEO_BUSY_STATUSES = new Set(["arming", "recording", "reconnecting"]);
+@@ -353,11 +374,13 @@ function App() {
+   const [videoSegments, setVideoSegments] = useState<VideoSegment[]>([]);
+   const [videoSessions, setVideoSessions] = useState<VideoSession[]>([]);
+   const [videoParts, setVideoParts] = useState<VideoPart[]>([]);
+-  const [partMode, setPartMode] = useState<"manual" | "target">("manual");
++  const [partMode, setPartMode] = useState<"manual" | "target" | "count">("manual");
+   const [partFromSegment, setPartFromSegment] = useState(1);
+   const [partToSegment, setPartToSegment] = useState(1);
+-  const [partTargetMib, setPartTargetMib] = useState(1024);
++  const [partTargetMib, setPartTargetMib] = useState(() => storedPositiveInt(PART_TARGET_MIB_KEY, 1990));
++  const [partSegmentCount, setPartSegmentCount] = useState(() => storedPositiveInt(PART_SEGMENT_COUNT_KEY, 10));
+   const [partPlan, setPartPlan] = useState<PartPlan | null>(null);
++  const [partPlanAll, setPartPlanAll] = useState<PartPlanAll | null>(null);
+   const [partAction, setPartAction] = useState(false);
+   const [messages, setMessages] = useState<Message[]>([]);
+   const [progressBySession, setProgressBySession] = useState<Record<string, CaptureProgress>>({});
+@@ -377,6 +400,14 @@ function App() {
+   const [migrationDestinationRoot, setMigrationDestinationRoot] = useState("root2");
+   const [migrationAction, setMigrationAction] = useState(false);
+ 
++  useEffect(() => {
++    try { window.localStorage.setItem(PART_TARGET_MIB_KEY, String(partTargetMib)); } catch { /* browser storage unavailable */ }
++  }, [partTargetMib]);
++
++  useEffect(() => {
++    try { window.localStorage.setItem(PART_SEGMENT_COUNT_KEY, String(partSegmentCount)); } catch { /* browser storage unavailable */ }
++  }, [partSegmentCount]);
++
+   async function loadEvents() {
+     try {
+       const res = await fetch(`${API}/api/v1/events?page_size=100`, { cache: "no-store" });
+@@ -548,6 +579,7 @@ function App() {
+     setSelected(null);
+     setSelectedVideo(session);
+     setPartPlan(null);
++    setPartPlanAll(null);
+     try {
+       const [detailRes, runsRes, segmentsRes, partsRes] = await Promise.all([
+         fetch(`${API}/api/v1/video-sessions/${session.id}`, { cache: "no-store" }),
+@@ -580,9 +612,39 @@ function App() {
+   }
+ 
+   function partRequestBody() {
+-    return partMode === "manual"
+-      ? { mode: "manual", from_segment_no: partFromSegment, to_segment_no: partToSegment }
+-      : { mode: "target", from_segment_no: partFromSegment, target_mib: partTargetMib };
++    if (partMode === "manual") {
++      return { mode: "manual", from_segment_no: partFromSegment, to_segment_no: partToSegment };
++    }
++    if (partMode === "target") {
++      return { mode: "target", from_segment_no: partFromSegment, target_mib: partTargetMib };
++    }
++    return { mode: "count", from_segment_no: partFromSegment, segment_count: partSegmentCount };
++  }
++
++  function clearPartPlans() {
++    setPartPlan(null);
++    setPartPlanAll(null);
++  }
++
++  function nextBuildableSegment(after: number, parts: VideoPart[]) {
++    const reserved = new Set<number>();
++    parts.forEach((part) => {
++      for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
++    });
++    return videoSegments.find((segment) => (
++      segment.segment_no > after
++      && segment.storage_state === "archive_ready"
++      && segment.integrity_state === "hashed"
++      && !reserved.has(segment.segment_no)
++    ))?.segment_no || after + 1;
++  }
++
++  function advancePartEditor(after: number, createdParts: VideoPart[]) {
++    const next = nextBuildableSegment(after, createdParts);
++    const manualSpan = Math.max(1, partToSegment - partFromSegment + 1);
++    setPartFromSegment(next);
++    if (partMode === "manual") setPartToSegment(next + manualSpan - 1);
++    clearPartPlans();
+   }
+ 
+   async function previewPart() {
+@@ -596,6 +658,7 @@ function App() {
+       });
+       if (!res.ok) throw new Error(await res.text());
+       setPartPlan(await res.json());
++      setPartPlanAll(null);
+       setError(null);
+     } catch (e) {
+       setPartPlan(null);
+@@ -605,6 +668,27 @@ function App() {
+     }
+   }
+ 
++  async function previewAllParts() {
++    if (!selectedVideo) return;
++    setPartAction(true);
++    try {
++      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/parts/plan-all`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify(partRequestBody()),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      setPartPlanAll(await res.json());
++      setPartPlan(null);
++      setError(null);
++    } catch (e) {
++      setPartPlanAll(null);
++      setError(String(e));
++    } finally {
++      setPartAction(false);
++    }
++  }
++
+   async function buildPart() {
+     if (!selectedVideo) return;
+     setPartAction(true);
+@@ -616,21 +700,9 @@ function App() {
+       });
+       if (!res.ok) throw new Error(await res.text());
+       const created = await res.json() as VideoPart & { plan?: PartPlan; builder_wakeup_error?: string | null };
++      const merged = [...videoParts, created];
+       await loadVideoParts(selectedVideo.id);
+-      const reserved = new Set<number>();
+-      [...videoParts, created].forEach((part) => {
+-        for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
+-      });
+-      const after = created.plan?.end_segment_no || created.end_segment_no;
+-      const next = videoSegments.find((segment) => (
+-        segment.segment_no > after
+-        && segment.storage_state === "archive_ready"
+-        && segment.integrity_state === "hashed"
+-        && !reserved.has(segment.segment_no)
+-      ))?.segment_no || after + 1;
+-      setPartFromSegment(next);
+-      setPartToSegment(next);
+-      setPartPlan(null);
++      advancePartEditor(created.plan?.end_segment_no || created.end_segment_no, merged);
+       setError(created.builder_wakeup_error ? `Part поставлен в durable queue, но wakeup builder не прошёл: ${created.builder_wakeup_error}` : null);
+     } catch (e) {
+       setError(String(e));
+@@ -639,6 +711,30 @@ function App() {
+     }
+   }
+ 
++  async function buildAllParts() {
++    if (!selectedVideo || !partPlanAll) return;
++    setPartAction(true);
++    try {
++      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/parts/build-all`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify(partRequestBody()),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      const result = await res.json() as { items: (VideoPart & { plan?: PartPlan })[]; builder_wakeup_error?: string | null };
++      const merged = [...videoParts, ...result.items];
++      await loadVideoParts(selectedVideo.id);
++      const last = result.items[result.items.length - 1];
++      if (last) advancePartEditor(last.end_segment_no, merged);
++      else clearPartPlans();
++      setError(result.builder_wakeup_error ? `Parts поставлены в durable queue, но wakeup builder не прошёл: ${result.builder_wakeup_error}` : null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setPartAction(false);
++    }
++  }
++
+   async function partActionRequest(part: VideoPart, action: "retry" | "cancel" | "delete") {
+     if (!selectedVideo) return;
+     if (action === "delete" && !window.confirm(`Удалить part #${part.part_no}? Source segments останутся.`)) return;
+@@ -1039,20 +1135,28 @@ function App() {
+           <div className="section-label">BUILD PART</div>
+           <p className="muted small">Part — точная byte-for-byte склейка archive_ready MPEG-TS segments одного run. Range резервируется в БД до build. Во время активной Video записи queue ждёт capture idle.</p>
+           <div className="part-mode-tabs">
+-            <button className={partMode === "manual" ? "active-tab" : ""} onClick={() => { setPartMode("manual"); setPartPlan(null); }}>Manual range</button>
+-            <button className={partMode === "target" ? "active-tab" : ""} onClick={() => { setPartMode("target"); setPartPlan(null); }}>Target MiB</button>
++            <button className={partMode === "manual" ? "active-tab" : ""} onClick={() => { setPartMode("manual"); clearPartPlans(); }}>Manual range</button>
++            <button className={partMode === "target" ? "active-tab" : ""} onClick={() => { setPartMode("target"); clearPartPlans(); }}>Target MiB</button>
++            <button className={partMode === "count" ? "active-tab" : ""} onClick={() => { setPartMode("count"); clearPartPlans(); }}>Segment count</button>
+           </div>
+           <div className="part-controls">
+-            <label className="storage-field"><span>From segment</span><input type="number" min={1} value={partFromSegment} onChange={(e) => { const value = Math.max(1, Number(e.target.value) || 1); setPartFromSegment(value); if (partMode === "manual" && partToSegment < value) setPartToSegment(value); setPartPlan(null); }} /></label>
++            <label className="storage-field"><span>From segment</span><input type="number" min={1} value={partFromSegment} onChange={(e) => { const value = Math.max(1, Number(e.target.value) || 1); setPartFromSegment(value); if (partMode === "manual" && partToSegment < value) setPartToSegment(value); clearPartPlans(); }} /></label>
+             {partMode === "manual" ? (
+-              <label className="storage-field"><span>To segment</span><input type="number" min={partFromSegment} value={partToSegment} onChange={(e) => { setPartToSegment(Math.max(partFromSegment, Number(e.target.value) || partFromSegment)); setPartPlan(null); }} /></label>
++              <label className="storage-field"><span>To segment</span><input type="number" min={partFromSegment} value={partToSegment} onChange={(e) => { setPartToSegment(Math.max(partFromSegment, Number(e.target.value) || partFromSegment)); clearPartPlans(); }} /></label>
++            ) : partMode === "target" ? (
++              <label className="storage-field"><span>Target MiB · сохраняется</span><input type="number" min={1} value={partTargetMib} onChange={(e) => { setPartTargetMib(Math.max(1, Number(e.target.value) || 1)); clearPartPlans(); }} /></label>
+             ) : (
+-              <label className="storage-field"><span>Target MiB</span><input type="number" min={1} value={partTargetMib} onChange={(e) => { setPartTargetMib(Math.max(1, Number(e.target.value) || 1)); setPartPlan(null); }} /></label>
++              <label className="storage-field"><span>Segments per Part · сохраняется</span><input type="number" min={1} max={10000} value={partSegmentCount} onChange={(e) => { setPartSegmentCount(Math.max(1, Number(e.target.value) || 1)); clearPartPlans(); }} /></label>
+             )}
+           </div>
++          {partMode === "target" && <p className="muted small">Стандарт: 1990 MiB. Последнее введённое значение сохраняется в браузере.</p>}
++          {partMode === "manual" && <p className="muted small">После Build следующий диапазон сохраняет ту же длину: например 1–10 → 11–20.</p>}
++          {partMode === "count" && <p className="muted small">Фиксированное число сегментов на Part; Preview показывает ожидаемый размер.</p>}
+           <div className="actions part-actions">
+             <button disabled={partAction} onClick={previewPart}>Preview</button>
+             <button disabled={partAction || !partPlan} onClick={buildPart}>{partAction ? "Работаю…" : "Build Part"}</button>
++            <button disabled={partAction} onClick={previewAllParts}>Preview All</button>
++            <button disabled={partAction || !partPlanAll} onClick={buildAllParts}>{partAction ? "Работаю…" : "Build All"}</button>
+           </div>
+           {partPlan && (
+             <div className="part-plan">
+@@ -1064,6 +1168,26 @@ function App() {
+               {partPlan.warnings.length > 0 && <div className="part-plan-warning"><span>Warnings</span><strong>{partPlan.warnings.join(", ")}</strong></div>}
+             </div>
+           )}
++          {partPlanAll && (
++            <div className="part-plan-all">
++              <div className="part-plan">
++                <div><span>Parts</span><strong>{partPlanAll.part_count}</strong></div>
++                <div><span>Segments</span><strong>{partPlanAll.segment_count}</strong></div>
++                <div><span>Total duration</span><strong>{fmtMs(partPlanAll.duration_ms)}</strong></div>
++                <div><span>Total expected</span><strong>{fmtBytes(partPlanAll.expected_bytes)}</strong></div>
++                <div><span>Skipped</span><strong>{partPlanAll.skipped.length}</strong></div>
++              </div>
++              <div className="part-plan-all-list">
++                {partPlanAll.items.map((plan, index) => (
++                  <div className="part-plan-all-row" key={`${plan.run_no}-${plan.from_segment_no}-${plan.end_segment_no}`}>
++                    <strong>#{index + 1} · seg {plan.from_segment_no}–{plan.end_segment_no}</strong>
++                    <span>run {plan.run_no} · {plan.segment_count} seg · {fmtMs(plan.duration_ms)} · {fmtBytes(plan.expected_bytes)}</span>
++                  </div>
++                ))}
++              </div>
++              {partPlanAll.skipped.length > 0 && <div className="muted small">Skipped: {partPlanAll.skipped.join(", ")}</div>}
++            </div>
++          )}
+         </section>
+         <section className="video-block">
+           <div className="section-label">PARTS / BUILD QUEUE</div>
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 54c597e..b23a9c9 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -163,3 +163,10 @@ td { font-variant-numeric: tabular-nums; }
+   .part-plan { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+   .video-manager-session { grid-template-columns: 1fr; }
+ }
++.part-plan-all { margin-top: 14px; display: grid; gap: 10px; }
++.part-plan-all .part-plan { margin-top: 0; }
++.part-plan-all-list { max-height: 320px; overflow: auto; border: 1px solid #e2e5ea; border-radius: 10px; background: #fff; }
++.part-plan-all-row { display: flex; justify-content: space-between; gap: 16px; padding: 9px 11px; border-bottom: 1px solid #eceff3; font-size: 12px; }
++.part-plan-all-row:last-child { border-bottom: 0; }
++.part-plan-all-row span { color: #6b7280; text-align: right; }
++@media (max-width: 760px) { .part-plan-all-row { flex-direction: column; gap: 4px; } .part-plan-all-row span { text-align: left; } }
+diff --git a/packages/python_common/streamhub_common/settings.py b/packages/python_common/streamhub_common/settings.py
+index 61cd390..4356122 100644
+--- a/packages/python_common/streamhub_common/settings.py
++++ b/packages/python_common/streamhub_common/settings.py
+@@ -55,7 +55,7 @@ class Settings(BaseSettings):
+     video_stop_timeout_seconds: int = Field(default=20, ge=5, alias="VIDEO_STOP_TIMEOUT_SECONDS")
+     part_build_workers: int = Field(default=2, ge=1, le=4, alias="PART_BUILD_WORKERS")
+     part_build_chunk_bytes: int = Field(default=524288, ge=65536, alias="PART_BUILD_CHUNK_BYTES")
+-    part_build_target_mib_default: int = Field(default=1024, ge=1, alias="PART_BUILD_TARGET_MIB_DEFAULT")
++    part_build_target_mib_default: int = Field(default=1990, ge=1, alias="PART_BUILD_TARGET_MIB_DEFAULT")
+     part_build_allow_during_capture: bool = Field(default=False, alias="PART_BUILD_ALLOW_DURING_CAPTURE")
+     part_build_lease_seconds: int = Field(default=30, ge=10, alias="PART_BUILD_LEASE_SECONDS")
+ 
+diff --git a/tests/test_video_parts.py b/tests/test_video_parts.py
+index e190447..b0c09d4 100644
+--- a/tests/test_video_parts.py
++++ b/tests/test_video_parts.py
+@@ -118,3 +118,32 @@ def test_parts_integrate_with_delete_and_storage_migration_guards():
+     assert "video session has pending/active part build during storage migration" in recorder
+     assert "archive_bytes = segment_bytes + ready_part_bytes" in recorder
+     assert "return True, archive_bytes" in recorder
++
++
++def test_video_part_planner_supports_count_and_bulk_build_modes():
++    root = Path(__file__).resolve().parents[1]
++    video = (root / "apps/api/app/routers/video.py").read_text()
++    web = (root / "apps/web/src/main.tsx").read_text()
++
++    assert 'payload.mode not in {"manual", "target", "count"}' in video
++    assert 'segment_count: int | None' in video
++    assert '@router.post("/video-sessions/{session_id}/parts/plan-all")' in video
++    assert '@router.post("/video-sessions/{session_id}/parts/build-all")' in video
++    assert 'Segment count' in web
++    assert 'Preview All' in web
++    assert 'Build All' in web
++    assert 'next + manualSpan - 1' in web
++
++
++def test_video_part_target_default_is_1990_and_builder_workers_survive_claim_errors():
++    root = Path(__file__).resolve().parents[1]
++    settings = (root / "packages/python_common/streamhub_common/settings.py").read_text()
++    env_example = (root / ".env.example").read_text()
++    builder = (root / "apps/video_part_builder/app/main.py").read_text()
++    web = (root / "apps/web/src/main.tsx").read_text()
++
++    assert 'default=1990, ge=1, alias="PART_BUILD_TARGET_MIB_DEFAULT"' in settings
++    assert "PART_BUILD_TARGET_MIB_DEFAULT=1990" in env_example
++    assert 'storedPositiveInt(PART_TARGET_MIB_KEY, 1990)' in web
++    assert 'part queue claim failed worker=%s; retrying' in builder
++    assert '"workers_alive": workers_alive' in builder

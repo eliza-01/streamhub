@@ -118,3 +118,32 @@ def test_parts_integrate_with_delete_and_storage_migration_guards():
     assert "video session has pending/active part build during storage migration" in recorder
     assert "archive_bytes = segment_bytes + ready_part_bytes" in recorder
     assert "return True, archive_bytes" in recorder
+
+
+def test_video_part_planner_supports_count_and_bulk_build_modes():
+    root = Path(__file__).resolve().parents[1]
+    video = (root / "apps/api/app/routers/video.py").read_text()
+    web = (root / "apps/web/src/main.tsx").read_text()
+
+    assert 'payload.mode not in {"manual", "target", "count"}' in video
+    assert 'segment_count: int | None' in video
+    assert '@router.post("/video-sessions/{session_id}/parts/plan-all")' in video
+    assert '@router.post("/video-sessions/{session_id}/parts/build-all")' in video
+    assert 'Segment count' in web
+    assert 'Preview All' in web
+    assert 'Build All' in web
+    assert 'next + manualSpan - 1' in web
+
+
+def test_video_part_target_default_is_1990_and_builder_workers_survive_claim_errors():
+    root = Path(__file__).resolve().parents[1]
+    settings = (root / "packages/python_common/streamhub_common/settings.py").read_text()
+    env_example = (root / ".env.example").read_text()
+    builder = (root / "apps/video_part_builder/app/main.py").read_text()
+    web = (root / "apps/web/src/main.tsx").read_text()
+
+    assert 'default=1990, ge=1, alias="PART_BUILD_TARGET_MIB_DEFAULT"' in settings
+    assert "PART_BUILD_TARGET_MIB_DEFAULT=1990" in env_example
+    assert 'storedPositiveInt(PART_TARGET_MIB_KEY, 1990)' in web
+    assert 'part queue claim failed worker=%s; retrying' in builder
+    assert '"workers_alive": workers_alive' in builder

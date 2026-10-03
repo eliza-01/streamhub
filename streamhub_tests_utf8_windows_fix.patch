@@ -1,0 +1,29 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..31e4c4d
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,23 @@
++from __future__ import annotations
++
++from functools import wraps
++from pathlib import Path
++
++
++_original_read_text = Path.read_text
++
++
++@wraps(_original_read_text)
++def _read_text_utf8_by_default(
++    self: Path,
++    encoding: str | None = None,
++    errors: str | None = None,
++) -> str:
++    """Keep repository text fixture reads deterministic across host locales."""
++    return _original_read_text(self, encoding=encoding or "utf-8", errors=errors)
++
++
++# The test suite reads repository source files with Path.read_text(). On Windows,
++# the process locale may be cp1251, while the repository is UTF-8. Make the
++# implicit test-only default explicit without changing production code.
++Path.read_text = _read_text_utf8_by_default

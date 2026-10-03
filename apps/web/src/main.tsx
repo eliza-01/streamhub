@@ -100,7 +100,7 @@ type VideoPart = {
 };
 
 type PartPlan = {
-  mode: "manual" | "target";
+  mode: "manual" | "target" | "count";
   from_segment_no: number;
   end_segment_no: number;
   run_no: number;
@@ -108,7 +108,17 @@ type PartPlan = {
   expected_bytes: number;
   duration_ms: number;
   target_mib?: number | null;
+  requested_segment_count?: number | null;
   warnings: string[];
+};
+
+type PartPlanAll = {
+  items: PartPlan[];
+  part_count: number;
+  segment_count: number;
+  expected_bytes: number;
+  duration_ms: number;
+  skipped: string[];
 };
 
 type OutputRoot = {
@@ -236,6 +246,17 @@ type ViewMode = "events" | "video-manager" | "trash" | "storage";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
 const PROGRESS_POLL_MS = 5000;
+const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
+const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
+
+function storedPositiveInt(key: string, fallback: number) {
+  try {
+    const value = Number(window.localStorage.getItem(key));
+    return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+  } catch {
+    return fallback;
+  }
+}
 const CAPTURE_BUSY_STATUSES = new Set(["arming", "recording", "paused", "reconciling"]);
 const CAPTURE_BUSY_COMPLETENESS = new Set(["collecting", "verifying"]);
 const VIDEO_BUSY_STATUSES = new Set(["arming", "recording", "reconnecting"]);
@@ -353,11 +374,13 @@ function App() {
   const [videoSegments, setVideoSegments] = useState<VideoSegment[]>([]);
   const [videoSessions, setVideoSessions] = useState<VideoSession[]>([]);
   const [videoParts, setVideoParts] = useState<VideoPart[]>([]);
-  const [partMode, setPartMode] = useState<"manual" | "target">("manual");
+  const [partMode, setPartMode] = useState<"manual" | "target" | "count">("manual");
   const [partFromSegment, setPartFromSegment] = useState(1);
   const [partToSegment, setPartToSegment] = useState(1);
-  const [partTargetMib, setPartTargetMib] = useState(1024);
+  const [partTargetMib, setPartTargetMib] = useState(() => storedPositiveInt(PART_TARGET_MIB_KEY, 1990));
+  const [partSegmentCount, setPartSegmentCount] = useState(() => storedPositiveInt(PART_SEGMENT_COUNT_KEY, 10));
   const [partPlan, setPartPlan] = useState<PartPlan | null>(null);
+  const [partPlanAll, setPartPlanAll] = useState<PartPlanAll | null>(null);
   const [partAction, setPartAction] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [progressBySession, setProgressBySession] = useState<Record<string, CaptureProgress>>({});
@@ -376,6 +399,14 @@ function App() {
   const [migrationSourceRoot, setMigrationSourceRoot] = useState("root1");
   const [migrationDestinationRoot, setMigrationDestinationRoot] = useState("root2");
   const [migrationAction, setMigrationAction] = useState(false);
+
+  useEffect(() => {
+    try { window.localStorage.setItem(PART_TARGET_MIB_KEY, String(partTargetMib)); } catch { /* browser storage unavailable */ }
+  }, [partTargetMib]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem(PART_SEGMENT_COUNT_KEY, String(partSegmentCount)); } catch { /* browser storage unavailable */ }
+  }, [partSegmentCount]);
 
   async function loadEvents() {
     try {
@@ -548,6 +579,7 @@ function App() {
     setSelected(null);
     setSelectedVideo(session);
     setPartPlan(null);
+    setPartPlanAll(null);
     try {
       const [detailRes, runsRes, segmentsRes, partsRes] = await Promise.all([
         fetch(`${API}/api/v1/video-sessions/${session.id}`, { cache: "no-store" }),
@@ -580,9 +612,39 @@ function App() {
   }
 
   function partRequestBody() {
-    return partMode === "manual"
-      ? { mode: "manual", from_segment_no: partFromSegment, to_segment_no: partToSegment }
-      : { mode: "target", from_segment_no: partFromSegment, target_mib: partTargetMib };
+    if (partMode === "manual") {
+      return { mode: "manual", from_segment_no: partFromSegment, to_segment_no: partToSegment };
+    }
+    if (partMode === "target") {
+      return { mode: "target", from_segment_no: partFromSegment, target_mib: partTargetMib };
+    }
+    return { mode: "count", from_segment_no: partFromSegment, segment_count: partSegmentCount };
+  }
+
+  function clearPartPlans() {
+    setPartPlan(null);
+    setPartPlanAll(null);
+  }
+
+  function nextBuildableSegment(after: number, parts: VideoPart[]) {
+    const reserved = new Set<number>();
+    parts.forEach((part) => {
+      for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
+    });
+    return videoSegments.find((segment) => (
+      segment.segment_no > after
+      && segment.storage_state === "archive_ready"
+      && segment.integrity_state === "hashed"
+      && !reserved.has(segment.segment_no)
+    ))?.segment_no || after + 1;
+  }
+
+  function advancePartEditor(after: number, createdParts: VideoPart[]) {
+    const next = nextBuildableSegment(after, createdParts);
+    const manualSpan = Math.max(1, partToSegment - partFromSegment + 1);
+    setPartFromSegment(next);
+    if (partMode === "manual") setPartToSegment(next + manualSpan - 1);
+    clearPartPlans();
   }
 
   async function previewPart() {
@@ -596,9 +658,31 @@ function App() {
       });
       if (!res.ok) throw new Error(await res.text());
       setPartPlan(await res.json());
+      setPartPlanAll(null);
       setError(null);
     } catch (e) {
       setPartPlan(null);
+      setError(String(e));
+    } finally {
+      setPartAction(false);
+    }
+  }
+
+  async function previewAllParts() {
+    if (!selectedVideo) return;
+    setPartAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/parts/plan-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(partRequestBody()),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setPartPlanAll(await res.json());
+      setPartPlan(null);
+      setError(null);
+    } catch (e) {
+      setPartPlanAll(null);
       setError(String(e));
     } finally {
       setPartAction(false);
@@ -616,22 +700,34 @@ function App() {
       });
       if (!res.ok) throw new Error(await res.text());
       const created = await res.json() as VideoPart & { plan?: PartPlan; builder_wakeup_error?: string | null };
+      const merged = [...videoParts, created];
       await loadVideoParts(selectedVideo.id);
-      const reserved = new Set<number>();
-      [...videoParts, created].forEach((part) => {
-        for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
-      });
-      const after = created.plan?.end_segment_no || created.end_segment_no;
-      const next = videoSegments.find((segment) => (
-        segment.segment_no > after
-        && segment.storage_state === "archive_ready"
-        && segment.integrity_state === "hashed"
-        && !reserved.has(segment.segment_no)
-      ))?.segment_no || after + 1;
-      setPartFromSegment(next);
-      setPartToSegment(next);
-      setPartPlan(null);
+      advancePartEditor(created.plan?.end_segment_no || created.end_segment_no, merged);
       setError(created.builder_wakeup_error ? `Part поставлен в durable queue, но wakeup builder не прошёл: ${created.builder_wakeup_error}` : null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPartAction(false);
+    }
+  }
+
+  async function buildAllParts() {
+    if (!selectedVideo || !partPlanAll) return;
+    setPartAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/parts/build-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(partRequestBody()),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const result = await res.json() as { items: (VideoPart & { plan?: PartPlan })[]; builder_wakeup_error?: string | null };
+      const merged = [...videoParts, ...result.items];
+      await loadVideoParts(selectedVideo.id);
+      const last = result.items[result.items.length - 1];
+      if (last) advancePartEditor(last.end_segment_no, merged);
+      else clearPartPlans();
+      setError(result.builder_wakeup_error ? `Parts поставлены в durable queue, но wakeup builder не прошёл: ${result.builder_wakeup_error}` : null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1039,20 +1135,28 @@ function App() {
           <div className="section-label">BUILD PART</div>
           <p className="muted small">Part — точная byte-for-byte склейка archive_ready MPEG-TS segments одного run. Range резервируется в БД до build. Во время активной Video записи queue ждёт capture idle.</p>
           <div className="part-mode-tabs">
-            <button className={partMode === "manual" ? "active-tab" : ""} onClick={() => { setPartMode("manual"); setPartPlan(null); }}>Manual range</button>
-            <button className={partMode === "target" ? "active-tab" : ""} onClick={() => { setPartMode("target"); setPartPlan(null); }}>Target MiB</button>
+            <button className={partMode === "manual" ? "active-tab" : ""} onClick={() => { setPartMode("manual"); clearPartPlans(); }}>Manual range</button>
+            <button className={partMode === "target" ? "active-tab" : ""} onClick={() => { setPartMode("target"); clearPartPlans(); }}>Target MiB</button>
+            <button className={partMode === "count" ? "active-tab" : ""} onClick={() => { setPartMode("count"); clearPartPlans(); }}>Segment count</button>
           </div>
           <div className="part-controls">
-            <label className="storage-field"><span>From segment</span><input type="number" min={1} value={partFromSegment} onChange={(e) => { const value = Math.max(1, Number(e.target.value) || 1); setPartFromSegment(value); if (partMode === "manual" && partToSegment < value) setPartToSegment(value); setPartPlan(null); }} /></label>
+            <label className="storage-field"><span>From segment</span><input type="number" min={1} value={partFromSegment} onChange={(e) => { const value = Math.max(1, Number(e.target.value) || 1); setPartFromSegment(value); if (partMode === "manual" && partToSegment < value) setPartToSegment(value); clearPartPlans(); }} /></label>
             {partMode === "manual" ? (
-              <label className="storage-field"><span>To segment</span><input type="number" min={partFromSegment} value={partToSegment} onChange={(e) => { setPartToSegment(Math.max(partFromSegment, Number(e.target.value) || partFromSegment)); setPartPlan(null); }} /></label>
+              <label className="storage-field"><span>To segment</span><input type="number" min={partFromSegment} value={partToSegment} onChange={(e) => { setPartToSegment(Math.max(partFromSegment, Number(e.target.value) || partFromSegment)); clearPartPlans(); }} /></label>
+            ) : partMode === "target" ? (
+              <label className="storage-field"><span>Target MiB · сохраняется</span><input type="number" min={1} value={partTargetMib} onChange={(e) => { setPartTargetMib(Math.max(1, Number(e.target.value) || 1)); clearPartPlans(); }} /></label>
             ) : (
-              <label className="storage-field"><span>Target MiB</span><input type="number" min={1} value={partTargetMib} onChange={(e) => { setPartTargetMib(Math.max(1, Number(e.target.value) || 1)); setPartPlan(null); }} /></label>
+              <label className="storage-field"><span>Segments per Part · сохраняется</span><input type="number" min={1} max={10000} value={partSegmentCount} onChange={(e) => { setPartSegmentCount(Math.max(1, Number(e.target.value) || 1)); clearPartPlans(); }} /></label>
             )}
           </div>
+          {partMode === "target" && <p className="muted small">Стандарт: 1990 MiB. Последнее введённое значение сохраняется в браузере.</p>}
+          {partMode === "manual" && <p className="muted small">После Build следующий диапазон сохраняет ту же длину: например 1–10 → 11–20.</p>}
+          {partMode === "count" && <p className="muted small">Фиксированное число сегментов на Part; Preview показывает ожидаемый размер.</p>}
           <div className="actions part-actions">
             <button disabled={partAction} onClick={previewPart}>Preview</button>
             <button disabled={partAction || !partPlan} onClick={buildPart}>{partAction ? "Работаю…" : "Build Part"}</button>
+            <button disabled={partAction} onClick={previewAllParts}>Preview All</button>
+            <button disabled={partAction || !partPlanAll} onClick={buildAllParts}>{partAction ? "Работаю…" : "Build All"}</button>
           </div>
           {partPlan && (
             <div className="part-plan">
@@ -1062,6 +1166,26 @@ function App() {
               <div><span>Duration</span><strong>{fmtMs(partPlan.duration_ms)}</strong></div>
               <div><span>Expected</span><strong>{fmtBytes(partPlan.expected_bytes)}</strong></div>
               {partPlan.warnings.length > 0 && <div className="part-plan-warning"><span>Warnings</span><strong>{partPlan.warnings.join(", ")}</strong></div>}
+            </div>
+          )}
+          {partPlanAll && (
+            <div className="part-plan-all">
+              <div className="part-plan">
+                <div><span>Parts</span><strong>{partPlanAll.part_count}</strong></div>
+                <div><span>Segments</span><strong>{partPlanAll.segment_count}</strong></div>
+                <div><span>Total duration</span><strong>{fmtMs(partPlanAll.duration_ms)}</strong></div>
+                <div><span>Total expected</span><strong>{fmtBytes(partPlanAll.expected_bytes)}</strong></div>
+                <div><span>Skipped</span><strong>{partPlanAll.skipped.length}</strong></div>
+              </div>
+              <div className="part-plan-all-list">
+                {partPlanAll.items.map((plan, index) => (
+                  <div className="part-plan-all-row" key={`${plan.run_no}-${plan.from_segment_no}-${plan.end_segment_no}`}>
+                    <strong>#{index + 1} · seg {plan.from_segment_no}–{plan.end_segment_no}</strong>
+                    <span>run {plan.run_no} · {plan.segment_count} seg · {fmtMs(plan.duration_ms)} · {fmtBytes(plan.expected_bytes)}</span>
+                  </div>
+                ))}
+              </div>
+              {partPlanAll.skipped.length > 0 && <div className="muted small">Skipped: {partPlanAll.skipped.join(", ")}</div>}
             </div>
           )}
         </section>
