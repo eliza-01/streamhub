@@ -364,7 +364,7 @@ def iso_utc(value: datetime | None) -> str | None:
 
 
 async def claim_archive_batch() -> list[ArchiveCandidate]:
-    terminal_statuses = {"completed", "failed", "soft_deleted"}
+    terminal_statuses = {"completed", "failed", "soft_deleted", "paused"}
     async with SessionLocal() as db:
         output_setting = await db.get(StorageOutputSetting, 1)
         batch_size = int(
@@ -1245,6 +1245,19 @@ class RecorderWorker:
             )
             await db.commit()
 
+    async def finalize_pause(self) -> None:
+        await self.mark_session(status="paused", last_error=None, stop_reason=None)
+        await build_spool_playlist(self.request.session_id, finished=False)
+        archive_wakeup.set()
+
+    async def finalize_control_stop(self) -> None:
+        if self.stop_reason == "service_shutdown":
+            await self.mark_session(status="reconnecting", last_error=None)
+        elif self.stop_reason == "pause":
+            await self.finalize_pause()
+        else:
+            await self.finalize_user_stop()
+
     async def finalize_user_stop(self) -> None:
         async with SessionLocal() as db:
             session = await db.get(VideoSession, self.request.session_id)
@@ -1311,19 +1324,13 @@ class RecorderWorker:
                     await self.update_run_closed(run.id, close_reason="launch_error", last_error=error)
                     await self.mark_session(status="reconnecting", last_error=error)
                     if self.stop_event.is_set():
-                        if self.stop_reason == "service_shutdown":
-                            await self.mark_session(status="reconnecting", last_error=None)
-                        else:
-                            await self.finalize_user_stop()
+                        await self.finalize_control_stop()
                         break
                     try:
                         await asyncio.wait_for(self.stop_event.wait(), timeout=settings.video_reconnect_seconds)
                     except asyncio.TimeoutError:
                         continue
-                    if self.stop_reason == "service_shutdown":
-                        await self.mark_session(status="reconnecting", last_error=None)
-                    else:
-                        await self.finalize_user_stop()
+                    await self.finalize_control_stop()
                     break
 
                 async with SessionLocal() as db:
@@ -1353,10 +1360,7 @@ class RecorderWorker:
 
                 if self.stop_event.is_set():
                     await self.update_run_closed(run.id, close_reason=self.stop_reason)
-                    if self.stop_reason == "service_shutdown":
-                        await self.mark_session(status="reconnecting", last_error=None)
-                    else:
-                        await self.finalize_user_stop()
+                    await self.finalize_control_stop()
                     break
 
                 clean_eof = streamlink_proc.returncode == 0 and ffmpeg_proc.returncode == 0
@@ -1375,10 +1379,7 @@ class RecorderWorker:
                     await asyncio.wait_for(self.stop_event.wait(), timeout=settings.video_reconnect_seconds)
                 except asyncio.TimeoutError:
                     continue
-                if self.stop_reason == "service_shutdown":
-                    await self.mark_session(status="reconnecting", last_error=None)
-                else:
-                    await self.finalize_user_stop()
+                await self.finalize_control_stop()
                 break
         except asyncio.CancelledError:
             await self.force_stop()
@@ -1527,6 +1528,63 @@ async def start_video_session(payload: VideoStartRequest) -> dict:
             raise HTTPException(409, f"cannot start video session in state {row.status}")
     await start_worker(payload)
     return {"status": "started", "session_id": str(payload.session_id)}
+
+
+@app.post("/internal/v1/video-sessions/{session_id}/pause", dependencies=[Depends(require_internal_token)])
+async def pause_video_session(session_id: uuid.UUID) -> dict:
+    worker = workers.get(session_id)
+    if worker:
+        await worker.request_stop("pause")
+
+    async with SessionLocal() as db:
+        row = await db.get(VideoSession, session_id)
+        if row is None:
+            raise HTTPException(404, "video session not found")
+        if row.status == "paused":
+            return {"status": "paused", "session_id": str(session_id)}
+        if row.status not in ACTIVE_VIDEO_STATUSES:
+            raise HTTPException(409, f"cannot pause video session in state {row.status}")
+        # No runtime worker means capture is already not producing I/O. Persist
+        # the requested paused state instead of leaving a stale recording row.
+        row.status = "paused"
+        row.last_error = None
+        row.stop_reason = None
+        row.last_activity_at_utc = utcnow_naive()
+        await db.commit()
+    archive_wakeup.set()
+    return {"status": "paused", "session_id": str(session_id)}
+
+
+@app.post("/internal/v1/video-sessions/{session_id}/resume", dependencies=[Depends(require_internal_token)])
+async def resume_video_session(session_id: uuid.UUID) -> dict:
+    async with SessionLocal() as db:
+        row = await db.get(VideoSession, session_id)
+        if row is None:
+            raise HTTPException(404, "video session not found")
+        if row.status in ACTIVE_VIDEO_STATUSES:
+            return {"status": "already_active", "session_id": str(session_id)}
+        if row.status != "paused":
+            raise HTTPException(409, f"cannot resume video session in state {row.status}")
+        media_type = str((row.metadata_json or {}).get("media_type") or "")
+        if media_type not in {"live", "vod"}:
+            raise HTTPException(409, "video session recovery metadata is missing media_type")
+        request = VideoStartRequest(
+            session_id=row.id,
+            event_id=row.event_id,
+            media_type=media_type,
+            source_url=row.source_url,
+            quality=row.quality,
+            source_duration_ms=row.required_end_ms,
+        )
+        # Persist the transition before returning so the public API/Extension
+        # cannot observe a stale paused row after Resume succeeds.
+        row.status = "arming"
+        row.last_error = None
+        row.last_activity_at_utc = utcnow_naive()
+        await db.commit()
+
+    await start_worker(request)
+    return {"status": "resumed", "session_id": str(session_id)}
 
 
 @app.post("/internal/v1/video-sessions/{session_id}/stop", dependencies=[Depends(require_internal_token)])

@@ -27,7 +27,8 @@ from streamhub_common.settings import get_settings
 router = APIRouter(prefix="/api/v1", tags=["video"])
 settings = get_settings()
 
-ACTIVE_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting"})
+RUNNING_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting"})
+ACTIVE_VIDEO_STATUSES = RUNNING_VIDEO_STATUSES | {"paused"}
 
 PART_ACTIVE_JOB_STATUSES = frozenset({"queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"})
 
@@ -343,6 +344,69 @@ async def delete_video_db_rows(db: AsyncSession, session_id: uuid.UUID) -> None:
     await db.execute(delete(VideoSegment).where(VideoSegment.video_session_id == session_id))
     await db.execute(delete(VideoRun).where(VideoRun.video_session_id == session_id))
     await db.execute(delete(VideoSession).where(VideoSession.id == session_id))
+
+
+@router.post("/video-sessions/{session_id}/pause")
+async def pause_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    row = await db.get(VideoSession, session_id)
+    if row is None or row.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    if row.status == "paused":
+        return video_session_dict(row)
+    if row.status not in RUNNING_VIDEO_STATUSES:
+        raise HTTPException(409, f"cannot pause video session in state {row.status}")
+
+    await recorder_post(f"/internal/v1/video-sessions/{row.id}/pause", {})
+    try:
+        await part_builder_post("/internal/v1/capture-priority/release", {})
+    except HTTPException:
+        pass
+    await db.refresh(row)
+    db.add(
+        AuditLog(
+            event_id=row.event_id,
+            video_session_id=row.id,
+            action="video_pause",
+            payload_json={},
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    return video_session_dict(row)
+
+
+@router.post("/video-sessions/{session_id}/resume")
+async def resume_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    row = await db.get(VideoSession, session_id)
+    if row is None or row.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    if row.status in RUNNING_VIDEO_STATUSES:
+        return video_session_dict(row)
+    if row.status != "paused":
+        raise HTTPException(409, f"cannot resume video session in state {row.status}")
+
+    await part_builder_post("/internal/v1/capture-priority/quiesce", {})
+    try:
+        await recorder_post(f"/internal/v1/video-sessions/{row.id}/resume", {})
+    except HTTPException:
+        try:
+            await part_builder_post("/internal/v1/capture-priority/release", {})
+        except HTTPException:
+            pass
+        raise
+
+    await db.refresh(row)
+    db.add(
+        AuditLog(
+            event_id=row.event_id,
+            video_session_id=row.id,
+            action="video_resume",
+            payload_json={},
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    return video_session_dict(row)
 
 
 @router.post("/video-sessions/{session_id}/stop")

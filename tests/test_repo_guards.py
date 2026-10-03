@@ -119,6 +119,26 @@ def test_video_capture_vertical_slice_is_exposed_in_extension_and_web():
     assert "SEGMENTS · spool" in web
 
 
+def test_extension_and_backend_expose_video_pause_resume_controls():
+    root = Path(__file__).resolve().parents[1]
+    popup = (root / "apps/chrome_extension/popup.js").read_text()
+    popup_html = (root / "apps/chrome_extension/popup.html").read_text()
+    api = (root / "apps/api/app/routers/video.py").read_text()
+    recorder = (root / "apps/video_recorder/app/main.py").read_text()
+
+    assert 'id="pause-video"' in popup_html
+    assert 'id="resume-video"' in popup_html
+    assert '/pause`' in popup
+    assert '/resume`' in popup
+    assert '@router.post("/video-sessions/{session_id}/pause")' in api
+    assert '@router.post("/video-sessions/{session_id}/resume")' in api
+    assert 'ACTIVE_VIDEO_STATUSES = RUNNING_VIDEO_STATUSES | {"paused"}' in api
+    assert '@app.post("/internal/v1/video-sessions/{session_id}/pause"' in recorder
+    assert '@app.post("/internal/v1/video-sessions/{session_id}/resume"' in recorder
+    assert 'await self.mark_session(status="paused"' in recorder
+    assert 'terminal_statuses = {"completed", "failed", "soft_deleted", "paused"}' in recorder
+
+
 def test_video_only_start_does_not_require_vod_integrity():
     root = Path(__file__).resolve().parents[1]
     source = (root / "apps/api/app/routers/capture.py").read_text()

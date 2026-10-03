@@ -80,6 +80,9 @@ function render() {
   $("pause-chat").disabled = !activeChatSession;
   $("resume-chat").disabled = !activeChatSession;
   $("stop-chat").disabled = !activeChatSession;
+  const videoStatus = activeVideoSession?.status || null;
+  $("pause-video").disabled = !activeVideoSession || videoStatus === "paused";
+  $("resume-video").disabled = !activeVideoSession || videoStatus !== "paused";
   $("stop-video").disabled = !activeVideoSession;
   $("stop-all").disabled = !activeChatSession && !activeVideoSession;
 }
@@ -238,6 +241,26 @@ $("stop-chat").addEventListener("click", async () => {
     showMessage("Chat остановлен. Video не затронут.");
     await syncCurrentCaptureStatus({ silent: true });
   } catch (e) { showMessage(`Ошибка Stop Chat: ${e}`); }
+});
+
+$("pause-video").addEventListener("click", async () => {
+  try {
+    await syncCurrentCaptureStatus({ silent: true });
+    if (!activeVideoSession) throw new Error("для текущего события активного Video нет");
+    await api(`/api/v1/video-sessions/${activeVideoSession.id}/pause`, { method: "POST", body: "{}" });
+    showMessage("Video Pause установлен.");
+    await syncCurrentCaptureStatus({ silent: true });
+  } catch (e) { showMessage(`Ошибка Video Pause: ${e}`); }
+});
+
+$("resume-video").addEventListener("click", async () => {
+  try {
+    await syncCurrentCaptureStatus({ silent: true });
+    if (!activeVideoSession) throw new Error("для текущего события активного Video нет");
+    await api(`/api/v1/video-sessions/${activeVideoSession.id}/resume`, { method: "POST", body: "{}" });
+    showMessage("Video Resume выполнен.");
+    await syncCurrentCaptureStatus({ silent: true });
+  } catch (e) { showMessage(`Ошибка Video Resume: ${e}`); }
 });
 
 $("stop-video").addEventListener("click", async () => {

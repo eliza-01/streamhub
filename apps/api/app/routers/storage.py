@@ -22,7 +22,7 @@ from streamhub_common.settings import get_settings
 router = APIRouter(prefix="/api/v1/storage", tags=["storage"])
 settings = get_settings()
 
-ACTIVE_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting"})
+ACTIVE_VIDEO_STATUSES = frozenset({"arming", "recording", "reconnecting", "paused"})
 ACTIVE_MIGRATION_STATUSES = frozenset({"queued", "running"})
 PART_ACTIVE_JOB_STATUSES = frozenset({"queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"})
 
