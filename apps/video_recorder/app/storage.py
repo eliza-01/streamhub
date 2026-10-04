@@ -423,6 +423,42 @@ def restore_quarantined_directory(path: Path, token: str) -> None:
     _restore_tree_files(quarantine, path)
 
 
+def purge_quarantine_details(path: Path) -> tuple[Path, uuid.UUID, str] | None:
+    """Return (original_path, session_id, token) for a purge quarantine directory."""
+    marker = ".purge-"
+    if marker not in path.name:
+        return None
+    session_text, token = path.name.rsplit(marker, 1)
+    if len(token) != 32:
+        return None
+    try:
+        int(token, 16)
+        session_id = uuid.UUID(session_text)
+    except (ValueError, TypeError):
+        return None
+    return path.with_name(session_text), session_id, token.lower()
+
+
+def find_purge_quarantines(root: Path) -> list[tuple[Path, Path, uuid.UUID, str]]:
+    """Find StreamHub purge quarantine directories below a storage root.
+
+    Only names matching ``<session UUID>.purge-<32 hex token>`` are returned,
+    so unrelated directories containing ``.purge-`` are never touched.
+    """
+    if not root.exists():
+        return []
+    found: list[tuple[Path, Path, uuid.UUID, str]] = []
+    for candidate in root.rglob("*.purge-*"):
+        if not candidate.is_dir():
+            continue
+        details = purge_quarantine_details(candidate)
+        if details is None:
+            continue
+        original, session_id, token = details
+        found.append((candidate, original, session_id, token))
+    return found
+
+
 def delete_quarantined_directory(path: Path, token: str) -> None:
     quarantine = path.with_name(f"{path.name}.purge-{token}")
     if quarantine.exists():

@@ -245,3 +245,29 @@ def test_recorder_health_exposes_archive_workers_and_backlog_in_source():
     assert '"archive_backlog": archive_backlog' in health
     assert '"dead_workers": dead_workers' in health
     assert 'VideoSegment.storage_state.in_({"spool", "copying"})' in health
+
+
+def test_purge_quarantine_discovery_only_accepts_session_uuid_and_hex_token(tmp_path: Path):
+    module = load_storage_module()
+    session_id = uuid.UUID("dd968802-b40a-494d-ae8f-0d532fe5d655")
+    token = "080b6becff654e5e8d084d86225253a2"
+    original = tmp_path / str(session_id)
+    quarantine = tmp_path / f"{session_id}.purge-{token}"
+    quarantine.mkdir()
+    (tmp_path / "not-a-session.purge-080b6becff654e5e8d084d86225253a2").mkdir()
+    (tmp_path / f"{session_id}.purge-nothex").mkdir()
+
+    details = module.purge_quarantine_details(quarantine)
+    assert details == (original, session_id, token)
+    found = module.find_purge_quarantines(tmp_path)
+    assert found == [(quarantine, original, session_id, token)]
+
+
+def test_video_recorder_retries_finalize_and_reconciles_purge_quarantines_on_startup():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps/video_recorder/app/main.py").read_text()
+
+    assert "delete_quarantined_directory_with_retry" in source
+    assert "reconcile_purge_quarantines(restore_referenced=True)" in source
+    assert "purge_quarantine_reaper_loop" in source
+    assert 'name="video-purge-reaper"' in source
