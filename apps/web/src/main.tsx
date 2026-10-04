@@ -377,6 +377,13 @@ type SiteAssets = {
   complete: boolean;
 };
 
+type SiteTimecode = {
+  id: number;
+  position: number;
+  offset_ms: number;
+  title: string;
+};
+
 type SiteEvent = {
   id: string;
   platform: string;
@@ -393,6 +400,7 @@ type SiteEvent = {
   published_at_utc: string;
   categories: Array<SiteCategory & { position?: number }>;
   assets: SiteAssets;
+  timecodes?: SiteTimecode[];
   video_sessions: SiteVideoSession[];
   chat_sessions: SiteChatSession[];
   primary_chat_session_id?: string | null;
@@ -425,6 +433,7 @@ type SiteAvailableEvent = {
 type SiteAdminEvent = SiteAvailableEvent & {
   published: boolean;
   categories: Array<SiteCategory & { position?: number }>;
+  timecodes: SiteTimecode[];
 };
 
 type MediaEvent = {
@@ -507,6 +516,16 @@ function fmtMs(ms?: number | null) {
   const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
   return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
+}
+
+function parseTimecodeText(value: string): number | null {
+  const parts = value.trim().split(":");
+  if (parts.length !== 2 && parts.length !== 3) return null;
+  const numbers = parts.map((part) => Number(part));
+  if (numbers.some((part) => !Number.isInteger(part) || part < 0)) return null;
+  const [hours, minutes, seconds] = parts.length === 3 ? numbers : [0, numbers[0], numbers[1]];
+  if (minutes > 59 || seconds > 59) return null;
+  return (hours * 3600 + minutes * 60 + seconds) * 1000;
 }
 
 function fmtBytes(bytes?: number | null) {
@@ -1804,6 +1823,38 @@ function SiteArtwork({ event, wide = false, label, src }: { event: SiteEvent; wi
   );
 }
 
+function SiteEventTimecodes({
+  items,
+  videoRef,
+}: {
+  items: SiteTimecode[];
+  videoRef: { current: HTMLVideoElement | null };
+}) {
+  if (!items.length) return null;
+  return (
+    <section className="streamvault-timecodes" aria-label="Таймкоды события">
+      <div className="streamvault-timecodes-head"><strong>Таймкоды</strong><span>{items.length}</span></div>
+      <div className="streamvault-timecodes-list">
+        {items.map((item) => (
+          <button
+            type="button"
+            key={item.id}
+            onClick={() => {
+              const video = videoRef.current;
+              if (!video) return;
+              video.currentTime = Math.max(0, item.offset_ms / 1000);
+              void video.play().catch(() => undefined);
+            }}
+          >
+            <time>{fmtMs(item.offset_ms)}</time>
+            <strong>{item.title}</strong>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function SiteAdminPanel({
   events,
   drafts,
@@ -1812,6 +1863,7 @@ function SiteAdminPanel({
   onDraftChange,
   onSaveTitle,
   onUpload,
+  onSaveTimecodes,
   onAddEvent,
   onClose,
 }: {
@@ -1822,6 +1874,7 @@ function SiteAdminPanel({
   onDraftChange: (eventId: string, value: string) => void;
   onSaveTitle: (eventId: string) => void;
   onUpload: (eventId: string, slot: string, file: File) => void;
+  onSaveTimecodes: (eventId: string, items: Array<{ offset_ms: number; title: string }>) => Promise<boolean>;
   onAddEvent: () => void;
   onClose: () => void;
 }) {
@@ -1838,6 +1891,8 @@ function SiteAdminPanel({
   const [uploadTarget, setUploadTarget] = useState<{ eventId: string; slot: string; label: string } | null>(null);
   const [clipboardNotice, setClipboardNotice] = useState("");
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const [timecodeEditorEventId, setTimecodeEditorEventId] = useState<string | null>(null);
+  const [timecodeDrafts, setTimecodeDrafts] = useState<Record<string, Array<{ time: string; title: string }>>>({});
 
   useEffect(() => {
     if (!uploadTarget) return;
@@ -1872,6 +1927,38 @@ function SiteAdminPanel({
     onUpload(target.eventId, target.slot, file);
   };
 
+  const openTimecodeEditor = (event: SiteAdminEvent) => {
+    setTimecodeDrafts((current) => ({
+      ...current,
+      [event.id]: current[event.id] || (event.timecodes.length
+        ? event.timecodes.map((item) => ({ time: fmtMs(item.offset_ms), title: item.title }))
+        : [{ time: "00:00:00", title: "" }]),
+    }));
+    setTimecodeEditorEventId(event.id);
+  };
+
+  const updateTimecodeDraft = (eventId: string, index: number, key: "time" | "title", value: string) => {
+    setTimecodeDrafts((current) => ({
+      ...current,
+      [eventId]: (current[eventId] || []).map((item, itemIndex) => itemIndex === index ? { ...item, [key]: value } : item),
+    }));
+  };
+
+  const removeTimecodeDraft = (eventId: string, index: number) => {
+    setTimecodeDrafts((current) => ({
+      ...current,
+      [eventId]: (current[eventId] || []).filter((_item, itemIndex) => itemIndex !== index),
+    }));
+  };
+
+  const saveTimecodes = async (eventId: string) => {
+    const drafts = timecodeDrafts[eventId] || [];
+    const parsed = drafts.map((item) => ({ offset_ms: parseTimecodeText(item.time), title: item.title.trim() }));
+    if (parsed.some((item) => item.offset_ms == null || !item.title)) return;
+    const saved = await onSaveTimecodes(eventId, parsed.map((item) => ({ offset_ms: item.offset_ms as number, title: item.title })));
+    if (saved) setTimecodeEditorEventId(null);
+  };
+
   return (
     <div className="site-modal-backdrop site-admin-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="site-modal site-admin-modal" role="dialog" aria-modal="true" aria-labelledby="siteAdminTitle">
@@ -1887,47 +1974,119 @@ function SiteAdminPanel({
           <div className="site-empty compact">Нет событий с готовым Telegram-backed видео.</div>
         ) : (
           <div className="site-admin-event-list">
-            {events.map((event) => (
-              <section className="site-admin-event" key={event.id}>
-                <div className="site-admin-event-top">
-                  <div>
-                    <span className={`site-admin-publish-state ${event.published ? "is-published" : ""}`}>{event.published ? "Опубликовано" : "Не опубликовано"}</span>
-                    <h3>{event.display_title}</h3>
-                    <p>Исходное название: <strong>{event.source_title || "—"}</strong></p>
-                    <small>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleString("ru-RU") : "Дата неизвестна"} · TG {event.linked_parts}/{event.ready_parts}</small>
-                  </div>
-                  <span className={`site-admin-assets-state ${event.assets.complete ? "is-complete" : ""}`}>{event.assets.complete ? "5/5 изображений" : `${Number(Boolean(event.assets.cover)) + event.assets.frames.filter(Boolean).length}/5 изображений`}</span>
-                </div>
-                <div className="site-admin-title-editor">
-                  <label>
-                    <span>Отображаемое название</span>
-                    <input value={drafts[event.id] ?? event.display_title} maxLength={1024} onChange={(e) => onDraftChange(event.id, e.target.value)} />
-                  </label>
-                  <button type="button" disabled={actionKey === `title:${event.id}` || !(drafts[event.id] ?? event.display_title).trim() || (drafts[event.id] ?? event.display_title).trim() === event.display_title} onClick={() => onSaveTitle(event.id)}>
-                    {actionKey === `title:${event.id}` ? "Сохраняю…" : "Сохранить"}
-                  </button>
-                </div>
-                <div className="site-admin-assets">
-                  {assetSlots.map(([slot, label]) => {
-                    const asset = assetFor(event, slot);
-                    const busy = actionKey === `asset:${event.id}:${slot}`;
-                    return (
-                      <button
-                        type="button"
-                        className={`site-admin-asset ${asset ? "has-asset" : ""}`}
-                        key={slot}
-                        disabled={Boolean(actionKey)}
-                        onClick={() => openAssetPicker(event.id, slot, label)}
-                      >
-                        <span>{label}</span>
-                        <div>{asset ? <img src={apiUrl(asset.url)} alt="" /> : <b>+</b>}</div>
-                        <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height} · заменить` : "Файл или Ctrl+V"}</small>
+            {events.map((event) => {
+              const assetCount = Number(Boolean(event.assets.cover)) + event.assets.frames.filter(Boolean).length;
+              const eventTimecodes = timecodeDrafts[event.id] || [];
+              const timecodesValid = eventTimecodes.every((item) => parseTimecodeText(item.time) != null && Boolean(item.title.trim()));
+              return (
+                <details className="site-admin-event" key={event.id}>
+                  <summary className="site-admin-event-summary">
+                    <div className="site-admin-summary-cell is-status">
+                      <span>Статус</span>
+                      <strong className={`site-admin-publish-state ${event.published ? "is-published" : ""}`}>{event.published ? "Опубликовано" : "Не опубликовано"}</strong>
+                    </div>
+                    <div className="site-admin-summary-cell is-date">
+                      <span>Дата</span>
+                      <strong>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleDateString("ru-RU") : "—"}</strong>
+                    </div>
+                    <div className="site-admin-summary-cell is-categories">
+                      <span>Категории</span>
+                      <strong>{event.categories.length ? event.categories.map((category) => category.label).join(" · ") : "Без категории"}</strong>
+                    </div>
+                    <div className="site-admin-summary-cell is-title">
+                      <span>Название</span>
+                      <strong>{event.display_title}</strong>
+                    </div>
+                    <div className="site-admin-summary-cell is-assets">
+                      <span>Изображения</span>
+                      <strong className={`site-admin-assets-state ${event.assets.complete ? "is-complete" : ""}`}>{assetCount}/5</strong>
+                    </div>
+                  </summary>
+                  <div className="site-admin-event-body">
+                    <div className="site-admin-source-meta">
+                      <span>Исходное название: <strong>{event.source_title || "—"}</strong></span>
+                      <span>TG {event.linked_parts}/{event.ready_parts}</span>
+                    </div>
+                    <div className="site-admin-title-editor">
+                      <label>
+                        <span>Отображаемое название</span>
+                        <input value={drafts[event.id] ?? event.display_title} maxLength={1024} onChange={(e) => onDraftChange(event.id, e.target.value)} />
+                      </label>
+                      <button type="button" disabled={actionKey === `title:${event.id}` || !(drafts[event.id] ?? event.display_title).trim() || (drafts[event.id] ?? event.display_title).trim() === event.display_title} onClick={() => onSaveTitle(event.id)}>
+                        {actionKey === `title:${event.id}` ? "Сохраняю…" : "Сохранить"}
                       </button>
-                    );
-                  })}
-                </div>
-              </section>
-            ))}
+                    </div>
+                    <div className="site-admin-assets">
+                      {assetSlots.map(([slot, label]) => {
+                        const asset = assetFor(event, slot);
+                        const busy = actionKey === `asset:${event.id}:${slot}`;
+                        return (
+                          <button
+                            type="button"
+                            className={`site-admin-asset ${asset ? "has-asset" : ""}`}
+                            key={slot}
+                            disabled={Boolean(actionKey)}
+                            onClick={() => openAssetPicker(event.id, slot, label)}
+                          >
+                            <span>{label}</span>
+                            <div>{asset ? <img src={apiUrl(asset.url)} alt="" /> : <b>+</b>}</div>
+                            <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height} · заменить` : "Файл или Ctrl+V"}</small>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="site-admin-timecodes-actions">
+                      <button type="button" className="site-admin-timecodes-open" onClick={() => openTimecodeEditor(event)}>Добавить таймкоды</button>
+                    </div>
+                    {timecodeEditorEventId === event.id ? (
+                      <div className="site-admin-timecodes-editor">
+                        <div className="site-admin-timecodes-editor-head">
+                          <div><strong>Таймкоды события</strong><span>Время указывается относительно публичного видеоплеера.</span></div>
+                          <button type="button" onClick={() => setTimecodeEditorEventId(null)}>Закрыть</button>
+                        </div>
+                        <div className="site-admin-timecode-rows">
+                          {eventTimecodes.map((item, index) => (
+                            <div className="site-admin-timecode-row" key={`${event.id}:${index}`}>
+                              <label>
+                                <span>Время</span>
+                                <input
+                                  value={item.time}
+                                  inputMode="numeric"
+                                  placeholder="00:00:00"
+                                  onChange={(e) => updateTimecodeDraft(event.id, index, "time", e.target.value)}
+                                />
+                              </label>
+                              <label>
+                                <span>Название таймкода</span>
+                                <input
+                                  value={item.title}
+                                  maxLength={255}
+                                  placeholder="Например: Начало матча"
+                                  onChange={(e) => updateTimecodeDraft(event.id, index, "title", e.target.value)}
+                                />
+                              </label>
+                              <button type="button" className="site-admin-timecode-remove" onClick={() => removeTimecodeDraft(event.id, index)} aria-label="Удалить таймкод">×</button>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="site-admin-timecodes-footer">
+                          <button
+                            type="button"
+                            onClick={() => setTimecodeDrafts((current) => ({ ...current, [event.id]: [...(current[event.id] || []), { time: "00:00:00", title: "" }] }))}
+                          >+ Ещё таймкод</button>
+                          <button
+                            type="button"
+                            className="primary"
+                            disabled={Boolean(actionKey) || !timecodesValid}
+                            onClick={() => void saveTimecodes(event.id)}
+                          >{actionKey === `timecodes:${event.id}` ? "Сохраняю…" : "Сохранить таймкоды"}</button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                </details>
+              );
+            })}
           </div>
         )}
         {uploadTarget ? (
@@ -2398,6 +2557,30 @@ function App() {
       setError(null);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setSiteAdminActionKey(null);
+    }
+  }
+
+  async function saveSiteTimecodes(eventId: string, items: Array<{ offset_ms: number; title: string }>) {
+    setSiteAdminActionKey(`timecodes:${eventId}`);
+    try {
+      const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}/timecodes`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json() as { items?: SiteTimecode[] };
+      const timecodes = data.items || [];
+      setSiteAdminEvents((current) => current.map((event) => event.id === eventId ? { ...event, timecodes } : event));
+      setSiteEvents((current) => current.map((event) => event.id === eventId ? { ...event, timecodes } : event));
+      setSelectedSiteEvent((current) => current?.id === eventId ? { ...current, timecodes } : current);
+      setError(null);
+      return true;
+    } catch (e) {
+      setError(String(e));
+      return false;
     } finally {
       setSiteAdminActionKey(null);
     }
@@ -3046,6 +3229,7 @@ function App() {
                   <div className="streamvault-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
                 )}
               </div>
+              <SiteEventTimecodes items={selectedSiteEvent.timecodes || []} videoRef={siteVideoRef} />
               <section className="streamvault-watch-meta">
                 <div className="streamvault-watch-title-row">
                   <div>
@@ -3116,6 +3300,7 @@ function App() {
             onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
             onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
             onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
+            onSaveTimecodes={saveSiteTimecodes}
             onAddEvent={() => { setSiteAdminOpen(false); closeSiteEvent(); void openSitePublisher(); }}
             onClose={() => setSiteAdminOpen(false)}
           />
@@ -3206,9 +3391,8 @@ function App() {
             <section className="streamvault-recordings" aria-labelledby="streamvaultRecordingsTitle">
               <div className="streamvault-section-head">
                 <div>
-                  <h2 id="streamvaultRecordingsTitle">{siteCategory === "all" ? "Записи" : siteCategories.find((category) => category.slug === siteCategory)?.label || "Записи"}</h2>
+                  <h2 id="streamvaultRecordingsTitle">{siteCategory === "all" ? "Все видео" : siteCategories.find((category) => category.slug === siteCategory)?.label || "Все видео"}</h2>
                 </div>
-                <span>{siteEvents.length.toLocaleString("ru-RU")}</span>
               </div>
               {siteEvents.length === 0 ? (
                 <div className="streamvault-empty">Пока нет опубликованных записей в этом разделе.</div>
@@ -3248,6 +3432,7 @@ function App() {
             onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
             onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
             onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
+            onSaveTimecodes={saveSiteTimecodes}
             onAddEvent={() => { setSiteAdminOpen(false); void openSitePublisher(); }}
             onClose={() => setSiteAdminOpen(false)}
           />

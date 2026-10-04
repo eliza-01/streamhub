@@ -23,6 +23,7 @@ from streamhub_common.models import (
     Session,
     SiteEventAsset,
     SiteEventPublication,
+    SiteEventTimecode,
     TelegramVideoPartBinding,
     VideoPart,
     VideoPartSegment,
@@ -56,6 +57,15 @@ class SiteCategoriesRequest(BaseModel):
 
 class SiteEventAdminUpdateRequest(BaseModel):
     display_title: str = Field(min_length=1, max_length=1024)
+
+
+class SiteTimecodeInput(BaseModel):
+    offset_ms: int = Field(ge=0, le=2_592_000_000)
+    title: str = Field(min_length=1, max_length=255)
+
+
+class SiteTimecodesRequest(BaseModel):
+    items: list[SiteTimecodeInput] = Field(default_factory=list, max_length=200)
 
 
 def _event_title(event: MediaEvent) -> str:
@@ -119,6 +129,33 @@ def _site_assets_payload(rows: dict[str, SiteEventAsset]) -> dict:
         "frames": [_site_asset_payload(frame) if frame else None for frame in frames],
         "complete": all(rows.get(slot) is not None for slot in SITE_ASSET_SLOTS),
     }
+
+
+def _site_timecode_payload(row: SiteEventTimecode) -> dict:
+    return {
+        "id": int(row.id),
+        "position": int(row.position),
+        "offset_ms": int(row.offset_ms),
+        "title": row.title,
+    }
+
+
+async def _event_timecodes(
+    db: AsyncSession, event_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[SiteEventTimecode]]:
+    if not event_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(SiteEventTimecode)
+            .where(SiteEventTimecode.event_id.in_(event_ids))
+            .order_by(SiteEventTimecode.event_id, SiteEventTimecode.position, SiteEventTimecode.offset_ms)
+        )
+    ).scalars().all()
+    grouped: dict[uuid.UUID, list[SiteEventTimecode]] = defaultdict(list)
+    for row in rows:
+        grouped[row.event_id].append(row)
+    return grouped
 
 
 def _clean_category_slugs(values: list[str]) -> list[str]:
@@ -293,36 +330,40 @@ async def _video_summaries(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict
 async def _site_payloads(
     db: AsyncSession,
     publication_rows: list[tuple[SiteEventPublication, MediaEvent]],
+    *,
+    include_timecodes: bool = False,
 ) -> list[dict]:
     event_ids = [event.id for _publication, event in publication_rows]
     categories = await _event_categories(db, event_ids)
     videos = await _video_summaries(db, event_ids)
     chats = await _chat_summaries(db, event_ids)
     assets = await _event_assets(db, event_ids)
+    timecodes = await _event_timecodes(db, event_ids) if include_timecodes else {}
     payloads: list[dict] = []
     for publication, event in publication_rows:
         sessions = videos.get(event.id, [])
         chat_sessions = chats.get(event.id, [])
         primary = next((item for item in sessions if item["playable"]), sessions[0] if sessions else None)
         primary_chat = next((item for item in chat_sessions if item["message_count"] > 0), chat_sessions[0] if chat_sessions else None)
-        payloads.append(
-            {
-                **_base_event_payload(event),
-                "published_at_utc": publication.published_at_utc,
-                "categories": categories.get(event.id, []),
-                "assets": _site_assets_payload(assets.get(event.id, {})),
-                "video_sessions": sessions,
-                "chat_sessions": chat_sessions,
-                "primary_chat_session_id": primary_chat["id"] if primary_chat else None,
-                "chat_message_count": int(primary_chat["message_count"] if primary_chat else 0),
-                "has_chat": bool(primary_chat and primary_chat["message_count"] > 0),
-                "ready_parts": sum(item["ready_parts"] for item in sessions),
-                "linked_parts": sum(item["linked_parts"] for item in sessions),
-                "primary_video_session_id": primary["id"] if primary else None,
-                "playback_url": primary["playback_url"] if primary else None,
-                "playable": bool(primary and primary["playable"]),
-            }
-        )
+        payload = {
+            **_base_event_payload(event),
+            "published_at_utc": publication.published_at_utc,
+            "categories": categories.get(event.id, []),
+            "assets": _site_assets_payload(assets.get(event.id, {})),
+            "video_sessions": sessions,
+            "chat_sessions": chat_sessions,
+            "primary_chat_session_id": primary_chat["id"] if primary_chat else None,
+            "chat_message_count": int(primary_chat["message_count"] if primary_chat else 0),
+            "has_chat": bool(primary_chat and primary_chat["message_count"] > 0),
+            "ready_parts": sum(item["ready_parts"] for item in sessions),
+            "linked_parts": sum(item["linked_parts"] for item in sessions),
+            "primary_video_session_id": primary["id"] if primary else None,
+            "playback_url": primary["playback_url"] if primary else None,
+            "playable": bool(primary and primary["playable"]),
+        }
+        if include_timecodes:
+            payload["timecodes"] = [_site_timecode_payload(row) for row in timecodes.get(event.id, [])]
+        payloads.append(payload)
     return payloads
 
 
@@ -434,7 +475,7 @@ async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
     row = await _published_event_row(db, event_id)
     if row is None:
         raise HTTPException(404, "site event not found")
-    return (await _site_payloads(db, [row]))[0]
+    return (await _site_payloads(db, [row], include_timecodes=True))[0]
 
 
 def _naive_utc(value: datetime | None) -> datetime | None:
@@ -1112,6 +1153,7 @@ async def site_admin_events(db: AsyncSession = Depends(get_db)) -> dict:
     )
     categories = await _event_categories(db, event_ids)
     assets = await _event_assets(db, event_ids)
+    timecodes = await _event_timecodes(db, event_ids)
     videos = await _video_summaries(db, event_ids)
     return {
         "items": [
@@ -1120,6 +1162,7 @@ async def site_admin_events(db: AsyncSession = Depends(get_db)) -> dict:
                 "published": event.id in publication_ids,
                 "categories": categories.get(event.id, []),
                 "assets": _site_assets_payload(assets.get(event.id, {})),
+                "timecodes": [_site_timecode_payload(row) for row in timecodes.get(event.id, [])],
                 "video_sessions": len(videos.get(event.id, [])),
                 "ready_parts": sum(item["ready_parts"] for item in videos.get(event.id, [])),
                 "linked_parts": sum(item["linked_parts"] for item in videos.get(event.id, [])),
@@ -1185,6 +1228,54 @@ async def update_site_event(
     )
     await db.commit()
     return _base_event_payload(event)
+
+
+@router.put("/admin/events/{event_id}/timecodes")
+async def replace_site_event_timecodes(
+    event_id: uuid.UUID,
+    payload: SiteTimecodesRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    event = await db.get(MediaEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "event not found")
+
+    cleaned: list[tuple[int, str]] = []
+    seen_offsets: set[int] = set()
+    for item in payload.items:
+        title = item.title.strip()
+        if not title:
+            raise HTTPException(400, "timecode title must not be empty")
+        offset_ms = int(item.offset_ms)
+        if offset_ms in seen_offsets:
+            raise HTTPException(400, "timecode offsets must be unique within an event")
+        seen_offsets.add(offset_ms)
+        cleaned.append((offset_ms, title))
+    cleaned.sort(key=lambda item: item[0])
+
+    await db.execute(delete(SiteEventTimecode).where(SiteEventTimecode.event_id == event_id))
+    for position, (offset_ms, title) in enumerate(cleaned, start=1):
+        db.add(
+            SiteEventTimecode(
+                event_id=event_id,
+                position=position,
+                offset_ms=offset_ms,
+                title=title,
+            )
+        )
+    db.add(
+        AuditLog(
+            event_id=event_id,
+            action="site_timecodes_replace",
+            payload_json={
+                "count": len(cleaned),
+                "items": [{"offset_ms": offset_ms, "title": title} for offset_ms, title in cleaned],
+            },
+        )
+    )
+    await db.commit()
+    rows = (await _event_timecodes(db, [event_id])).get(event_id, [])
+    return {"items": [_site_timecode_payload(row) for row in rows]}
 
 
 @router.put("/admin/events/{event_id}/assets/{slot}")

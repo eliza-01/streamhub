@@ -275,3 +275,53 @@ def test_site_admin_api_and_ui_manage_display_title_cover_and_four_manual_frames
     assert 'onPublish={() => void openSitePublisher()}' not in web
     assert '.site-admin-modal' in css
     assert '.streamvault-artwork.has-image' in css
+
+
+def test_site_timecodes_use_event_owned_relational_storage_and_public_payloads():
+    migration = _read("migrations/versions/0012_site_event_timecodes.py")
+    models = _read("packages/python_common/streamhub_common/models.py")
+    route = _read("apps/api/app/routers/site.py")
+
+    assert 'down_revision = "0011_site_admin_assets"' in migration
+    assert '"site_event_timecodes"' in migration
+    assert 'sa.ForeignKeyConstraint(["event_id"], ["media_events.id"], ondelete="CASCADE")' in migration
+    assert '"ix_site_event_timecodes_event_offset"' in migration
+    assert 'class SiteEventTimecode(Base):' in models
+    assert 'UniqueConstraint("event_id", "position", name="uq_site_event_timecodes_position")' in models
+    assert '@router.put("/admin/events/{event_id}/timecodes")' in route
+    assert 'delete(SiteEventTimecode).where(SiteEventTimecode.event_id == event_id)' in route
+    assert 'action="site_timecodes_replace"' in route
+    assert '"timecodes": [_site_timecode_payload(row) for row in timecodes.get(event.id, [])]' in route
+
+
+def test_site_admin_collapses_events_and_edits_timecodes_without_embedding_a_player():
+    web = _read("apps/web/src/main.tsx")
+    css = _read("apps/web/src/styles.css")
+
+    assert '<details className="site-admin-event"' in web
+    assert '<summary className="site-admin-event-summary">' in web
+    assert '<span>Статус</span>' in web
+    assert '<span>Дата</span>' in web
+    assert '<span>Категории</span>' in web
+    assert '<span>Название</span>' in web
+    assert '<span>Изображения</span>' in web
+    assert 'Добавить таймкоды' in web
+    assert 'placeholder="00:00:00"' in web
+    assert 'placeholder="Например: Начало матча"' in web
+    assert 'fetch(`${API}/api/v1/site/admin/events/${eventId}/timecodes`' in web
+    assert 'Время указывается относительно публичного видеоплеера.' in web
+    assert '.site-admin-event-summary' in css
+    assert '.site-admin-timecode-row' in css
+
+
+def test_public_event_renders_clickable_timecodes_and_active_section_heading_without_count():
+    web = _read("apps/web/src/main.tsx")
+    css = _read("apps/web/src/styles.css")
+
+    assert 'function SiteEventTimecodes(' in web
+    assert '<SiteEventTimecodes items={selectedSiteEvent.timecodes || []} videoRef={siteVideoRef} />' in web
+    assert 'video.currentTime = Math.max(0, item.offset_ms / 1000)' in web
+    assert '{siteCategory === "all" ? "Все видео"' in web
+    assert '<span>{siteEvents.length.toLocaleString("ru-RU")}</span>' not in web
+    assert '.streamvault-timecodes-list button' in css
+    assert '.streamvault-hero > h1, .streamvault-recordings h2 { margin: 0; color: var(--sv-orange-2);' in css

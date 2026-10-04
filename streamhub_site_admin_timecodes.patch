@@ -1,0 +1,842 @@
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+index 2fd3e16581a6b29d67625787e03ff98247a8ca37..05136c7b730470bc68f730a7dd3e0953d608b852 100644
+--- a/apps/api/app/routers/site.py
++++ b/apps/api/app/routers/site.py
+@@ -23,6 +23,7 @@ from streamhub_common.models import (
+     Session,
+     SiteEventAsset,
+     SiteEventPublication,
++    SiteEventTimecode,
+     TelegramVideoPartBinding,
+     VideoPart,
+     VideoPartSegment,
+@@ -58,6 +59,15 @@ class SiteEventAdminUpdateRequest(BaseModel):
+     display_title: str = Field(min_length=1, max_length=1024)
+ 
+ 
++class SiteTimecodeInput(BaseModel):
++    offset_ms: int = Field(ge=0, le=2_592_000_000)
++    title: str = Field(min_length=1, max_length=255)
++
++
++class SiteTimecodesRequest(BaseModel):
++    items: list[SiteTimecodeInput] = Field(default_factory=list, max_length=200)
++
++
+ def _event_title(event: MediaEvent) -> str:
+     return event.display_title or event.title or event.channel_display_name or event.channel_login or event.external_key
+ 
+@@ -121,6 +131,33 @@ def _site_assets_payload(rows: dict[str, SiteEventAsset]) -> dict:
+     }
+ 
+ 
++def _site_timecode_payload(row: SiteEventTimecode) -> dict:
++    return {
++        "id": int(row.id),
++        "position": int(row.position),
++        "offset_ms": int(row.offset_ms),
++        "title": row.title,
++    }
++
++
++async def _event_timecodes(
++    db: AsyncSession, event_ids: list[uuid.UUID]
++) -> dict[uuid.UUID, list[SiteEventTimecode]]:
++    if not event_ids:
++        return {}
++    rows = (
++        await db.execute(
++            select(SiteEventTimecode)
++            .where(SiteEventTimecode.event_id.in_(event_ids))
++            .order_by(SiteEventTimecode.event_id, SiteEventTimecode.position, SiteEventTimecode.offset_ms)
++        )
++    ).scalars().all()
++    grouped: dict[uuid.UUID, list[SiteEventTimecode]] = defaultdict(list)
++    for row in rows:
++        grouped[row.event_id].append(row)
++    return grouped
++
++
+ def _clean_category_slugs(values: list[str]) -> list[str]:
+     cleaned: list[str] = []
+     for value in values:
+@@ -293,36 +330,40 @@ async def _video_summaries(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict
+ async def _site_payloads(
+     db: AsyncSession,
+     publication_rows: list[tuple[SiteEventPublication, MediaEvent]],
++    *,
++    include_timecodes: bool = False,
+ ) -> list[dict]:
+     event_ids = [event.id for _publication, event in publication_rows]
+     categories = await _event_categories(db, event_ids)
+     videos = await _video_summaries(db, event_ids)
+     chats = await _chat_summaries(db, event_ids)
+     assets = await _event_assets(db, event_ids)
++    timecodes = await _event_timecodes(db, event_ids) if include_timecodes else {}
+     payloads: list[dict] = []
+     for publication, event in publication_rows:
+         sessions = videos.get(event.id, [])
+         chat_sessions = chats.get(event.id, [])
+         primary = next((item for item in sessions if item["playable"]), sessions[0] if sessions else None)
+         primary_chat = next((item for item in chat_sessions if item["message_count"] > 0), chat_sessions[0] if chat_sessions else None)
+-        payloads.append(
+-            {
+-                **_base_event_payload(event),
+-                "published_at_utc": publication.published_at_utc,
+-                "categories": categories.get(event.id, []),
+-                "assets": _site_assets_payload(assets.get(event.id, {})),
+-                "video_sessions": sessions,
+-                "chat_sessions": chat_sessions,
+-                "primary_chat_session_id": primary_chat["id"] if primary_chat else None,
+-                "chat_message_count": int(primary_chat["message_count"] if primary_chat else 0),
+-                "has_chat": bool(primary_chat and primary_chat["message_count"] > 0),
+-                "ready_parts": sum(item["ready_parts"] for item in sessions),
+-                "linked_parts": sum(item["linked_parts"] for item in sessions),
+-                "primary_video_session_id": primary["id"] if primary else None,
+-                "playback_url": primary["playback_url"] if primary else None,
+-                "playable": bool(primary and primary["playable"]),
+-            }
+-        )
++        payload = {
++            **_base_event_payload(event),
++            "published_at_utc": publication.published_at_utc,
++            "categories": categories.get(event.id, []),
++            "assets": _site_assets_payload(assets.get(event.id, {})),
++            "video_sessions": sessions,
++            "chat_sessions": chat_sessions,
++            "primary_chat_session_id": primary_chat["id"] if primary_chat else None,
++            "chat_message_count": int(primary_chat["message_count"] if primary_chat else 0),
++            "has_chat": bool(primary_chat and primary_chat["message_count"] > 0),
++            "ready_parts": sum(item["ready_parts"] for item in sessions),
++            "linked_parts": sum(item["linked_parts"] for item in sessions),
++            "primary_video_session_id": primary["id"] if primary else None,
++            "playback_url": primary["playback_url"] if primary else None,
++            "playable": bool(primary and primary["playable"]),
++        }
++        if include_timecodes:
++            payload["timecodes"] = [_site_timecode_payload(row) for row in timecodes.get(event.id, [])]
++        payloads.append(payload)
+     return payloads
+ 
+ 
+@@ -434,7 +475,7 @@ async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
+     row = await _published_event_row(db, event_id)
+     if row is None:
+         raise HTTPException(404, "site event not found")
+-    return (await _site_payloads(db, [row]))[0]
++    return (await _site_payloads(db, [row], include_timecodes=True))[0]
+ 
+ 
+ def _naive_utc(value: datetime | None) -> datetime | None:
+@@ -1112,6 +1153,7 @@ async def site_admin_events(db: AsyncSession = Depends(get_db)) -> dict:
+     )
+     categories = await _event_categories(db, event_ids)
+     assets = await _event_assets(db, event_ids)
++    timecodes = await _event_timecodes(db, event_ids)
+     videos = await _video_summaries(db, event_ids)
+     return {
+         "items": [
+@@ -1120,6 +1162,7 @@ async def site_admin_events(db: AsyncSession = Depends(get_db)) -> dict:
+                 "published": event.id in publication_ids,
+                 "categories": categories.get(event.id, []),
+                 "assets": _site_assets_payload(assets.get(event.id, {})),
++                "timecodes": [_site_timecode_payload(row) for row in timecodes.get(event.id, [])],
+                 "video_sessions": len(videos.get(event.id, [])),
+                 "ready_parts": sum(item["ready_parts"] for item in videos.get(event.id, [])),
+                 "linked_parts": sum(item["linked_parts"] for item in videos.get(event.id, [])),
+@@ -1187,6 +1230,54 @@ async def update_site_event(
+     return _base_event_payload(event)
+ 
+ 
++@router.put("/admin/events/{event_id}/timecodes")
++async def replace_site_event_timecodes(
++    event_id: uuid.UUID,
++    payload: SiteTimecodesRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    event = await db.get(MediaEvent, event_id)
++    if event is None:
++        raise HTTPException(404, "event not found")
++
++    cleaned: list[tuple[int, str]] = []
++    seen_offsets: set[int] = set()
++    for item in payload.items:
++        title = item.title.strip()
++        if not title:
++            raise HTTPException(400, "timecode title must not be empty")
++        offset_ms = int(item.offset_ms)
++        if offset_ms in seen_offsets:
++            raise HTTPException(400, "timecode offsets must be unique within an event")
++        seen_offsets.add(offset_ms)
++        cleaned.append((offset_ms, title))
++    cleaned.sort(key=lambda item: item[0])
++
++    await db.execute(delete(SiteEventTimecode).where(SiteEventTimecode.event_id == event_id))
++    for position, (offset_ms, title) in enumerate(cleaned, start=1):
++        db.add(
++            SiteEventTimecode(
++                event_id=event_id,
++                position=position,
++                offset_ms=offset_ms,
++                title=title,
++            )
++        )
++    db.add(
++        AuditLog(
++            event_id=event_id,
++            action="site_timecodes_replace",
++            payload_json={
++                "count": len(cleaned),
++                "items": [{"offset_ms": offset_ms, "title": title} for offset_ms, title in cleaned],
++            },
++        )
++    )
++    await db.commit()
++    rows = (await _event_timecodes(db, [event_id])).get(event_id, [])
++    return {"items": [_site_timecode_payload(row) for row in rows]}
++
++
+ @router.put("/admin/events/{event_id}/assets/{slot}")
+ async def upload_site_event_asset(
+     event_id: uuid.UUID,
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 394156050a6bb507ea03cff44633e33838b511c3..e3097e88823ca9d4fd1b8306aa1553cde21670ac 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -377,6 +377,13 @@ type SiteAssets = {
+   complete: boolean;
+ };
+ 
++type SiteTimecode = {
++  id: number;
++  position: number;
++  offset_ms: number;
++  title: string;
++};
++
+ type SiteEvent = {
+   id: string;
+   platform: string;
+@@ -393,6 +400,7 @@ type SiteEvent = {
+   published_at_utc: string;
+   categories: Array<SiteCategory & { position?: number }>;
+   assets: SiteAssets;
++  timecodes?: SiteTimecode[];
+   video_sessions: SiteVideoSession[];
+   chat_sessions: SiteChatSession[];
+   primary_chat_session_id?: string | null;
+@@ -425,6 +433,7 @@ type SiteAvailableEvent = {
+ type SiteAdminEvent = SiteAvailableEvent & {
+   published: boolean;
+   categories: Array<SiteCategory & { position?: number }>;
++  timecodes: SiteTimecode[];
+ };
+ 
+ type MediaEvent = {
+@@ -509,6 +518,16 @@ function fmtMs(ms?: number | null) {
+   return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
+ }
+ 
++function parseTimecodeText(value: string): number | null {
++  const parts = value.trim().split(":");
++  if (parts.length !== 2 && parts.length !== 3) return null;
++  const numbers = parts.map((part) => Number(part));
++  if (numbers.some((part) => !Number.isInteger(part) || part < 0)) return null;
++  const [hours, minutes, seconds] = parts.length === 3 ? numbers : [0, numbers[0], numbers[1]];
++  if (minutes > 59 || seconds > 59) return null;
++  return (hours * 3600 + minutes * 60 + seconds) * 1000;
++}
++
+ function fmtBytes(bytes?: number | null) {
+   if (bytes == null) return "—";
+   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+@@ -1804,6 +1823,38 @@ function SiteArtwork({ event, wide = false, label, src }: { event: SiteEvent; wi
+   );
+ }
+ 
++function SiteEventTimecodes({
++  items,
++  videoRef,
++}: {
++  items: SiteTimecode[];
++  videoRef: { current: HTMLVideoElement | null };
++}) {
++  if (!items.length) return null;
++  return (
++    <section className="streamvault-timecodes" aria-label="Таймкоды события">
++      <div className="streamvault-timecodes-head"><strong>Таймкоды</strong><span>{items.length}</span></div>
++      <div className="streamvault-timecodes-list">
++        {items.map((item) => (
++          <button
++            type="button"
++            key={item.id}
++            onClick={() => {
++              const video = videoRef.current;
++              if (!video) return;
++              video.currentTime = Math.max(0, item.offset_ms / 1000);
++              void video.play().catch(() => undefined);
++            }}
++          >
++            <time>{fmtMs(item.offset_ms)}</time>
++            <strong>{item.title}</strong>
++          </button>
++        ))}
++      </div>
++    </section>
++  );
++}
++
+ function SiteAdminPanel({
+   events,
+   drafts,
+@@ -1812,6 +1863,7 @@ function SiteAdminPanel({
+   onDraftChange,
+   onSaveTitle,
+   onUpload,
++  onSaveTimecodes,
+   onAddEvent,
+   onClose,
+ }: {
+@@ -1822,6 +1874,7 @@ function SiteAdminPanel({
+   onDraftChange: (eventId: string, value: string) => void;
+   onSaveTitle: (eventId: string) => void;
+   onUpload: (eventId: string, slot: string, file: File) => void;
++  onSaveTimecodes: (eventId: string, items: Array<{ offset_ms: number; title: string }>) => Promise<boolean>;
+   onAddEvent: () => void;
+   onClose: () => void;
+ }) {
+@@ -1838,6 +1891,8 @@ function SiteAdminPanel({
+   const [uploadTarget, setUploadTarget] = useState<{ eventId: string; slot: string; label: string } | null>(null);
+   const [clipboardNotice, setClipboardNotice] = useState("");
+   const uploadInputRef = useRef<HTMLInputElement | null>(null);
++  const [timecodeEditorEventId, setTimecodeEditorEventId] = useState<string | null>(null);
++  const [timecodeDrafts, setTimecodeDrafts] = useState<Record<string, Array<{ time: string; title: string }>>>({});
+ 
+   useEffect(() => {
+     if (!uploadTarget) return;
+@@ -1872,6 +1927,38 @@ function SiteAdminPanel({
+     onUpload(target.eventId, target.slot, file);
+   };
+ 
++  const openTimecodeEditor = (event: SiteAdminEvent) => {
++    setTimecodeDrafts((current) => ({
++      ...current,
++      [event.id]: current[event.id] || (event.timecodes.length
++        ? event.timecodes.map((item) => ({ time: fmtMs(item.offset_ms), title: item.title }))
++        : [{ time: "00:00:00", title: "" }]),
++    }));
++    setTimecodeEditorEventId(event.id);
++  };
++
++  const updateTimecodeDraft = (eventId: string, index: number, key: "time" | "title", value: string) => {
++    setTimecodeDrafts((current) => ({
++      ...current,
++      [eventId]: (current[eventId] || []).map((item, itemIndex) => itemIndex === index ? { ...item, [key]: value } : item),
++    }));
++  };
++
++  const removeTimecodeDraft = (eventId: string, index: number) => {
++    setTimecodeDrafts((current) => ({
++      ...current,
++      [eventId]: (current[eventId] || []).filter((_item, itemIndex) => itemIndex !== index),
++    }));
++  };
++
++  const saveTimecodes = async (eventId: string) => {
++    const drafts = timecodeDrafts[eventId] || [];
++    const parsed = drafts.map((item) => ({ offset_ms: parseTimecodeText(item.time), title: item.title.trim() }));
++    if (parsed.some((item) => item.offset_ms == null || !item.title)) return;
++    const saved = await onSaveTimecodes(eventId, parsed.map((item) => ({ offset_ms: item.offset_ms as number, title: item.title })));
++    if (saved) setTimecodeEditorEventId(null);
++  };
++
+   return (
+     <div className="site-modal-backdrop site-admin-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+       <div className="site-modal site-admin-modal" role="dialog" aria-modal="true" aria-labelledby="siteAdminTitle">
+@@ -1887,47 +1974,119 @@ function SiteAdminPanel({
+           <div className="site-empty compact">Нет событий с готовым Telegram-backed видео.</div>
+         ) : (
+           <div className="site-admin-event-list">
+-            {events.map((event) => (
+-              <section className="site-admin-event" key={event.id}>
+-                <div className="site-admin-event-top">
+-                  <div>
+-                    <span className={`site-admin-publish-state ${event.published ? "is-published" : ""}`}>{event.published ? "Опубликовано" : "Не опубликовано"}</span>
+-                    <h3>{event.display_title}</h3>
+-                    <p>Исходное название: <strong>{event.source_title || "—"}</strong></p>
+-                    <small>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleString("ru-RU") : "Дата неизвестна"} · TG {event.linked_parts}/{event.ready_parts}</small>
+-                  </div>
+-                  <span className={`site-admin-assets-state ${event.assets.complete ? "is-complete" : ""}`}>{event.assets.complete ? "5/5 изображений" : `${Number(Boolean(event.assets.cover)) + event.assets.frames.filter(Boolean).length}/5 изображений`}</span>
+-                </div>
+-                <div className="site-admin-title-editor">
+-                  <label>
+-                    <span>Отображаемое название</span>
+-                    <input value={drafts[event.id] ?? event.display_title} maxLength={1024} onChange={(e) => onDraftChange(event.id, e.target.value)} />
+-                  </label>
+-                  <button type="button" disabled={actionKey === `title:${event.id}` || !(drafts[event.id] ?? event.display_title).trim() || (drafts[event.id] ?? event.display_title).trim() === event.display_title} onClick={() => onSaveTitle(event.id)}>
+-                    {actionKey === `title:${event.id}` ? "Сохраняю…" : "Сохранить"}
+-                  </button>
+-                </div>
+-                <div className="site-admin-assets">
+-                  {assetSlots.map(([slot, label]) => {
+-                    const asset = assetFor(event, slot);
+-                    const busy = actionKey === `asset:${event.id}:${slot}`;
+-                    return (
+-                      <button
+-                        type="button"
+-                        className={`site-admin-asset ${asset ? "has-asset" : ""}`}
+-                        key={slot}
+-                        disabled={Boolean(actionKey)}
+-                        onClick={() => openAssetPicker(event.id, slot, label)}
+-                      >
+-                        <span>{label}</span>
+-                        <div>{asset ? <img src={apiUrl(asset.url)} alt="" /> : <b>+</b>}</div>
+-                        <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height} · заменить` : "Файл или Ctrl+V"}</small>
++            {events.map((event) => {
++              const assetCount = Number(Boolean(event.assets.cover)) + event.assets.frames.filter(Boolean).length;
++              const eventTimecodes = timecodeDrafts[event.id] || [];
++              const timecodesValid = eventTimecodes.every((item) => parseTimecodeText(item.time) != null && Boolean(item.title.trim()));
++              return (
++                <details className="site-admin-event" key={event.id}>
++                  <summary className="site-admin-event-summary">
++                    <div className="site-admin-summary-cell is-status">
++                      <span>Статус</span>
++                      <strong className={`site-admin-publish-state ${event.published ? "is-published" : ""}`}>{event.published ? "Опубликовано" : "Не опубликовано"}</strong>
++                    </div>
++                    <div className="site-admin-summary-cell is-date">
++                      <span>Дата</span>
++                      <strong>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleDateString("ru-RU") : "—"}</strong>
++                    </div>
++                    <div className="site-admin-summary-cell is-categories">
++                      <span>Категории</span>
++                      <strong>{event.categories.length ? event.categories.map((category) => category.label).join(" · ") : "Без категории"}</strong>
++                    </div>
++                    <div className="site-admin-summary-cell is-title">
++                      <span>Название</span>
++                      <strong>{event.display_title}</strong>
++                    </div>
++                    <div className="site-admin-summary-cell is-assets">
++                      <span>Изображения</span>
++                      <strong className={`site-admin-assets-state ${event.assets.complete ? "is-complete" : ""}`}>{assetCount}/5</strong>
++                    </div>
++                  </summary>
++                  <div className="site-admin-event-body">
++                    <div className="site-admin-source-meta">
++                      <span>Исходное название: <strong>{event.source_title || "—"}</strong></span>
++                      <span>TG {event.linked_parts}/{event.ready_parts}</span>
++                    </div>
++                    <div className="site-admin-title-editor">
++                      <label>
++                        <span>Отображаемое название</span>
++                        <input value={drafts[event.id] ?? event.display_title} maxLength={1024} onChange={(e) => onDraftChange(event.id, e.target.value)} />
++                      </label>
++                      <button type="button" disabled={actionKey === `title:${event.id}` || !(drafts[event.id] ?? event.display_title).trim() || (drafts[event.id] ?? event.display_title).trim() === event.display_title} onClick={() => onSaveTitle(event.id)}>
++                        {actionKey === `title:${event.id}` ? "Сохраняю…" : "Сохранить"}
+                       </button>
+-                    );
+-                  })}
+-                </div>
+-              </section>
+-            ))}
++                    </div>
++                    <div className="site-admin-assets">
++                      {assetSlots.map(([slot, label]) => {
++                        const asset = assetFor(event, slot);
++                        const busy = actionKey === `asset:${event.id}:${slot}`;
++                        return (
++                          <button
++                            type="button"
++                            className={`site-admin-asset ${asset ? "has-asset" : ""}`}
++                            key={slot}
++                            disabled={Boolean(actionKey)}
++                            onClick={() => openAssetPicker(event.id, slot, label)}
++                          >
++                            <span>{label}</span>
++                            <div>{asset ? <img src={apiUrl(asset.url)} alt="" /> : <b>+</b>}</div>
++                            <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height} · заменить` : "Файл или Ctrl+V"}</small>
++                          </button>
++                        );
++                      })}
++                    </div>
++                    <div className="site-admin-timecodes-actions">
++                      <button type="button" className="site-admin-timecodes-open" onClick={() => openTimecodeEditor(event)}>Добавить таймкоды</button>
++                    </div>
++                    {timecodeEditorEventId === event.id ? (
++                      <div className="site-admin-timecodes-editor">
++                        <div className="site-admin-timecodes-editor-head">
++                          <div><strong>Таймкоды события</strong><span>Время указывается относительно публичного видеоплеера.</span></div>
++                          <button type="button" onClick={() => setTimecodeEditorEventId(null)}>Закрыть</button>
++                        </div>
++                        <div className="site-admin-timecode-rows">
++                          {eventTimecodes.map((item, index) => (
++                            <div className="site-admin-timecode-row" key={`${event.id}:${index}`}>
++                              <label>
++                                <span>Время</span>
++                                <input
++                                  value={item.time}
++                                  inputMode="numeric"
++                                  placeholder="00:00:00"
++                                  onChange={(e) => updateTimecodeDraft(event.id, index, "time", e.target.value)}
++                                />
++                              </label>
++                              <label>
++                                <span>Название таймкода</span>
++                                <input
++                                  value={item.title}
++                                  maxLength={255}
++                                  placeholder="Например: Начало матча"
++                                  onChange={(e) => updateTimecodeDraft(event.id, index, "title", e.target.value)}
++                                />
++                              </label>
++                              <button type="button" className="site-admin-timecode-remove" onClick={() => removeTimecodeDraft(event.id, index)} aria-label="Удалить таймкод">×</button>
++                            </div>
++                          ))}
++                        </div>
++                        <div className="site-admin-timecodes-footer">
++                          <button
++                            type="button"
++                            onClick={() => setTimecodeDrafts((current) => ({ ...current, [event.id]: [...(current[event.id] || []), { time: "00:00:00", title: "" }] }))}
++                          >+ Ещё таймкод</button>
++                          <button
++                            type="button"
++                            className="primary"
++                            disabled={Boolean(actionKey) || !timecodesValid}
++                            onClick={() => void saveTimecodes(event.id)}
++                          >{actionKey === `timecodes:${event.id}` ? "Сохраняю…" : "Сохранить таймкоды"}</button>
++                        </div>
++                      </div>
++                    ) : null}
++                  </div>
++                </details>
++              );
++            })}
+           </div>
+         )}
+         {uploadTarget ? (
+@@ -2403,6 +2562,30 @@ function App() {
+     }
+   }
+ 
++  async function saveSiteTimecodes(eventId: string, items: Array<{ offset_ms: number; title: string }>) {
++    setSiteAdminActionKey(`timecodes:${eventId}`);
++    try {
++      const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}/timecodes`, {
++        method: "PUT",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ items }),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      const data = await res.json() as { items?: SiteTimecode[] };
++      const timecodes = data.items || [];
++      setSiteAdminEvents((current) => current.map((event) => event.id === eventId ? { ...event, timecodes } : event));
++      setSiteEvents((current) => current.map((event) => event.id === eventId ? { ...event, timecodes } : event));
++      setSelectedSiteEvent((current) => current?.id === eventId ? { ...current, timecodes } : current);
++      setError(null);
++      return true;
++    } catch (e) {
++      setError(String(e));
++      return false;
++    } finally {
++      setSiteAdminActionKey(null);
++    }
++  }
++
+   async function openSitePublisher() {
+     setSiteAction(true);
+     try {
+@@ -3046,6 +3229,7 @@ function App() {
+                   <div className="streamvault-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
+                 )}
+               </div>
++              <SiteEventTimecodes items={selectedSiteEvent.timecodes || []} videoRef={siteVideoRef} />
+               <section className="streamvault-watch-meta">
+                 <div className="streamvault-watch-title-row">
+                   <div>
+@@ -3116,6 +3300,7 @@ function App() {
+             onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
+             onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
+             onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
++            onSaveTimecodes={saveSiteTimecodes}
+             onAddEvent={() => { setSiteAdminOpen(false); closeSiteEvent(); void openSitePublisher(); }}
+             onClose={() => setSiteAdminOpen(false)}
+           />
+@@ -3206,9 +3391,8 @@ function App() {
+             <section className="streamvault-recordings" aria-labelledby="streamvaultRecordingsTitle">
+               <div className="streamvault-section-head">
+                 <div>
+-                  <h2 id="streamvaultRecordingsTitle">{siteCategory === "all" ? "Записи" : siteCategories.find((category) => category.slug === siteCategory)?.label || "Записи"}</h2>
++                  <h2 id="streamvaultRecordingsTitle">{siteCategory === "all" ? "Все видео" : siteCategories.find((category) => category.slug === siteCategory)?.label || "Все видео"}</h2>
+                 </div>
+-                <span>{siteEvents.length.toLocaleString("ru-RU")}</span>
+               </div>
+               {siteEvents.length === 0 ? (
+                 <div className="streamvault-empty">Пока нет опубликованных записей в этом разделе.</div>
+@@ -3248,6 +3432,7 @@ function App() {
+             onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
+             onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
+             onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
++            onSaveTimecodes={saveSiteTimecodes}
+             onAddEvent={() => { setSiteAdminOpen(false); void openSitePublisher(); }}
+             onClose={() => setSiteAdminOpen(false)}
+           />
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index bdad32ff6dccde547fb25a9d3c30e4ad5a5067c1..c80fee849e55aa34aecbdc12874701080c257260 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -450,7 +450,7 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-content { max-width: none; min-width: 0; margin: 0; padding: 0; }
+ .streamvault-error { margin-bottom: 18px; padding: 12px 14px; border: 1px solid #6e3434; border-radius: 11px; background: #261516; color: #efb3b3; font-size: 12px; }
+ .streamvault-hero { margin-bottom: 36px; }
+-.streamvault-hero > h1, .streamvault-recordings h2 { margin: 0; font-size: 21px; line-height: 1.2; letter-spacing: -.025em; }
++.streamvault-hero > h1, .streamvault-recordings h2 { margin: 0; color: var(--sv-orange-2); font-size: 21px; line-height: 1.2; letter-spacing: -.025em; }
+ .streamvault-hero > h1 { margin-bottom: 13px; }
+ .streamvault-latest-layout { display: grid; grid-template-columns: minmax(190px, 240px) minmax(0, 1fr); gap: 18px; }
+ .streamvault-latest-cover, .streamvault-preview-main, .streamvault-preview-rail > button, .streamvault-recording-cover-link {
+@@ -563,6 +563,15 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-player { width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--sv-line); border-radius: 14px; background: #000; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+ .streamvault-player .telegram-player { width: 100%; height: 100%; max-height: none; border-radius: 0; object-fit: contain; }
+ .streamvault-video-placeholder { width: 100%; height: 100%; display: grid; place-items: center; padding: 28px; color: var(--sv-muted); text-align: center; }
++.streamvault-timecodes { margin-top: 10px; padding: 11px 12px 12px; border: 1px solid var(--sv-line-soft); border-radius: 12px; background: rgba(12,17,22,.78); }
++.streamvault-timecodes-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
++.streamvault-timecodes-head strong { color: var(--sv-orange-2); font-size: 11px; letter-spacing: .045em; text-transform: uppercase; }
++.streamvault-timecodes-head span { color: #68737d; font-size: 10px; font-variant-numeric: tabular-nums; }
++.streamvault-timecodes-list { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: thin; }
++.streamvault-timecodes-list button { flex: 0 0 auto; min-width: 150px; max-width: 280px; display: grid; grid-template-columns: auto minmax(0,1fr); align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #28333d; border-radius: 9px; background: #10171d; color: #dfe5e9; text-align: left; transition: border-color .14s ease, background .14s ease, transform .14s ease; }
++.streamvault-timecodes-list button:hover { border-color: rgba(255,120,24,.58); background: rgba(255,120,24,.07); transform: translateY(-1px); }
++.streamvault-timecodes-list time { color: var(--sv-orange-2); font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
++.streamvault-timecodes-list strong { overflow: hidden; color: #dfe5e9; font-size: 11px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+ .streamvault-watch-meta { padding: 17px 2px 0; }
+ .streamvault-watch-title-row { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; }
+ .streamvault-watch-title-row h1 { margin: 0 0 8px; font-size: clamp(20px, 2.4vw, 30px); line-height: 1.22; letter-spacing: -.025em; }
+@@ -794,15 +803,26 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .site-admin-head-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+ .site-admin-head-actions .primary { border-color: var(--sv-orange); background: var(--sv-orange); color: #17100b; font-weight: 800; }
+ .site-admin-storage-note { margin: 10px 0 18px; color: #78848f; font-size: 11px; line-height: 1.5; }
+-.site-admin-event-list { display: grid; gap: 14px; }
+-.site-admin-event { padding: 16px; border: 1px solid #2a3540; border-radius: 14px; background: #0d1318; }
+-.site-admin-event-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+-.site-admin-event-top h3 { margin: 8px 0 5px; color: #f0f3f5; font-size: 16px; line-height: 1.3; }
+-.site-admin-event-top p { margin: 0; color: #7f8a94; font-size: 11px; }
+-.site-admin-event-top p strong { color: #aeb7bf; font-weight: 650; }
+-.site-admin-event-top small { display: block; margin-top: 6px; color: #606c77; font-size: 10px; }
++.site-admin-event-list { display: grid; gap: 10px; }
++.site-admin-event { overflow: hidden; padding: 0; border: 1px solid #2a3540; border-radius: 14px; background: #0d1318; }
++.site-admin-event-summary { display: grid; grid-template-columns: 132px 112px minmax(150px,.8fr) minmax(230px,2fr) 92px; align-items: center; gap: 12px; padding: 13px 15px; list-style: none; cursor: pointer; user-select: none; transition: background .14s ease, border-color .14s ease; }
++.site-admin-event-summary::-webkit-details-marker { display: none; }
++.site-admin-event-summary::marker { display: none; content: ""; }
++.site-admin-event-summary:hover { background: #111920; }
++.site-admin-event[open] > .site-admin-event-summary { background: #111920; }
++.site-admin-summary-cell { min-width: 0; display: grid; gap: 5px; }
++.site-admin-summary-cell > span { color: #65717c; font-size: 8px; font-weight: 850; letter-spacing: .065em; text-transform: uppercase; }
++.site-admin-summary-cell > strong { min-width: 0; overflow: hidden; color: #dce2e7; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
++.site-admin-summary-cell.is-title > strong { color: #f0f3f5; font-size: 12px; }
++.site-admin-summary-cell.is-date > strong { font-variant-numeric: tabular-nums; }
++.site-admin-summary-cell.is-assets { justify-items: end; }
++.site-admin-summary-cell.is-assets > span { justify-self: end; }
++.site-admin-event-body { padding: 16px; border-top: 1px solid #26313b; background: #0c1217; }
++.site-admin-source-meta { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 18px; color: #6e7a85; font-size: 10px; }
++.site-admin-source-meta strong { color: #aeb7bf; font-weight: 650; }
+ .site-admin-publish-state, .site-admin-assets-state { display: inline-flex; align-items: center; min-height: 23px; width: max-content; padding: 0 8px; border: 1px solid #34414e; border-radius: 999px; color: #89949e; font-size: 9px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+ .site-admin-publish-state.is-published, .site-admin-assets-state.is-complete { border-color: rgba(69,178,116,.48); background: rgba(69,178,116,.08); color: #75c99a; }
++.site-admin-summary-cell .site-admin-publish-state, .site-admin-summary-cell .site-admin-assets-state { min-height: 22px; max-width: 100%; }
+ .site-admin-title-editor { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: end; margin-top: 14px; }
+ .site-admin-title-editor label { display: grid; gap: 6px; }
+ .site-admin-title-editor label > span { color: #929ca5; font-size: 10px; font-weight: 750; }
+@@ -820,6 +840,24 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .site-admin-asset img { width: 100%; height: 100%; object-fit: cover; display: block; }
+ .site-admin-asset b { color: #56626d; font-size: 24px; font-weight: 400; }
+ .site-admin-asset small { overflow: hidden; color: #68747e; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
++.site-admin-timecodes-actions { margin-top: 15px; padding-top: 14px; border-top: 1px solid #25303a; }
++.site-admin-timecodes-open { border-color: rgba(255,120,24,.42); background: rgba(255,120,24,.08); color: var(--sv-orange-2); font-weight: 800; }
++.site-admin-timecodes-open:hover:not(:disabled) { border-color: var(--sv-orange); background: rgba(255,120,24,.14); }
++.site-admin-timecodes-editor { margin-top: 11px; padding: 14px; border: 1px solid #2d3944; border-radius: 11px; background: #10171d; }
++.site-admin-timecodes-editor-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
++.site-admin-timecodes-editor-head > div { display: grid; gap: 4px; }
++.site-admin-timecodes-editor-head strong { color: #edf1f4; font-size: 13px; }
++.site-admin-timecodes-editor-head span { color: #6d7984; font-size: 9px; }
++.site-admin-timecode-rows { display: grid; gap: 8px; }
++.site-admin-timecode-row { display: grid; grid-template-columns: 132px minmax(0,1fr) 34px; align-items: end; gap: 8px; }
++.site-admin-timecode-row label { min-width: 0; display: grid; gap: 5px; }
++.site-admin-timecode-row label > span { color: #7e8993; font-size: 9px; font-weight: 750; }
++.site-admin-timecode-row input { width: 100%; min-width: 0; height: 36px; border: 1px solid #34414e; border-radius: 8px; background: #0c1217; color: #eef2f5; padding: 0 10px; outline: none; }
++.site-admin-timecode-row input:focus { border-color: var(--sv-orange); box-shadow: 0 0 0 2px rgba(255,120,24,.09); }
++.site-admin-timecode-remove { width: 34px; height: 36px; padding: 0; border-color: #3a4651; background: #151d24; color: #9aa5ae; font-size: 18px; }
++.site-admin-timecode-remove:hover:not(:disabled) { border-color: #84413d; color: #f0a19a; }
++.site-admin-timecodes-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
++.site-admin-timecodes-footer .primary { border-color: var(--sv-orange); background: var(--sv-orange); color: #17100b; font-weight: 850; }
+ .site-admin-asset-picker-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 20px; background: rgba(0,0,0,.7); }
+ .site-admin-asset-picker { width: min(430px, 100%); padding: 22px; border: 1px solid #35424e; border-radius: 15px; background: #10171d; box-shadow: 0 28px 90px rgba(0,0,0,.55); text-align: center; }
+ .site-admin-asset-picker-kicker { color: var(--sv-orange); font-size: 9px; font-weight: 850; letter-spacing: .08em; text-transform: uppercase; }
+@@ -834,11 +872,19 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .site-admin-publish-warning { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,120,24,.28); border-radius: 9px; background: rgba(255,120,24,.06); color: #d89a6a; font-size: 11px; }
+ @media (max-width: 900px) {
+   .site-admin-modal { padding: 16px; }
++  .site-admin-event-summary { grid-template-columns: 120px 100px minmax(160px,1fr) 86px; }
++  .site-admin-summary-cell.is-categories { display: none; }
+   .site-admin-assets { grid-template-columns: repeat(3, minmax(0,1fr)); }
+ }
+ @media (max-width: 660px) {
+-  .site-admin-head, .site-admin-event-top { display: grid; }
++  .site-admin-head { display: grid; }
+   .site-admin-head-actions { justify-content: flex-start; }
++  .site-admin-event-summary { grid-template-columns: 1fr auto; gap: 9px 12px; }
++  .site-admin-summary-cell.is-status, .site-admin-summary-cell.is-date, .site-admin-summary-cell.is-title { grid-column: 1; }
++  .site-admin-summary-cell.is-assets { grid-column: 2; grid-row: 1 / span 3; align-self: center; }
++  .site-admin-summary-cell.is-categories { display: none; }
+   .site-admin-title-editor { grid-template-columns: 1fr; }
+   .site-admin-assets { grid-template-columns: repeat(2, minmax(0,1fr)); }
++  .site-admin-timecode-row { grid-template-columns: 104px minmax(0,1fr) 34px; }
++  .site-admin-timecodes-editor-head, .site-admin-timecodes-footer { align-items: stretch; flex-direction: column; }
+ }
+diff --git a/migrations/versions/0012_site_event_timecodes.py b/migrations/versions/0012_site_event_timecodes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1585e270c1ec569c646b04b253c65f065feb20a9
+--- /dev/null
++++ b/migrations/versions/0012_site_event_timecodes.py
+@@ -0,0 +1,57 @@
++"""event timecodes for StreamVault public playback
++
++Revision ID: 0012_site_event_timecodes
++Revises: 0011_site_admin_assets
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0012_site_event_timecodes"
++down_revision = "0011_site_admin_assets"
++branch_labels = None
++depends_on = None
++
++
++def _table_exists(name: str) -> bool:
++    return name in sa.inspect(op.get_bind()).get_table_names()
++
++
++def upgrade() -> None:
++    if _table_exists("site_event_timecodes"):
++        return
++    op.create_table(
++        "site_event_timecodes",
++        sa.Column("id", mysql.BIGINT(unsigned=True), autoincrement=True, nullable=False),
++        sa.Column("event_id", sa.BINARY(16), nullable=False),
++        sa.Column("position", mysql.SMALLINT(unsigned=True), nullable=False, server_default="1"),
++        sa.Column("offset_ms", mysql.BIGINT(unsigned=True), nullable=False),
++        sa.Column("title", sa.String(length=255), nullable=False),
++        sa.Column(
++            "created_at",
++            mysql.DATETIME(fsp=6),
++            nullable=False,
++            server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++        ),
++        sa.Column(
++            "updated_at",
++            mysql.DATETIME(fsp=6),
++            nullable=False,
++            server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++        ),
++        sa.ForeignKeyConstraint(["event_id"], ["media_events.id"], ondelete="CASCADE"),
++        sa.PrimaryKeyConstraint("id"),
++        sa.UniqueConstraint("event_id", "position", name="uq_site_event_timecodes_position"),
++    )
++    op.create_index(
++        "ix_site_event_timecodes_event_offset",
++        "site_event_timecodes",
++        ["event_id", "offset_ms"],
++    )
++
++
++def downgrade() -> None:
++    if _table_exists("site_event_timecodes"):
++        op.drop_table("site_event_timecodes")
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index 5b73c81b149a727984de70a40f0719b7d03566d8..b7ca58f6925b4185ce927013037df7953d69d23a 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -94,6 +94,26 @@ class SiteEventAsset(Base):
+     )
+ 
+ 
++class SiteEventTimecode(Base):
++    __tablename__ = "site_event_timecodes"
++    __table_args__ = (
++        UniqueConstraint("event_id", "position", name="uq_site_event_timecodes_position"),
++        Index("ix_site_event_timecodes_event_offset", "event_id", "offset_ms"),
++    )
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    event_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), nullable=False
++    )
++    position: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1)
++    offset_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
++    title: Mapped[str] = mapped_column(String(255), nullable=False)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(
++        DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow
++    )
++
++
+ class EventCategory(Base):
+     __tablename__ = "event_categories"
+     __table_args__ = (
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+index cc25950f506938120045b9859ead17db65c1713f..5391bb98ccb0a341c11836ae1bfad912c6e555b6 100644
+--- a/tests/test_site_catalog.py
++++ b/tests/test_site_catalog.py
+@@ -275,3 +275,53 @@ def test_site_admin_api_and_ui_manage_display_title_cover_and_four_manual_frames
+     assert 'onPublish={() => void openSitePublisher()}' not in web
+     assert '.site-admin-modal' in css
+     assert '.streamvault-artwork.has-image' in css
++
++
++def test_site_timecodes_use_event_owned_relational_storage_and_public_payloads():
++    migration = _read("migrations/versions/0012_site_event_timecodes.py")
++    models = _read("packages/python_common/streamhub_common/models.py")
++    route = _read("apps/api/app/routers/site.py")
++
++    assert 'down_revision = "0011_site_admin_assets"' in migration
++    assert '"site_event_timecodes"' in migration
++    assert 'sa.ForeignKeyConstraint(["event_id"], ["media_events.id"], ondelete="CASCADE")' in migration
++    assert '"ix_site_event_timecodes_event_offset"' in migration
++    assert 'class SiteEventTimecode(Base):' in models
++    assert 'UniqueConstraint("event_id", "position", name="uq_site_event_timecodes_position")' in models
++    assert '@router.put("/admin/events/{event_id}/timecodes")' in route
++    assert 'delete(SiteEventTimecode).where(SiteEventTimecode.event_id == event_id)' in route
++    assert 'action="site_timecodes_replace"' in route
++    assert '"timecodes": [_site_timecode_payload(row) for row in timecodes.get(event.id, [])]' in route
++
++
++def test_site_admin_collapses_events_and_edits_timecodes_without_embedding_a_player():
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert '<details className="site-admin-event"' in web
++    assert '<summary className="site-admin-event-summary">' in web
++    assert '<span>Статус</span>' in web
++    assert '<span>Дата</span>' in web
++    assert '<span>Категории</span>' in web
++    assert '<span>Название</span>' in web
++    assert '<span>Изображения</span>' in web
++    assert 'Добавить таймкоды' in web
++    assert 'placeholder="00:00:00"' in web
++    assert 'placeholder="Например: Начало матча"' in web
++    assert 'fetch(`${API}/api/v1/site/admin/events/${eventId}/timecodes`' in web
++    assert 'Время указывается относительно публичного видеоплеера.' in web
++    assert '.site-admin-event-summary' in css
++    assert '.site-admin-timecode-row' in css
++
++
++def test_public_event_renders_clickable_timecodes_and_active_section_heading_without_count():
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert 'function SiteEventTimecodes(' in web
++    assert '<SiteEventTimecodes items={selectedSiteEvent.timecodes || []} videoRef={siteVideoRef} />' in web
++    assert 'video.currentTime = Math.max(0, item.offset_ms / 1000)' in web
++    assert '{siteCategory === "all" ? "Все видео"' in web
++    assert '<span>{siteEvents.length.toLocaleString("ru-RU")}</span>' not in web
++    assert '.streamvault-timecodes-list button' in css
++    assert '.streamvault-hero > h1, .streamvault-recordings h2 { margin: 0; color: var(--sv-orange-2);' in css

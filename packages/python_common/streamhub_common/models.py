@@ -94,6 +94,26 @@ class SiteEventAsset(Base):
     )
 
 
+class SiteEventTimecode(Base):
+    __tablename__ = "site_event_timecodes"
+    __table_args__ = (
+        UniqueConstraint("event_id", "position", name="uq_site_event_timecodes_position"),
+        Index("ix_site_event_timecodes_event_offset", "event_id", "offset_ms"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1)
+    offset_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
 class EventCategory(Base):
     __tablename__ = "event_categories"
     __table_args__ = (
