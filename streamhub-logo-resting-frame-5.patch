@@ -1,0 +1,22 @@
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 52d30ab..bda7796 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -524,7 +524,7 @@ const STREAMVAULT_LOGO_FRAME_SEQUENCE: Array<[number, number]> = [
+ const STREAMVAULT_LOGO_ANIMATION_MS = 2040;
+ 
+ function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
+-  const [frame, setFrame] = useState(0);
++  const [frame, setFrame] = useState(5);
+   const [animating, setAnimating] = useState(false);
+   const timersRef = useRef<number[]>([]);
+   const reducedMotionRef = useRef(false);
+@@ -562,7 +562,7 @@ function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
+       reducedMotionRef.current = reducedMotion.matches;
+       if (reducedMotion.matches) {
+         clearTimers();
+-        setFrame(0);
++        setFrame(5);
+         setAnimating(false);
+       }
+     };
