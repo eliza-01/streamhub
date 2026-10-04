@@ -629,37 +629,108 @@ function apiUrl(pathOrUrl: string) {
 function TelegramVideoPlayer({
   playlistUrl,
   externalRef,
+  autoPlay = false,
 }: {
   playlistUrl: string;
   externalRef?: { current: HTMLVideoElement | null };
+  autoPlay?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const autoPlayAttemptedRef = useRef(false);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     const source = apiUrl(playlistUrl);
+    autoPlayAttemptedRef.current = false;
+    setLoading(true);
+
+    const tryAutoPlay = () => {
+      if (!autoPlay || autoPlayAttemptedRef.current) return;
+      autoPlayAttemptedRef.current = true;
+      void video.play().catch((error) => {
+        if (!(error instanceof DOMException) || error.name !== "NotAllowedError") {
+          autoPlayAttemptedRef.current = false;
+        }
+      });
+    };
+    const markLoading = () => setLoading(true);
+    const markReady = () => {
+      setLoading(false);
+      tryAutoPlay();
+    };
+    const markSeeked = () => {
+      if (video.readyState >= 3) setLoading(false);
+    };
+
+    video.addEventListener("loadstart", markLoading);
+    video.addEventListener("waiting", markLoading);
+    video.addEventListener("stalled", markLoading);
+    video.addEventListener("seeking", markLoading);
+    video.addEventListener("loadeddata", markReady);
+    video.addEventListener("canplay", markReady);
+    video.addEventListener("playing", markReady);
+    video.addEventListener("seeked", markSeeked);
+
+    const detachMediaEvents = () => {
+      video.removeEventListener("loadstart", markLoading);
+      video.removeEventListener("waiting", markLoading);
+      video.removeEventListener("stalled", markLoading);
+      video.removeEventListener("seeking", markLoading);
+      video.removeEventListener("loadeddata", markReady);
+      video.removeEventListener("canplay", markReady);
+      video.removeEventListener("playing", markReady);
+      video.removeEventListener("seeked", markSeeked);
+    };
+
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
       video.src = source;
-      return () => { video.removeAttribute("src"); video.load(); };
+      video.load();
+      return () => {
+        detachMediaEvents();
+        video.removeAttribute("src");
+        video.load();
+      };
     }
-    if (!Hls.isSupported()) return;
+    if (!Hls.isSupported()) {
+      detachMediaEvents();
+      setLoading(false);
+      return;
+    }
     const hls = new Hls();
     hls.loadSource(source);
     hls.attachMedia(video);
-    return () => hls.destroy();
-  }, [playlistUrl]);
+    hls.on(Hls.Events.MANIFEST_PARSED, tryAutoPlay);
+    return () => {
+      detachMediaEvents();
+      hls.destroy();
+    };
+  }, [playlistUrl, autoPlay]);
 
   return (
-    <video
-      ref={(node) => {
-        videoRef.current = node;
-        if (externalRef) externalRef.current = node;
-      }}
-      className="telegram-player"
-      controls
-      preload="metadata"
-    />
+    <>
+      <video
+        ref={(node) => {
+          videoRef.current = node;
+          if (externalRef) externalRef.current = node;
+        }}
+        className="telegram-player"
+        controls
+        autoPlay={autoPlay}
+        playsInline
+        preload="auto"
+      />
+      {loading ? (
+        <div className="streamvault-video-loading" role="status" aria-live="polite" aria-label="Видео загружается">
+          <div className="streamvault-video-loading-card">
+            <span className="streamvault-video-loading-spinner" aria-hidden="true" />
+            <strong>Загрузка видео…</strong>
+            <small>Подготавливаем воспроизведение</small>
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
 
@@ -1603,8 +1674,17 @@ function SiteReplayChat({
     if (nextMessagePlayerMs == null) return;
     const video = videoRef.current;
     if (!video) return;
-    video.currentTime = Math.max(0, nextMessagePlayerMs / 1000);
-    setCurrentMs(nextMessagePlayerMs);
+    const seekAndPlay = () => {
+      video.currentTime = Math.max(0, nextMessagePlayerMs / 1000);
+      setCurrentMs(nextMessagePlayerMs);
+      void video.play().catch(() => undefined);
+    };
+    if (video.readyState >= 1) {
+      seekAndPlay();
+    } else {
+      video.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+      void video.play().catch(() => undefined);
+    }
     setFollowing(true);
   }
 
@@ -1738,7 +1818,6 @@ function StreamVaultHeader({
       <div className="streamvault-header-inner">
         <button type="button" className="streamvault-brand" onClick={onBrand} aria-label="StreamVault — главная">
           <span className="streamvault-brand-mark" aria-hidden="true" />
-          <span>StreamVault</span>
         </button>
         <div
           className="streamvault-search-wrap"
@@ -3224,7 +3303,7 @@ function App() {
             <div className="streamvault-watch-primary">
               <div className="streamvault-player">
                 {selectedSiteEvent.playable && selectedSiteEvent.playback_url ? (
-                  <TelegramVideoPlayer playlistUrl={selectedSiteEvent.playback_url} externalRef={siteVideoRef} />
+                  <TelegramVideoPlayer playlistUrl={selectedSiteEvent.playback_url} externalRef={siteVideoRef} autoPlay />
                 ) : (
                   <div className="streamvault-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
                 )}

@@ -1,0 +1,211 @@
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index e3097e8..6fd2b0d 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -629,37 +629,108 @@ function apiUrl(pathOrUrl: string) {
+ function TelegramVideoPlayer({
+   playlistUrl,
+   externalRef,
++  autoPlay = false,
+ }: {
+   playlistUrl: string;
+   externalRef?: { current: HTMLVideoElement | null };
++  autoPlay?: boolean;
+ }) {
+   const videoRef = useRef<HTMLVideoElement | null>(null);
++  const autoPlayAttemptedRef = useRef(false);
++  const [loading, setLoading] = useState(true);
+ 
+   useEffect(() => {
+     const video = videoRef.current;
+     if (!video) return;
+     const source = apiUrl(playlistUrl);
++    autoPlayAttemptedRef.current = false;
++    setLoading(true);
++
++    const tryAutoPlay = () => {
++      if (!autoPlay || autoPlayAttemptedRef.current) return;
++      autoPlayAttemptedRef.current = true;
++      void video.play().catch((error) => {
++        if (!(error instanceof DOMException) || error.name !== "NotAllowedError") {
++          autoPlayAttemptedRef.current = false;
++        }
++      });
++    };
++    const markLoading = () => setLoading(true);
++    const markReady = () => {
++      setLoading(false);
++      tryAutoPlay();
++    };
++    const markSeeked = () => {
++      if (video.readyState >= 3) setLoading(false);
++    };
++
++    video.addEventListener("loadstart", markLoading);
++    video.addEventListener("waiting", markLoading);
++    video.addEventListener("stalled", markLoading);
++    video.addEventListener("seeking", markLoading);
++    video.addEventListener("loadeddata", markReady);
++    video.addEventListener("canplay", markReady);
++    video.addEventListener("playing", markReady);
++    video.addEventListener("seeked", markSeeked);
++
++    const detachMediaEvents = () => {
++      video.removeEventListener("loadstart", markLoading);
++      video.removeEventListener("waiting", markLoading);
++      video.removeEventListener("stalled", markLoading);
++      video.removeEventListener("seeking", markLoading);
++      video.removeEventListener("loadeddata", markReady);
++      video.removeEventListener("canplay", markReady);
++      video.removeEventListener("playing", markReady);
++      video.removeEventListener("seeked", markSeeked);
++    };
++
+     if (video.canPlayType("application/vnd.apple.mpegurl")) {
+       video.src = source;
+-      return () => { video.removeAttribute("src"); video.load(); };
++      video.load();
++      return () => {
++        detachMediaEvents();
++        video.removeAttribute("src");
++        video.load();
++      };
++    }
++    if (!Hls.isSupported()) {
++      detachMediaEvents();
++      setLoading(false);
++      return;
+     }
+-    if (!Hls.isSupported()) return;
+     const hls = new Hls();
+     hls.loadSource(source);
+     hls.attachMedia(video);
+-    return () => hls.destroy();
+-  }, [playlistUrl]);
++    hls.on(Hls.Events.MANIFEST_PARSED, tryAutoPlay);
++    return () => {
++      detachMediaEvents();
++      hls.destroy();
++    };
++  }, [playlistUrl, autoPlay]);
+ 
+   return (
+-    <video
+-      ref={(node) => {
+-        videoRef.current = node;
+-        if (externalRef) externalRef.current = node;
+-      }}
+-      className="telegram-player"
+-      controls
+-      preload="metadata"
+-    />
++    <>
++      <video
++        ref={(node) => {
++          videoRef.current = node;
++          if (externalRef) externalRef.current = node;
++        }}
++        className="telegram-player"
++        controls
++        autoPlay={autoPlay}
++        playsInline
++        preload="auto"
++      />
++      {loading ? (
++        <div className="streamvault-video-loading" role="status" aria-live="polite" aria-label="Видео загружается">
++          <div className="streamvault-video-loading-card">
++            <span className="streamvault-video-loading-spinner" aria-hidden="true" />
++            <strong>Загрузка видео…</strong>
++            <small>Подготавливаем воспроизведение</small>
++          </div>
++        </div>
++      ) : null}
++    </>
+   );
+ }
+ 
+@@ -1603,8 +1674,17 @@ function SiteReplayChat({
+     if (nextMessagePlayerMs == null) return;
+     const video = videoRef.current;
+     if (!video) return;
+-    video.currentTime = Math.max(0, nextMessagePlayerMs / 1000);
+-    setCurrentMs(nextMessagePlayerMs);
++    const seekAndPlay = () => {
++      video.currentTime = Math.max(0, nextMessagePlayerMs / 1000);
++      setCurrentMs(nextMessagePlayerMs);
++      void video.play().catch(() => undefined);
++    };
++    if (video.readyState >= 1) {
++      seekAndPlay();
++    } else {
++      video.addEventListener("loadedmetadata", seekAndPlay, { once: true });
++      void video.play().catch(() => undefined);
++    }
+     setFollowing(true);
+   }
+ 
+@@ -1738,7 +1818,6 @@ function StreamVaultHeader({
+       <div className="streamvault-header-inner">
+         <button type="button" className="streamvault-brand" onClick={onBrand} aria-label="StreamVault — главная">
+           <span className="streamvault-brand-mark" aria-hidden="true" />
+-          <span>StreamVault</span>
+         </button>
+         <div
+           className="streamvault-search-wrap"
+@@ -3224,7 +3303,7 @@ function App() {
+             <div className="streamvault-watch-primary">
+               <div className="streamvault-player">
+                 {selectedSiteEvent.playable && selectedSiteEvent.playback_url ? (
+-                  <TelegramVideoPlayer playlistUrl={selectedSiteEvent.playback_url} externalRef={siteVideoRef} />
++                  <TelegramVideoPlayer playlistUrl={selectedSiteEvent.playback_url} externalRef={siteVideoRef} autoPlay />
+                 ) : (
+                   <div className="streamvault-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
+                 )}
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index c80fee8..cb03c06 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -306,7 +306,7 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+   height: 100%;
+   margin: 0 auto;
+   display: grid;
+-  grid-template-columns: 190px minmax(260px, 520px) 1fr;
++  grid-template-columns: 42px minmax(260px, 520px) 1fr;
+   gap: 24px;
+   align-items: center;
+ }
+@@ -560,16 +560,22 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-back:hover { color: #fff; }
+ .streamvault-watch-layout { display: grid; grid-template-columns: minmax(0, 1fr) 350px; gap: 14px; align-items: start; }
+ .streamvault-watch-primary { min-width: 0; }
+-.streamvault-player { width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--sv-line); border-radius: 14px; background: #000; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
++.streamvault-player { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--sv-line); border-radius: 14px; background: #000; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+ .streamvault-player .telegram-player { width: 100%; height: 100%; max-height: none; border-radius: 0; object-fit: contain; }
++.streamvault-video-loading { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; background: rgba(3,6,8,.64); backdrop-filter: blur(2px); cursor: progress; }
++.streamvault-video-loading-card { display: grid; justify-items: center; gap: 8px; min-width: 190px; padding: 18px 22px; border: 1px solid rgba(255,255,255,.08); border-radius: 14px; background: rgba(12,17,22,.88); box-shadow: 0 18px 55px rgba(0,0,0,.35); text-align: center; }
++.streamvault-video-loading-card strong { color: #f1f4f6; font-size: 13px; }
++.streamvault-video-loading-card small { color: #7f8a94; font-size: 10px; }
++.streamvault-video-loading-spinner { width: 25px; height: 25px; border: 3px solid rgba(255,255,255,.13); border-top-color: var(--sv-orange); border-radius: 50%; animation: streamvault-video-spin .72s linear infinite; }
++@keyframes streamvault-video-spin { to { transform: rotate(360deg); } }
+ .streamvault-video-placeholder { width: 100%; height: 100%; display: grid; place-items: center; padding: 28px; color: var(--sv-muted); text-align: center; }
+ .streamvault-timecodes { margin-top: 10px; padding: 11px 12px 12px; border: 1px solid var(--sv-line-soft); border-radius: 12px; background: rgba(12,17,22,.78); }
+ .streamvault-timecodes-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+ .streamvault-timecodes-head strong { color: var(--sv-orange-2); font-size: 11px; letter-spacing: .045em; text-transform: uppercase; }
+ .streamvault-timecodes-head span { color: #68737d; font-size: 10px; font-variant-numeric: tabular-nums; }
+-.streamvault-timecodes-list { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: thin; }
++.streamvault-timecodes-list { display: flex; gap: 7px; overflow-x: auto; padding: 2px 1px 3px; scrollbar-width: thin; }
+ .streamvault-timecodes-list button { flex: 0 0 auto; min-width: 150px; max-width: 280px; display: grid; grid-template-columns: auto minmax(0,1fr); align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #28333d; border-radius: 9px; background: #10171d; color: #dfe5e9; text-align: left; transition: border-color .14s ease, background .14s ease, transform .14s ease; }
+-.streamvault-timecodes-list button:hover { border-color: rgba(255,120,24,.58); background: rgba(255,120,24,.07); transform: translateY(-1px); }
++.streamvault-timecodes-list button:hover { border-color: rgba(255,120,24,.58); background: rgba(255,120,24,.07); box-shadow: 0 0 0 1px rgba(255,120,24,.1); }
+ .streamvault-timecodes-list time { color: var(--sv-orange-2); font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+ .streamvault-timecodes-list strong { overflow: hidden; color: #dfe5e9; font-size: 11px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+ .streamvault-watch-meta { padding: 17px 2px 0; }
+@@ -685,7 +691,7 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+   .streamvault-recording-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+ }
+ @media (max-width: 1160px) {
+-  .streamvault-header-inner { grid-template-columns: 170px minmax(220px,1fr) auto; gap: 15px; }
++  .streamvault-header-inner { grid-template-columns: 42px minmax(220px,1fr) auto; gap: 15px; }
+   .streamvault-home-shell { grid-template-columns: 160px minmax(0,1fr); gap: 20px; }
+   .streamvault-recording-grid { grid-template-columns: repeat(4, minmax(0,1fr)); }
+   .streamvault-latest-layout { grid-template-columns: 205px minmax(0,1fr); }
