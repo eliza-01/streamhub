@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from streamhub_common.db import get_db
+from streamhub_common.db import SessionLocal, get_db
 from streamhub_common.settings import get_settings
 from streamhub_common.models import (
     AuditLog,
@@ -17,6 +20,7 @@ from streamhub_common.models import (
     ChatEvent,
     ChatMessage,
     EventCategory,
+    EventPurgeJob,
     MediaEvent,
     Session,
     SessionSegment,
@@ -48,8 +52,14 @@ from .video import (
 )
 from ..site_assets import remove_site_asset_file
 
+class EventDisplayTitleUpdateRequest(BaseModel):
+    display_title: str = Field(min_length=1, max_length=1024)
+
+
 router = APIRouter(prefix="/api/v1", tags=["events"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
+ACTIVE_EVENT_PURGE_STATUSES = frozenset({"queued", "running"})
 
 
 def event_dict(row: MediaEvent) -> dict:
@@ -313,6 +323,31 @@ async def get_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> 
     return _event_payload(event, chat_summaries.get(event_id, []), video_summaries.get(event_id, []))
 
 
+@router.put("/events/{event_id}/display-title")
+async def update_event_display_title(
+    event_id: uuid.UUID,
+    payload: EventDisplayTitleUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    event = await db.get(MediaEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "event not found")
+    display_title = payload.display_title.strip()
+    if not display_title:
+        raise HTTPException(400, "display_title must not be empty")
+    event.display_title = display_title
+    db.add(
+        AuditLog(
+            event_id=event_id,
+            action="event_display_title_update",
+            payload_json={"display_title": display_title},
+        )
+    )
+    await db.commit()
+    await db.refresh(event)
+    return event_dict(event)
+
+
 @router.post("/events/{event_id}/stop-all")
 async def stop_all_event_capture(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
     event = await db.get(MediaEvent, event_id)
@@ -548,18 +583,8 @@ async def _clear_orphaned_site_editorial_state(
     return storage_keys, payload
 
 
-@router.delete("/deleted/events/{event_id}")
-async def purge_event(
-    event_id: uuid.UUID,
-    permanent: bool = Query(default=False),
-    db: AsyncSession = Depends(get_db),
-) -> dict:
-    """Permanently purge only this Event's sessions that are currently in Trash.
-
-    Visible sessions and the canonical MediaEvent identity are intentionally kept.
-    """
-    if not permanent:
-        raise HTTPException(400, "permanent=true and explicit UI confirmation are required")
+async def _purge_event_trash_now(event_id: uuid.UUID, db: AsyncSession) -> dict:
+    """Permanently purge this Event's sessions that are currently in Trash."""
     event = await db.get(MediaEvent, event_id)
     if event is None:
         raise HTTPException(404, "event not found")
@@ -658,3 +683,234 @@ async def purge_event(
         "site_cleanup": site_cleanup,
         "site_asset_files_cleanup_requested": len(storage_keys),
     }
+
+
+def event_purge_job_payload(row: EventPurgeJob) -> dict:
+    return {
+        "id": int(row.id),
+        "event_id": str(row.event_id),
+        "status": row.status,
+        "total_chat_sessions": int(row.total_chat_sessions or 0),
+        "total_video_sessions": int(row.total_video_sessions or 0),
+        "purged_chat_sessions": int(row.purged_chat_sessions or 0),
+        "purged_video_sessions": int(row.purged_video_sessions or 0),
+        "result": row.result_json,
+        "last_error": row.last_error,
+        "created_at": row.created_at,
+        "started_at_utc": row.started_at_utc,
+        "completed_at_utc": row.completed_at_utc,
+        "updated_at": row.updated_at,
+    }
+
+
+class EventPurgeQueueRuntime:
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+        self._wake = asyncio.Event()
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stop.clear()
+        self._wake.clear()
+        async with SessionLocal() as db:
+            interrupted = (
+                await db.execute(select(EventPurgeJob).where(EventPurgeJob.status == "running"))
+            ).scalars().all()
+            if interrupted:
+                now = datetime.now(UTC).replace(tzinfo=None)
+                for job in interrupted:
+                    job.status = "queued"
+                    job.last_error = "worker restarted while this purge was running; queued for idempotent retry"
+                    job.started_at_utc = None
+                    job.updated_at = now
+                await db.commit()
+        self._task = asyncio.create_task(self._run(), name="event-purge-queue")
+        self._wake.set()
+
+    async def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        task = self._task
+        self._task = None
+        if task is not None:
+            await task
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            processed = False
+            try:
+                processed = await self._process_next()
+            except Exception:
+                logger.exception("event purge queue iteration failed")
+            if processed:
+                continue
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=1.0)
+            except TimeoutError:
+                pass
+
+    async def _process_next(self) -> bool:
+        async with SessionLocal() as db:
+            job = await db.scalar(
+                select(EventPurgeJob)
+                .where(EventPurgeJob.status == "queued")
+                .order_by(EventPurgeJob.id.asc())
+                .limit(1)
+            )
+            if job is None:
+                return False
+            job_id = int(job.id)
+            event_id = job.event_id
+            now = datetime.now(UTC).replace(tzinfo=None)
+            job.status = "running"
+            job.started_at_utc = now
+            job.completed_at_utc = None
+            job.last_error = None
+            job.updated_at = now
+            await db.commit()
+
+        try:
+            async with SessionLocal() as db:
+                result = await _purge_event_trash_now(event_id, db)
+        except Exception as exc:
+            logger.exception("event purge job failed id=%s event=%s", job_id, event_id)
+            async with SessionLocal() as db:
+                failed = await db.get(EventPurgeJob, job_id)
+                if failed is not None:
+                    failed.status = "failed"
+                    failed.last_error = str(exc.detail if isinstance(exc, HTTPException) else exc)
+                    failed.completed_at_utc = datetime.now(UTC).replace(tzinfo=None)
+                    failed.updated_at = failed.completed_at_utc
+                    await db.commit()
+            return True
+
+        async with SessionLocal() as db:
+            completed = await db.get(EventPurgeJob, job_id)
+            if completed is not None:
+                completed.status = "completed"
+                completed.purged_chat_sessions = int(result.get("chat_sessions") or 0)
+                completed.purged_video_sessions = int(result.get("video_sessions") or 0)
+                completed.result_json = result
+                completed.last_error = None
+                completed.completed_at_utc = datetime.now(UTC).replace(tzinfo=None)
+                completed.updated_at = completed.completed_at_utc
+                await db.commit()
+        return True
+
+
+event_purge_queue_runtime = EventPurgeQueueRuntime()
+
+
+@router.get("/deleted/event-purge-jobs")
+async def list_event_purge_jobs(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            select(EventPurgeJob).order_by(EventPurgeJob.id.desc()).limit(limit)
+        )
+    ).scalars().all()
+    return {"items": [event_purge_job_payload(row) for row in rows]}
+
+
+@router.delete("/deleted/events/{event_id}", status_code=202)
+async def enqueue_event_purge(
+    event_id: uuid.UUID,
+    permanent: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if not permanent:
+        raise HTTPException(400, "permanent=true and explicit UI confirmation are required")
+    event = await db.get(MediaEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "event not found")
+
+    existing = await db.scalar(
+        select(EventPurgeJob)
+        .where(
+            EventPurgeJob.event_id == event_id,
+            EventPurgeJob.status.in_(ACTIVE_EVENT_PURGE_STATUSES),
+        )
+        .order_by(EventPurgeJob.id.desc())
+        .limit(1)
+    )
+    if existing is not None:
+        return event_purge_job_payload(existing)
+
+    chat_count = int(
+        await db.scalar(
+            select(func.count()).select_from(Session).where(
+                Session.event_id == event_id,
+                Session.deleted_at_utc.is_not(None),
+            )
+        )
+        or 0
+    )
+    video_count = int(
+        await db.scalar(
+            select(func.count()).select_from(VideoSession).where(
+                VideoSession.event_id == event_id,
+                VideoSession.deleted_at_utc.is_not(None),
+            )
+        )
+        or 0
+    )
+    if chat_count == 0 and video_count == 0:
+        raise HTTPException(409, "event has no sessions in trash")
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    job = EventPurgeJob(
+        event_id=event_id,
+        status="queued",
+        total_chat_sessions=chat_count,
+        total_video_sessions=video_count,
+        purged_chat_sessions=0,
+        purged_video_sessions=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    event_purge_queue_runtime.wake()
+    return event_purge_job_payload(job)
+
+
+@router.post("/deleted/event-purge-jobs/{job_id}/retry")
+async def retry_event_purge_job(job_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+    job = await db.get(EventPurgeJob, job_id)
+    if job is None:
+        raise HTTPException(404, "event purge job not found")
+    if job.status != "failed":
+        raise HTTPException(409, "only failed event purge jobs can be retried")
+    another = await db.scalar(
+        select(EventPurgeJob.id)
+        .where(
+            EventPurgeJob.event_id == job.event_id,
+            EventPurgeJob.id != job.id,
+            EventPurgeJob.status.in_(ACTIVE_EVENT_PURGE_STATUSES),
+        )
+        .limit(1)
+    )
+    if another is not None:
+        raise HTTPException(409, "this Event already has a queued or running purge job")
+    now = datetime.now(UTC).replace(tzinfo=None)
+    job.status = "queued"
+    job.purged_chat_sessions = 0
+    job.purged_video_sessions = 0
+    job.result_json = None
+    job.last_error = None
+    job.started_at_utc = None
+    job.completed_at_utc = None
+    job.updated_at = now
+    await db.commit()
+    await db.refresh(job)
+    event_purge_queue_runtime.wake()
+    return event_purge_job_payload(job)

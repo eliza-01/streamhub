@@ -1,0 +1,87 @@
+diff --git a/apps/api/app/routers/video.py b/apps/api/app/routers/video.py
+index 3c922a7..43c480c 100644
+--- a/apps/api/app/routers/video.py
++++ b/apps/api/app/routers/video.py
+@@ -360,6 +360,7 @@ def video_event_dict(event: MediaEvent) -> dict:
+         "channel_login": event.channel_login,
+         "channel_display_name": event.channel_display_name,
+         "title": event.title,
++        "display_title": event.display_title,
+         "external_key": event.external_key,
+         "source_started_at_utc": event.source_started_at_utc,
+     }
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index b5e1d17..8939272 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -61,6 +61,7 @@ type VideoSession = {
+     channel_login?: string | null;
+     channel_display_name?: string | null;
+     title?: string | null;
++    display_title?: string | null;
+     external_key: string;
+     source_started_at_utc?: string | null;
+   };
+@@ -652,6 +653,13 @@ function visibleEventTitle(event: MediaEvent, mode: EventTitleMode) {
+   return event.display_title?.trim() || event.title?.trim() || fallback;
+ }
+ 
++function visibleVideoEventTitle(session: VideoSession, mode: EventTitleMode) {
++  const event = session.event;
++  const fallback = event?.external_key || session.id;
++  if (mode === "source") return event?.title?.trim() || fallback;
++  return event?.display_title?.trim() || event?.title?.trim() || fallback;
++}
++
+ function storedPositiveInt(key: string, fallback: number) {
+   try {
+     const value = Number(window.localStorage.getItem(key));
+@@ -3930,6 +3938,11 @@ function App() {
+           <strong>{new Date(eventDate).toLocaleString("ru-RU")}</strong>
+         </div>
+         <button className="video-manager-back" onClick={() => setSelectedVideo(null)}>Назад</button>
++        <div className="events-title-mode" role="group" aria-label="Режим названий Video Manager">
++          <span>Название:</span>
++          <button type="button" className={eventTitleMode === "display" ? "active" : ""} onClick={() => changeEventTitleMode("display")}>Отображаемое</button>
++          <button type="button" className={eventTitleMode === "source" ? "active" : ""} onClick={() => changeEventTitleMode("source")}>Исходное</button>
++        </div>
+         <header className="detail-header">
+           <div>
+             <h1>Video Manager · output</h1>
+@@ -4291,6 +4304,11 @@ function App() {
+        ) : view === "site" ? null : view === "video-manager" ? (
+         <section className="storage-panel video-manager-index">
+           <div className="section-label">VIDEO SESSIONS</div>
++          <div className="events-title-mode" role="group" aria-label="Режим названий Video Manager">
++            <span>Название:</span>
++            <button type="button" className={eventTitleMode === "display" ? "active" : ""} onClick={() => changeEventTitleMode("display")}>Отображаемое</button>
++            <button type="button" className={eventTitleMode === "source" ? "active" : ""} onClick={() => changeEventTitleMode("source")}>Исходное</button>
++          </div>
+           {videoSessions.length === 0 ? <div className="empty-child">Video sessions пока нет</div> : (
+             <div className="video-manager-list">
+               {videoSessions.map((session) => (
+@@ -4313,7 +4331,7 @@ function App() {
+                       <strong>{new Date(session.event?.source_started_at_utc || session.recording_started_at_utc || session.created_at).toLocaleString("ru-RU")}</strong>
+                     </div>
+                     <div className="row"><strong>{session.event?.channel_display_name || session.event?.channel_login || session.metadata?.channel_login || "Twitch"}</strong><span>{session.event?.media_type?.toUpperCase() || session.metadata?.media_type?.toUpperCase() || "VIDEO"}</span></div>
+-                    <div className="event-title">{session.event?.title || session.event?.external_key || session.id}</div>
++                    <div className="event-title">{visibleVideoEventTitle(session, eventTitleMode)}</div>
+                     <div className="session-status-line"><strong>{session.status}</strong><span>{session.completeness_status}</span><span>{session.segment_count || 0} seg</span><span>{fmtBytes(session.bytes || 0)}</span><span>{fmtMs(session.duration_recorded_ms)}</span></div>
+                     <div className="muted small"><code>{session.id}</code></div>
+                   </div>
+diff --git a/tests/test_video_parts.py b/tests/test_video_parts.py
+index f1283f1..121cfa2 100644
+--- a/tests/test_video_parts.py
++++ b/tests/test_video_parts.py
+@@ -156,8 +156,11 @@ def test_video_manager_shows_event_date_and_opens_session_from_whole_row():
+     api = (root / "apps/api/app/routers/video.py").read_text()
+ 
+     assert '"source_started_at_utc": event.source_started_at_utc' in api
++    assert '"display_title": event.display_title' in api
+     assert '"event": video_event_dict(event)' in api
+     assert "Дата проведения события" in web
++    assert 'aria-label="Режим названий Video Manager"' in web
++    assert 'visibleVideoEventTitle(session, eventTitleMode)' in web
+     assert 'className="video-manager-session is-clickable"' in web
+     assert 'onClick={() => void openVideoSession(session)}' in web
+     assert "video-manager-event-date" in styles

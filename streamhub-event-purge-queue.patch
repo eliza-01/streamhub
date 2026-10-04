@@ -1,0 +1,634 @@
+diff --git a/apps/api/app/main.py b/apps/api/app/main.py
+index 8aa8c28..84b41cd 100644
+--- a/apps/api/app/main.py
++++ b/apps/api/app/main.py
+@@ -17,9 +17,11 @@ configure_logging(settings.log_level)
+ @asynccontextmanager
+ async def lifespan(_app: FastAPI):
+     await telegram_runtime.start()
++    await events.event_purge_queue_runtime.start()
+     try:
+         yield
+     finally:
++        await events.event_purge_queue_runtime.stop()
+         await telegram_runtime.stop()
+ 
+ 
+diff --git a/apps/api/app/routers/events.py b/apps/api/app/routers/events.py
+index e21a73c..24abb29 100644
+--- a/apps/api/app/routers/events.py
++++ b/apps/api/app/routers/events.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import asyncio
++import logging
+ import uuid
+ from collections import defaultdict
+ from datetime import UTC, datetime
+@@ -9,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
+ from sqlalchemy import and_, delete, func, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+-from streamhub_common.db import get_db
++from streamhub_common.db import SessionLocal, get_db
+ from streamhub_common.settings import get_settings
+ from streamhub_common.models import (
+     AuditLog,
+@@ -17,6 +19,7 @@ from streamhub_common.models import (
+     ChatEvent,
+     ChatMessage,
+     EventCategory,
++    EventPurgeJob,
+     MediaEvent,
+     Session,
+     SessionSegment,
+@@ -50,6 +53,8 @@ from ..site_assets import remove_site_asset_file
+ 
+ router = APIRouter(prefix="/api/v1", tags=["events"])
+ settings = get_settings()
++logger = logging.getLogger(__name__)
++ACTIVE_EVENT_PURGE_STATUSES = frozenset({"queued", "running"})
+ 
+ 
+ def event_dict(row: MediaEvent) -> dict:
+@@ -548,18 +553,8 @@ async def _clear_orphaned_site_editorial_state(
+     return storage_keys, payload
+ 
+ 
+-@router.delete("/deleted/events/{event_id}")
+-async def purge_event(
+-    event_id: uuid.UUID,
+-    permanent: bool = Query(default=False),
+-    db: AsyncSession = Depends(get_db),
+-) -> dict:
+-    """Permanently purge only this Event's sessions that are currently in Trash.
+-
+-    Visible sessions and the canonical MediaEvent identity are intentionally kept.
+-    """
+-    if not permanent:
+-        raise HTTPException(400, "permanent=true and explicit UI confirmation are required")
++async def _purge_event_trash_now(event_id: uuid.UUID, db: AsyncSession) -> dict:
++    """Permanently purge this Event's sessions that are currently in Trash."""
+     event = await db.get(MediaEvent, event_id)
+     if event is None:
+         raise HTTPException(404, "event not found")
+@@ -658,3 +653,234 @@ async def purge_event(
+         "site_cleanup": site_cleanup,
+         "site_asset_files_cleanup_requested": len(storage_keys),
+     }
++
++
++def event_purge_job_payload(row: EventPurgeJob) -> dict:
++    return {
++        "id": int(row.id),
++        "event_id": str(row.event_id),
++        "status": row.status,
++        "total_chat_sessions": int(row.total_chat_sessions or 0),
++        "total_video_sessions": int(row.total_video_sessions or 0),
++        "purged_chat_sessions": int(row.purged_chat_sessions or 0),
++        "purged_video_sessions": int(row.purged_video_sessions or 0),
++        "result": row.result_json,
++        "last_error": row.last_error,
++        "created_at": row.created_at,
++        "started_at_utc": row.started_at_utc,
++        "completed_at_utc": row.completed_at_utc,
++        "updated_at": row.updated_at,
++    }
++
++
++class EventPurgeQueueRuntime:
++    def __init__(self) -> None:
++        self._task: asyncio.Task | None = None
++        self._stop = asyncio.Event()
++        self._wake = asyncio.Event()
++
++    async def start(self) -> None:
++        if self._task is not None and not self._task.done():
++            return
++        self._stop.clear()
++        self._wake.clear()
++        async with SessionLocal() as db:
++            interrupted = (
++                await db.execute(select(EventPurgeJob).where(EventPurgeJob.status == "running"))
++            ).scalars().all()
++            if interrupted:
++                now = datetime.now(UTC).replace(tzinfo=None)
++                for job in interrupted:
++                    job.status = "queued"
++                    job.last_error = "worker restarted while this purge was running; queued for idempotent retry"
++                    job.started_at_utc = None
++                    job.updated_at = now
++                await db.commit()
++        self._task = asyncio.create_task(self._run(), name="event-purge-queue")
++        self._wake.set()
++
++    async def stop(self) -> None:
++        self._stop.set()
++        self._wake.set()
++        task = self._task
++        self._task = None
++        if task is not None:
++            await task
++
++    def wake(self) -> None:
++        self._wake.set()
++
++    async def _run(self) -> None:
++        while not self._stop.is_set():
++            processed = False
++            try:
++                processed = await self._process_next()
++            except Exception:
++                logger.exception("event purge queue iteration failed")
++            if processed:
++                continue
++            self._wake.clear()
++            try:
++                await asyncio.wait_for(self._wake.wait(), timeout=1.0)
++            except TimeoutError:
++                pass
++
++    async def _process_next(self) -> bool:
++        async with SessionLocal() as db:
++            job = await db.scalar(
++                select(EventPurgeJob)
++                .where(EventPurgeJob.status == "queued")
++                .order_by(EventPurgeJob.id.asc())
++                .limit(1)
++            )
++            if job is None:
++                return False
++            job_id = int(job.id)
++            event_id = job.event_id
++            now = datetime.now(UTC).replace(tzinfo=None)
++            job.status = "running"
++            job.started_at_utc = now
++            job.completed_at_utc = None
++            job.last_error = None
++            job.updated_at = now
++            await db.commit()
++
++        try:
++            async with SessionLocal() as db:
++                result = await _purge_event_trash_now(event_id, db)
++        except Exception as exc:
++            logger.exception("event purge job failed id=%s event=%s", job_id, event_id)
++            async with SessionLocal() as db:
++                failed = await db.get(EventPurgeJob, job_id)
++                if failed is not None:
++                    failed.status = "failed"
++                    failed.last_error = str(exc.detail if isinstance(exc, HTTPException) else exc)
++                    failed.completed_at_utc = datetime.now(UTC).replace(tzinfo=None)
++                    failed.updated_at = failed.completed_at_utc
++                    await db.commit()
++            return True
++
++        async with SessionLocal() as db:
++            completed = await db.get(EventPurgeJob, job_id)
++            if completed is not None:
++                completed.status = "completed"
++                completed.purged_chat_sessions = int(result.get("chat_sessions") or 0)
++                completed.purged_video_sessions = int(result.get("video_sessions") or 0)
++                completed.result_json = result
++                completed.last_error = None
++                completed.completed_at_utc = datetime.now(UTC).replace(tzinfo=None)
++                completed.updated_at = completed.completed_at_utc
++                await db.commit()
++        return True
++
++
++event_purge_queue_runtime = EventPurgeQueueRuntime()
++
++
++@router.get("/deleted/event-purge-jobs")
++async def list_event_purge_jobs(
++    limit: int = Query(default=50, ge=1, le=200),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    rows = (
++        await db.execute(
++            select(EventPurgeJob).order_by(EventPurgeJob.id.desc()).limit(limit)
++        )
++    ).scalars().all()
++    return {"items": [event_purge_job_payload(row) for row in rows]}
++
++
++@router.delete("/deleted/events/{event_id}", status_code=202)
++async def enqueue_event_purge(
++    event_id: uuid.UUID,
++    permanent: bool = Query(default=False),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    if not permanent:
++        raise HTTPException(400, "permanent=true and explicit UI confirmation are required")
++    event = await db.get(MediaEvent, event_id)
++    if event is None:
++        raise HTTPException(404, "event not found")
++
++    existing = await db.scalar(
++        select(EventPurgeJob)
++        .where(
++            EventPurgeJob.event_id == event_id,
++            EventPurgeJob.status.in_(ACTIVE_EVENT_PURGE_STATUSES),
++        )
++        .order_by(EventPurgeJob.id.desc())
++        .limit(1)
++    )
++    if existing is not None:
++        return event_purge_job_payload(existing)
++
++    chat_count = int(
++        await db.scalar(
++            select(func.count()).select_from(Session).where(
++                Session.event_id == event_id,
++                Session.deleted_at_utc.is_not(None),
++            )
++        )
++        or 0
++    )
++    video_count = int(
++        await db.scalar(
++            select(func.count()).select_from(VideoSession).where(
++                VideoSession.event_id == event_id,
++                VideoSession.deleted_at_utc.is_not(None),
++            )
++        )
++        or 0
++    )
++    if chat_count == 0 and video_count == 0:
++        raise HTTPException(409, "event has no sessions in trash")
++
++    now = datetime.now(UTC).replace(tzinfo=None)
++    job = EventPurgeJob(
++        event_id=event_id,
++        status="queued",
++        total_chat_sessions=chat_count,
++        total_video_sessions=video_count,
++        purged_chat_sessions=0,
++        purged_video_sessions=0,
++        created_at=now,
++        updated_at=now,
++    )
++    db.add(job)
++    await db.commit()
++    await db.refresh(job)
++    event_purge_queue_runtime.wake()
++    return event_purge_job_payload(job)
++
++
++@router.post("/deleted/event-purge-jobs/{job_id}/retry")
++async def retry_event_purge_job(job_id: int, db: AsyncSession = Depends(get_db)) -> dict:
++    job = await db.get(EventPurgeJob, job_id)
++    if job is None:
++        raise HTTPException(404, "event purge job not found")
++    if job.status != "failed":
++        raise HTTPException(409, "only failed event purge jobs can be retried")
++    another = await db.scalar(
++        select(EventPurgeJob.id)
++        .where(
++            EventPurgeJob.event_id == job.event_id,
++            EventPurgeJob.id != job.id,
++            EventPurgeJob.status.in_(ACTIVE_EVENT_PURGE_STATUSES),
++        )
++        .limit(1)
++    )
++    if another is not None:
++        raise HTTPException(409, "this Event already has a queued or running purge job")
++    now = datetime.now(UTC).replace(tzinfo=None)
++    job.status = "queued"
++    job.purged_chat_sessions = 0
++    job.purged_video_sessions = 0
++    job.result_json = None
++    job.last_error = None
++    job.started_at_utc = None
++    job.completed_at_utc = None
++    job.updated_at = now
++    await db.commit()
++    await db.refresh(job)
++    event_purge_queue_runtime.wake()
++    return event_purge_job_payload(job)
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 52d30ab..69fac97 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -185,6 +185,21 @@ type OutputSettings = {
+   applies_to: string;
+ };
+ 
++type EventPurgeJob = {
++  id: number;
++  event_id: string;
++  status: "queued" | "running" | "completed" | "failed" | string;
++  total_chat_sessions: number;
++  total_video_sessions: number;
++  purged_chat_sessions: number;
++  purged_video_sessions: number;
++  result?: Record<string, unknown> | null;
++  last_error?: string | null;
++  created_at: string;
++  started_at_utc?: string | null;
++  completed_at_utc?: string | null;
++};
++
+ type StorageMigration = {
+   id: number;
+   status: "queued" | "running" | "completed" | "failed" | string;
+@@ -2410,6 +2425,7 @@ function SiteAdminPanel({
+ function App() {
+   const [events, setEvents] = useState<MediaEvent[]>([]);
+   const [trashEvents, setTrashEvents] = useState<MediaEvent[]>([]);
++  const [eventPurgeJobs, setEventPurgeJobs] = useState<EventPurgeJob[]>([]);
+   const [view, setView] = useState<ViewMode>(() => new URLSearchParams(window.location.search).has("site_event") ? "site" : "events");
+   const [expandedIds, setExpandedIds] = useState<string[]>([]);
+   const [selected, setSelected] = useState<Session | null>(null);
+@@ -2951,10 +2967,15 @@ function App() {
+ 
+   async function loadTrash() {
+     try {
+-      const res = await fetch(`${API}/api/v1/deleted/events?page_size=100`, { cache: "no-store" });
+-      if (!res.ok) throw new Error(await res.text());
+-      const data = await res.json();
+-      setTrashEvents(data.items || []);
++      const [eventsRes, jobsRes] = await Promise.all([
++        fetch(`${API}/api/v1/deleted/events?page_size=100`, { cache: "no-store" }),
++        fetch(`${API}/api/v1/deleted/event-purge-jobs?limit=100`, { cache: "no-store" }),
++      ]);
++      if (!eventsRes.ok) throw new Error(await eventsRes.text());
++      if (!jobsRes.ok) throw new Error(await jobsRes.text());
++      const [eventsData, jobsData] = await Promise.all([eventsRes.json(), jobsRes.json()]);
++      setTrashEvents(eventsData.items || []);
++      setEventPurgeJobs(jobsData.items || []);
+       setError(null);
+     } catch (e) {
+       setError(String(e));
+@@ -3313,7 +3334,7 @@ function App() {
+   }
+ 
+   async function purgeEvent(event: MediaEvent) {
+-    if (!window.confirm("Удалить навсегда все sessions этого Event, которые сейчас находятся в корзине? Текущие sessions в Events и сам уникальный Event не затрагиваются.")) return;
++    if (!window.confirm("Поставить в очередь безвозвратное удаление всех sessions этого Event, которые сейчас находятся в корзине? Текущие sessions в Events и сам уникальный Event не затрагиваются.")) return;
+     setActionId(event.id);
+     try {
+       const res = await fetch(`${API}/api/v1/deleted/events/${event.id}?permanent=true`, { method: "DELETE" });
+@@ -3327,6 +3348,24 @@ function App() {
+     }
+   }
+ 
++  function purgeJobForEvent(eventId: string) {
++    return eventPurgeJobs.find((job) => job.event_id === eventId && ["queued", "running", "failed"].includes(job.status)) || null;
++  }
++
++  async function retryEventPurge(job: EventPurgeJob) {
++    setActionId(job.event_id);
++    try {
++      const res = await fetch(`${API}/api/v1/deleted/event-purge-jobs/${job.id}/retry`, { method: "POST" });
++      if (!res.ok) throw new Error(await res.text());
++      await loadTrash();
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setActionId(null);
++    }
++  }
++
+   function toggleEvent(eventId: string) {
+     setExpandedIds((current) => current.includes(eventId)
+       ? current.filter((id) => id !== eventId)
+@@ -3338,6 +3377,17 @@ function App() {
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [view]);
+ 
++  const activeEventPurgeJobs = eventPurgeJobs.some((job) => job.status === "queued" || job.status === "running");
++
++  useEffect(() => {
++    if (view !== "trash" || !activeEventPurgeJobs) return;
++    const timer = window.setInterval(() => {
++      loadTrash();
++    }, 1500);
++    return () => window.clearInterval(timer);
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [view, activeEventPurgeJobs]);
++
+   const activeStorageMigration = storageMigrations.find((job) => job.status === "queued" || job.status === "running");
+ 
+   useEffect(() => {
+@@ -4248,6 +4298,23 @@ function App() {
+         </section>
+       ) : (
+         <>
++          {eventPurgeJobs.some((job) => ["queued", "running", "failed"].includes(job.status)) && (
++            <section className="trash-purge-queue">
++              <div className="section-label">ОЧЕРЕДЬ УДАЛЕНИЯ</div>
++              {eventPurgeJobs.filter((job) => ["queued", "running", "failed"].includes(job.status)).map((job) => (
++                <div className="trash-purge-job" key={job.id}>
++                  <div>
++                    <strong>Job #{job.id}</strong>
++                    <span className={`trash-purge-status ${job.status}`}>{job.status}</span>
++                    <span className="muted small">Event {job.event_id} · Chat {job.total_chat_sessions} · Video {job.total_video_sessions}</span>
++                  </div>
++                  {job.last_error ? <div className="error small">{job.last_error}</div> : null}
++                  {job.status === "failed" ? <button disabled={actionId === job.event_id} onClick={() => retryEventPurge(job)}>Повторить</button> : null}
++                </div>
++              ))}
++            </section>
++          )}
++
+           {trashEvents.length === 0 && <div className="empty">Корзина пуста</div>}
+ 
+           {trashEvents.length > 0 && (
+@@ -4270,8 +4337,15 @@ function App() {
+                     <div className="event-delete-row">
+                       <span className="muted small">Этот же уникальный Event может одновременно быть в Events с новыми sessions и здесь со старыми удалёнными sessions.</span>
+                       <div className="actions">
+-                        <button disabled={actionId === event.id} onClick={() => restoreEvent(event)}>Восстановить все sessions</button>
+-                        <button className="danger" disabled={actionId === event.id} onClick={() => purgeEvent(event)}>Удалить из корзины навсегда</button>
++                        {purgeJobForEvent(event.id) ? <span className={`trash-purge-status ${purgeJobForEvent(event.id)?.status}`}>#{purgeJobForEvent(event.id)?.id} · {purgeJobForEvent(event.id)?.status}</span> : null}
++                        <button disabled={actionId === event.id || ["queued", "running"].includes(purgeJobForEvent(event.id)?.status || "")} onClick={() => restoreEvent(event)}>Восстановить все sessions</button>
++                        {purgeJobForEvent(event.id)?.status === "failed" ? (
++                          <button className="danger" disabled={actionId === event.id} onClick={() => retryEventPurge(purgeJobForEvent(event.id)!)}>Повторить удаление</button>
++                        ) : (
++                          <button className="danger" disabled={actionId === event.id || ["queued", "running"].includes(purgeJobForEvent(event.id)?.status || "")} onClick={() => purgeEvent(event)}>
++                            {purgeJobForEvent(event.id)?.status === "queued" ? "В очереди" : purgeJobForEvent(event.id)?.status === "running" ? "Удаляется…" : "Удалить из корзины навсегда"}
++                          </button>
++                        )}
+                       </div>
+                     </div>
+ 
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 44b96dd..7b04623 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -991,3 +991,41 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+   .site-admin-timecode-row { grid-template-columns: 104px minmax(0,1fr) 34px; }
+   .site-admin-timecodes-editor-head, .site-admin-timecodes-footer { align-items: stretch; flex-direction: column; }
+ }
++
++.trash-purge-queue {
++  display: grid;
++  gap: 10px;
++  margin-bottom: 18px;
++  padding: 14px;
++  border: 1px solid #e2e5ea;
++  border-radius: 10px;
++  background: #fafbfc;
++}
++.trash-purge-job {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++  padding: 10px 12px;
++  border: 1px solid #e2e5ea;
++  border-radius: 8px;
++  background: #fff;
++}
++.trash-purge-job > div:first-child { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
++.trash-purge-status {
++  display: inline-flex;
++  align-items: center;
++  min-height: 22px;
++  padding: 2px 8px;
++  border: 1px solid #d7dbe2;
++  border-radius: 999px;
++  font-size: 11px;
++  line-height: 1;
++  white-space: nowrap;
++}
++.trash-purge-status.queued { background: #fff8db; border-color: #ead77a; }
++.trash-purge-status.running { background: #e9f4ff; border-color: #9ecbf2; }
++.trash-purge-status.failed { background: #fff0f0; border-color: #efb0b0; }
++@media (max-width: 760px) {
++  .trash-purge-job { align-items: stretch; flex-direction: column; }
++}
+diff --git a/migrations/versions/0014_event_purge_queue.py b/migrations/versions/0014_event_purge_queue.py
+new file mode 100644
+index 0000000..3104d8c
+--- /dev/null
++++ b/migrations/versions/0014_event_purge_queue.py
+@@ -0,0 +1,51 @@
++"""durable Event trash purge queue
++
++Revision ID: 0014_event_purge_queue
++Revises: 0013_site_publication_visibility
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0014_event_purge_queue"
++down_revision = "0013_site_publication_visibility"
++branch_labels = None
++depends_on = None
++
++
++def _table_exists(name: str) -> bool:
++    return name in sa.inspect(op.get_bind()).get_table_names()
++
++
++def upgrade() -> None:
++    if _table_exists("event_purge_jobs"):
++        return
++    op.create_table(
++        "event_purge_jobs",
++        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
++        sa.Column("event_id", sa.BINARY(16), nullable=False),
++        sa.Column("status", sa.String(length=32), nullable=False, server_default="queued"),
++        sa.Column("total_chat_sessions", sa.Integer(), nullable=False, server_default="0"),
++        sa.Column("total_video_sessions", sa.Integer(), nullable=False, server_default="0"),
++        sa.Column("purged_chat_sessions", sa.Integer(), nullable=False, server_default="0"),
++        sa.Column("purged_video_sessions", sa.Integer(), nullable=False, server_default="0"),
++        sa.Column("result_json", sa.JSON(), nullable=True),
++        sa.Column("last_error", sa.Text(), nullable=True),
++        sa.Column("created_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++        sa.Column("started_at_utc", mysql.DATETIME(fsp=6), nullable=True),
++        sa.Column("completed_at_utc", mysql.DATETIME(fsp=6), nullable=True),
++        sa.Column("updated_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)")),
++        sa.ForeignKeyConstraint(["event_id"], ["media_events.id"], ondelete="CASCADE"),
++        sa.PrimaryKeyConstraint("id"),
++    )
++    op.create_index("ix_event_purge_jobs_event_id", "event_purge_jobs", ["event_id"])
++    op.create_index("ix_event_purge_jobs_status", "event_purge_jobs", ["status"])
++    op.create_index("ix_event_purge_jobs_status_id", "event_purge_jobs", ["status", "id"])
++    op.create_index("ix_event_purge_jobs_event_status", "event_purge_jobs", ["event_id", "status"])
++
++
++def downgrade() -> None:
++    if _table_exists("event_purge_jobs"):
++        op.drop_table("event_purge_jobs")
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index 730ad17..728fb50 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -513,6 +513,30 @@ class StorageOutputSetting(Base):
+     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+ 
+ 
++class EventPurgeJob(Base):
++    __tablename__ = "event_purge_jobs"
++    __table_args__ = (
++        Index("ix_event_purge_jobs_status_id", "status", "id"),
++        Index("ix_event_purge_jobs_event_status", "event_id", "status"),
++    )
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    event_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), nullable=False, index=True
++    )
++    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
++    total_chat_sessions: Mapped[int] = mapped_column(Integer, default=0)
++    total_video_sessions: Mapped[int] = mapped_column(Integer, default=0)
++    purged_chat_sessions: Mapped[int] = mapped_column(Integer, default=0)
++    purged_video_sessions: Mapped[int] = mapped_column(Integer, default=0)
++    result_json: Mapped[dict | None] = mapped_column(JSON)
++    last_error: Mapped[str | None] = mapped_column(Text)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
+ class StorageMigrationJob(Base):
+     __tablename__ = "storage_migration_jobs"
+ 
+diff --git a/tests/test_delete_and_storage_migration.py b/tests/test_delete_and_storage_migration.py
+index 99c745c..533c2df 100644
+--- a/tests/test_delete_and_storage_migration.py
++++ b/tests/test_delete_and_storage_migration.py
+@@ -19,7 +19,7 @@ def test_event_and_video_delete_routes_are_exposed():
+ 
+     assert '@router.delete("/events/{event_id}")' in events
+     assert '@router.post("/events/{event_id}/restore")' in events
+-    assert '@router.delete("/deleted/events/{event_id}")' in events
++    assert '@router.delete("/deleted/events/{event_id}", status_code=202)' in events
+     assert '@router.delete("/video-sessions/{session_id}")' in video
+     assert '@router.post("/video-sessions/{session_id}/restore")' in video
+     assert '@router.delete("/deleted/video-sessions/{session_id}")' in video
+@@ -115,3 +115,24 @@ def test_permanent_event_purge_cleans_site_editorial_state_only_when_event_is_or
+     assert 'action="site_editorial_cleanup"' in events
+     assert "remove_site_asset_file(settings, storage_key)" in events
+     assert '"site_asset_files_cleanup_requested"' in events
++
++
++def test_event_trash_permanent_delete_uses_durable_queue():
++    root = Path(__file__).resolve().parents[1]
++    events = (root / "apps/api/app/routers/events.py").read_text()
++    models = (root / "packages/python_common/streamhub_common/models.py").read_text()
++    migration = (root / "migrations/versions/0014_event_purge_queue.py").read_text()
++    web = (root / "apps/web/src/main.tsx").read_text()
++    api_main = (root / "apps/api/app/main.py").read_text()
++
++    assert "class EventPurgeJob(Base)" in models
++    assert 'down_revision = "0013_site_publication_visibility"' in migration
++    assert 'status="queued"' in events
++    assert 'EventPurgeJob.status == "queued"' in events
++    assert '.order_by(EventPurgeJob.id.asc())' in events
++    assert '@router.get("/deleted/event-purge-jobs")' in events
++    assert '@router.delete("/deleted/events/{event_id}", status_code=202)' in events
++    assert '@router.post("/deleted/event-purge-jobs/{job_id}/retry")' in events
++    assert "event_purge_queue_runtime.start()" in api_main
++    assert "ОЧЕРЕДЬ УДАЛЕНИЯ" in web
++    assert 'job.status === "queued" || job.status === "running"' in web

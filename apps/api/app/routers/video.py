@@ -360,6 +360,7 @@ def video_event_dict(event: MediaEvent) -> dict:
         "channel_login": event.channel_login,
         "channel_display_name": event.channel_display_name,
         "title": event.title,
+        "display_title": event.display_title,
         "external_key": event.external_key,
         "source_started_at_utc": event.source_started_at_utc,
     }

@@ -17,9 +17,11 @@ configure_logging(settings.log_level)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await telegram_runtime.start()
+    await events.event_purge_queue_runtime.start()
     try:
         yield
     finally:
+        await events.event_purge_queue_runtime.stop()
         await telegram_runtime.stop()
 
 

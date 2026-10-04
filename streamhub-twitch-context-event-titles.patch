@@ -1,0 +1,449 @@
+diff --git a/apps/api/app/routers/events.py b/apps/api/app/routers/events.py
+index 24abb29..a40f943 100644
+--- a/apps/api/app/routers/events.py
++++ b/apps/api/app/routers/events.py
+@@ -8,6 +8,7 @@ from datetime import UTC, datetime
+ from typing import Literal
+ 
+ from fastapi import APIRouter, Depends, HTTPException, Query
++from pydantic import BaseModel, Field
+ from sqlalchemy import and_, delete, func, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -51,6 +52,10 @@ from .video import (
+ )
+ from ..site_assets import remove_site_asset_file
+ 
++class EventDisplayTitleUpdateRequest(BaseModel):
++    display_title: str = Field(min_length=1, max_length=1024)
++
++
+ router = APIRouter(prefix="/api/v1", tags=["events"])
+ settings = get_settings()
+ logger = logging.getLogger(__name__)
+@@ -318,6 +323,31 @@ async def get_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
+     return _event_payload(event, chat_summaries.get(event_id, []), video_summaries.get(event_id, []))
+ 
+ 
++@router.put("/events/{event_id}/display-title")
++async def update_event_display_title(
++    event_id: uuid.UUID,
++    payload: EventDisplayTitleUpdateRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    event = await db.get(MediaEvent, event_id)
++    if event is None:
++        raise HTTPException(404, "event not found")
++    display_title = payload.display_title.strip()
++    if not display_title:
++        raise HTTPException(400, "display_title must not be empty")
++    event.display_title = display_title
++    db.add(
++        AuditLog(
++            event_id=event_id,
++            action="event_display_title_update",
++            payload_json={"display_title": display_title},
++        )
++    )
++    await db.commit()
++    await db.refresh(event)
++    return event_dict(event)
++
++
+ @router.post("/events/{event_id}/stop-all")
+ async def stop_all_event_capture(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+     event = await db.get(MediaEvent, event_id)
+diff --git a/apps/chrome_extension/manifest.json b/apps/chrome_extension/manifest.json
+index 86027bd..b50115c 100644
+--- a/apps/chrome_extension/manifest.json
++++ b/apps/chrome_extension/manifest.json
+@@ -6,6 +6,7 @@
+   "permissions": [
+     "storage",
+     "tabs",
++    "scripting",
+     "webRequest"
+   ],
+   "host_permissions": [
+diff --git a/apps/chrome_extension/popup.js b/apps/chrome_extension/popup.js
+index ffb67ba..858348c 100644
+--- a/apps/chrome_extension/popup.js
++++ b/apps/chrome_extension/popup.js
+@@ -93,9 +93,11 @@ function render() {
+   const videoWriting = Boolean(activeVideoSession && ["arming", "recording", "reconnecting"].includes(activeVideoSession.status));
+   const partialCapture = chatWriting !== videoWriting;
+   const missingCapture = chatWriting ? "Video не пишется" : videoWriting ? "Chat не пишется" : null;
+-  const statusText = context?.supported
+-    ? `${context.mode?.toUpperCase()} · player ${context.player_open ? "open" : "closed"}`
+-    : "Неподдерживаемая страница Twitch";
++  const statusText = context?.mode === "loading"
++    ? "Twitch загружается…"
++    : context?.supported
++      ? `${context.mode?.toUpperCase()} · player ${context.player_open ? "open" : "closed"}`
++      : "Неподдерживаемая страница Twitch";
+   $("status").textContent = partialCapture && missingCapture
+     ? `${statusText}\n⚠ ${missingCapture}`
+     : statusText;
+@@ -143,10 +145,79 @@ async function getTwitchIntegrity(tabId) {
+   return chrome.runtime.sendMessage({ type: "STREAMHUB_GET_TWITCH_INTEGRITY", tabId });
+ }
+ 
++function sleep(ms) {
++  return new Promise((resolve) => window.setTimeout(resolve, ms));
++}
++
++async function readTwitchContextDirect(tabId) {
++  const results = await chrome.scripting.executeScript({
++    target: { tabId },
++    func: () => {
++      const serviceSegments = new Set([
++        "directory", "downloads", "jobs", "p", "settings", "subscriptions", "inventory",
++        "search", "wallet", "drops", "friends", "messages", "moderator", "creator-camp"
++      ]);
++      const url = new URL(location.href);
++      let route = { supported: false, mode: "unsupported" };
++      if (url.hostname === "www.twitch.tv" || url.hostname === "twitch.tv") {
++        const parts = url.pathname.split("/").filter(Boolean);
++        if (parts[0] === "videos" && /^\d+$/.test(parts[1] || "")) {
++          route = { supported: true, mode: "vod", video_id: parts[1] };
++        } else if (parts[0] === "clip" || parts[0] === "clips") {
++          route = { supported: false, mode: "unsupported_clip" };
++        } else if (parts.length === 1 && !serviceSegments.has(parts[0])) {
++          route = { supported: true, mode: "live", channel_login: parts[0].toLowerCase() };
++        }
++      }
++
++      const videos = [...document.querySelectorAll("video")];
++      const visibleVideo = videos.find((video) => {
++        const rect = video.getBoundingClientRect();
++        return rect.width > 160 && rect.height > 90;
++      });
++      const player = visibleVideo ? {
++        player_open: true,
++        current_time_ms: Number.isFinite(visibleVideo.currentTime) ? Math.round(visibleVideo.currentTime * 1000) : null,
++        duration_ms: Number.isFinite(visibleVideo.duration) ? Math.round(visibleVideo.duration * 1000) : null,
++        paused: visibleVideo.paused
++      } : { player_open: false };
++
++      return {
++        href: location.href,
++        ...route,
++        ...player,
++        observed_at: new Date().toISOString()
++      };
++    }
++  });
++  return results?.[0]?.result || null;
++}
++
++async function readTwitchContext(tabId) {
++  const delays = [0, 120, 350];
++  let lastError = null;
++  for (const delay of delays) {
++    if (delay) await sleep(delay);
++    try {
++      const value = await chrome.tabs.sendMessage(tabId, { type: "STREAMHUB_GET_CONTEXT" });
++      if (value) return value;
++    } catch (error) {
++      lastError = error;
++    }
++    try {
++      const value = await readTwitchContextDirect(tabId);
++      if (value) return value;
++    } catch (error) {
++      lastError = error;
++    }
++  }
++  throw lastError || new Error("Не удалось прочитать контекст Twitch");
++}
++
+ async function refreshContext() {
+   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+   activeTabId = tab?.id ?? null;
+-  if (!tab?.id || !tab.url?.includes("twitch.tv")) {
++  if (!tab?.id || !/^https:\/\/(www\.)?twitch\.tv\//i.test(tab.url || "")) {
+     context = { supported: false, mode: "unsupported", player_open: false };
+     currentEventId = null;
+     activeChatSession = null;
+@@ -156,15 +227,15 @@ async function refreshContext() {
+     return;
+   }
+   try {
+-    context = await chrome.tabs.sendMessage(tab.id, { type: "STREAMHUB_GET_CONTEXT" });
++    context = await readTwitchContext(tab.id);
+   } catch {
+-    context = { supported: false, mode: "unsupported", player_open: false };
++    context = { supported: true, mode: "loading", player_open: false, href: tab.url };
+   }
+   render();
+ }
+ 
+ async function syncCurrentCaptureStatus({ silent = false } = {}) {
+-  if (!context?.supported || !context?.player_open) {
++  if (!context?.supported) {
+     currentEventId = null;
+     activeChatSession = null;
+     activeVideoSession = null;
+@@ -172,6 +243,10 @@ async function syncCurrentCaptureStatus({ silent = false } = {}) {
+     render();
+     return null;
+   }
++  if (!context?.player_open || context?.mode === "loading") {
++    render();
++    return null;
++  }
+   const payload = {
+     mode: context.mode,
+     channel_login: context.channel_login || null,
+@@ -394,6 +469,21 @@ $("auth").addEventListener("click", () => {
+   void startTwitchAuthorization();
+ });
+ 
++chrome.runtime.onMessage.addListener((message, sender) => {
++  if (message?.type !== "STREAMHUB_CONTEXT_CHANGED") return false;
++  if (activeTabId == null || Number(sender.tab?.id) !== Number(activeTabId)) return false;
++  context = message.context;
++  render();
++  void syncCurrentCaptureStatus({ silent: true });
++  return false;
++});
++
++chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
++  if (Number(tabId) !== Number(activeTabId)) return;
++  if (!changeInfo.url && changeInfo.status !== "complete") return;
++  void refreshContext().then(() => syncCurrentCaptureStatus({ silent: true }));
++});
++
+ (async function init() {
+   state = await getState();
+   await refreshContext();
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 4e83134..b5e1d17 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -460,6 +460,7 @@ type MediaEvent = {
+   channel_login?: string | null;
+   channel_display_name?: string | null;
+   title?: string | null;
++  display_title?: string | null;
+   source_started_at_utc?: string | null;
+   source_duration_ms?: number | null;
+   created_at: string;
+@@ -630,6 +631,26 @@ const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
+ const PROGRESS_POLL_MS = 5000;
+ const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
+ const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
++const EVENT_TITLE_MODE_KEY = "streamhub.events.titleMode";
++type EventTitleMode = "display" | "source";
++
++function storedEventTitleMode(): EventTitleMode {
++  try {
++    return window.localStorage.getItem(EVENT_TITLE_MODE_KEY) === "source" ? "source" : "display";
++  } catch {
++    return "display";
++  }
++}
++
++function fallbackEventTitle(event: MediaEvent) {
++  return event.media_type === "vod" ? `VOD ${event.external_key.split(":").pop()}` : "LIVE stream";
++}
++
++function visibleEventTitle(event: MediaEvent, mode: EventTitleMode) {
++  const fallback = fallbackEventTitle(event);
++  if (mode === "source") return event.title?.trim() || fallback;
++  return event.display_title?.trim() || event.title?.trim() || fallback;
++}
+ 
+ function storedPositiveInt(key: string, fallback: number) {
+   try {
+@@ -2435,6 +2456,9 @@ function App() {
+   const [eventPurgeJobs, setEventPurgeJobs] = useState<EventPurgeJob[]>([]);
+   const [view, setView] = useState<ViewMode>(() => new URLSearchParams(window.location.search).has("site_event") ? "site" : "events");
+   const [expandedIds, setExpandedIds] = useState<string[]>([]);
++  const [eventTitleMode, setEventTitleMode] = useState<EventTitleMode>(() => storedEventTitleMode());
++  const [editingEventTitleId, setEditingEventTitleId] = useState<string | null>(null);
++  const [eventTitleDraft, setEventTitleDraft] = useState("");
+   const [selected, setSelected] = useState<Session | null>(null);
+   const [selectedVideo, setSelectedVideo] = useState<VideoSession | null>(null);
+   const [videoRuns, setVideoRuns] = useState<VideoRun[]>([]);
+@@ -2555,6 +2579,47 @@ function App() {
+     return () => controller.abort();
+   }, []);
+ 
++  function changeEventTitleMode(mode: EventTitleMode) {
++    setEventTitleMode(mode);
++    try { window.localStorage.setItem(EVENT_TITLE_MODE_KEY, mode); } catch { /* browser storage unavailable */ }
++  }
++
++  function beginEventTitleEdit(event: MediaEvent) {
++    setEditingEventTitleId(event.id);
++    setEventTitleDraft(event.display_title?.trim() || event.title?.trim() || fallbackEventTitle(event));
++  }
++
++  function cancelEventTitleEdit() {
++    setEditingEventTitleId(null);
++    setEventTitleDraft("");
++  }
++
++  async function saveEventDisplayTitle(event: MediaEvent) {
++    const displayTitle = eventTitleDraft.trim();
++    if (!displayTitle) return;
++    const actionKey = `event-title:${event.id}`;
++    setActionId(actionKey);
++    try {
++      const res = await fetch(`${API}/api/v1/events/${event.id}/display-title`, {
++        method: "PUT",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ display_title: displayTitle }),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      const updated = await res.json() as MediaEvent;
++      setEvents((current) => current.map((item) => item.id === event.id ? { ...item, display_title: updated.display_title } : item));
++      setSiteAdminEvents((current) => current.map((item) => item.id === event.id ? { ...item, title: displayTitle, display_title: displayTitle } : item));
++      setSiteEvents((current) => current.map((item) => item.id === event.id ? { ...item, title: displayTitle, display_title: displayTitle } : item));
++      setSelectedSiteEvent((current) => current?.id === event.id ? { ...current, title: displayTitle, display_title: displayTitle } : current);
++      cancelEventTitleEdit();
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setActionId(null);
++    }
++  }
++
+   async function loadEvents() {
+     try {
+       const res = await fetch(`${API}/api/v1/events?page_size=100`, { cache: "no-store" });
+@@ -4107,28 +4172,66 @@ function App() {
+ 
+       {view === "events" ? (
+         <>
++          <div className="events-title-mode" role="group" aria-label="Режим названий Events">
++            <span>Название:</span>
++            <button type="button" className={eventTitleMode === "display" ? "active" : ""} onClick={() => changeEventTitleMode("display")}>Отображаемое</button>
++            <button type="button" className={eventTitleMode === "source" ? "active" : ""} onClick={() => changeEventTitleMode("source")}>Исходное</button>
++          </div>
+           {events.length === 0 && <div className="empty">Events пока нет</div>}
+           <section className="events-list">
+             {events.map((event) => {
+               const expanded = expandedIds.includes(event.id);
+               const activeChat = event.chat_sessions.find(isCaptureBusy);
+               const activeVideo = event.video_sessions.find(isVideoBusy);
++              const editingTitle = editingEventTitleId === event.id;
+               return (
+                 <article className="event-card" key={event.id}>
+-                  <button className="event-summary" onClick={() => toggleEvent(event.id)} aria-expanded={expanded}>
+-                    <div className="event-main">
+-                      <div className="row"><strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong><span className="event-type">{event.media_type.toUpperCase()}</span></div>
+-                      <div className="event-title">{event.title || (event.media_type === "vod" ? `VOD ${event.external_key.split(":").pop()}` : "LIVE stream")}</div>
+-                      <div className="row muted event-meta"><span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span><span>{event.media_type === "vod" ? fmtMs(event.source_duration_ms) : "LIVE"}</span></div>
+-                    </div>
+-                    <div className="event-badges">
+-                      <span>Chat: {event.chat_sessions_count}</span>
+-                      <span>Video: {event.video_sessions_count}</span>
+-                      {event.metadata?.identity_state && event.metadata.identity_state !== "canonical" && <span>legacy identity</span>}
+-                      {activeChat && <span className="active-badge">chat {chatProgressLabel(activeChat, progressBySession[activeChat.id])}</span>}
+-                      {activeVideo && <span className="active-badge">video {videoProgressLabel(activeVideo, videoProgressBySession[activeVideo.id])}</span>}
+-                    </div>
+-                  </button>
++                  <div className="event-summary-row">
++                    <button
++                      type="button"
++                      className="event-edit-title-button"
++                      aria-label={`Изменить отображаемое название: ${visibleEventTitle(event, "display")}`}
++                      title="Изменить отображаемое название"
++                      onClick={() => editingTitle ? cancelEventTitleEdit() : beginEventTitleEdit(event)}
++                    >
++                      ✎
++                    </button>
++                    <button className="event-summary" onClick={() => toggleEvent(event.id)} aria-expanded={expanded}>
++                      <div className="event-main">
++                        <div className="row"><strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong><span className="event-type">{event.media_type.toUpperCase()}</span></div>
++                        <div className="event-title">{visibleEventTitle(event, eventTitleMode)}</div>
++                        <div className="row muted event-meta"><span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span><span>{event.media_type === "vod" ? fmtMs(event.source_duration_ms) : "LIVE"}</span></div>
++                      </div>
++                      <div className="event-badges">
++                        <span>Chat: {event.chat_sessions_count}</span>
++                        <span>Video: {event.video_sessions_count}</span>
++                        {event.metadata?.identity_state && event.metadata.identity_state !== "canonical" && <span>legacy identity</span>}
++                        {activeChat && <span className="active-badge">chat {chatProgressLabel(activeChat, progressBySession[activeChat.id])}</span>}
++                        {activeVideo && <span className="active-badge">video {videoProgressLabel(activeVideo, videoProgressBySession[activeVideo.id])}</span>}
++                      </div>
++                    </button>
++                  </div>
++
++                  {editingTitle && (
++                    <form className="event-title-editor" onSubmit={(e) => { e.preventDefault(); void saveEventDisplayTitle(event); }}>
++                      <div className="event-title-editor-copy">
++                        <label htmlFor={`event-display-title-${event.id}`}>Отображаемое название</label>
++                        <span>Исходное: {event.title?.trim() || fallbackEventTitle(event)}</span>
++                      </div>
++                      <input
++                        id={`event-display-title-${event.id}`}
++                        autoFocus
++                        maxLength={1024}
++                        value={eventTitleDraft}
++                        onChange={(e) => setEventTitleDraft(e.target.value)}
++                        onKeyDown={(e) => { if (e.key === "Escape") cancelEventTitleEdit(); }}
++                      />
++                      <div className="event-title-editor-actions">
++                        <button type="submit" disabled={actionId === `event-title:${event.id}` || !eventTitleDraft.trim()}>Сохранить</button>
++                        <button type="button" className="subtle" disabled={actionId === `event-title:${event.id}`} onClick={cancelEventTitleEdit}>Отмена</button>
++                      </div>
++                    </form>
++                  )}
+ 
+                   {expanded && (
+                     <div className="event-children">
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 7b04623..73d255b 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -41,9 +41,16 @@ button:disabled { cursor: not-allowed; opacity: .5; }
+   .message { grid-template-columns: 72px 110px 1fr; }
+ }
+ 
+-.events-list { display: grid; gap: 14px; margin-top: 22px; }
++.events-title-mode { display: inline-flex; align-items: center; gap: 6px; margin-top: 18px; padding: 5px; border: 1px solid #d7dbe2; border-radius: 10px; background: white; }
++.events-title-mode > span { padding: 0 5px 0 3px; color: #6b7280; font-size: 12px; font-weight: 700; }
++.events-title-mode button { padding: 7px 10px; border-radius: 7px; }
++.events-title-mode button.active { background: #111827; color: white; border-color: #111827; }
++.events-list { display: grid; gap: 14px; margin-top: 14px; }
+ .event-card { background: white; border: 1px solid #d7dbe2; border-radius: 12px; overflow: hidden; }
+-.event-summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; text-align: left; border: 0; border-radius: 0; padding: 16px; }
++.event-summary-row { display: grid; grid-template-columns: 48px minmax(0, 1fr); align-items: stretch; }
++.event-edit-title-button { align-self: center; justify-self: center; width: 32px; height: 32px; padding: 0; border-radius: 8px; font-size: 20px; line-height: 1; color: #4b5563; background: #f8fafc; }
++.event-edit-title-button:hover { color: #111827; background: #eef2f7; }
++.event-summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; text-align: left; border: 0; border-radius: 0; padding: 16px 16px 16px 4px; }
+ .event-summary:hover { background: #fafbfc; }
+ .event-main { min-width: 0; }
+ .event-type { font-size: 12px; font-weight: 700; letter-spacing: .04em; color: #4b5563; }
+@@ -52,6 +59,12 @@ button:disabled { cursor: not-allowed; opacity: .5; }
+ .event-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+ .event-badges span { border: 1px solid #d7dbe2; border-radius: 999px; padding: 5px 8px; font-size: 12px; color: #4b5563; background: #fafbfc; }
+ .event-badges .active-badge { font-weight: 700; }
++.event-title-editor { display: grid; grid-template-columns: minmax(180px, .75fr) minmax(260px, 2fr) auto; gap: 12px; align-items: end; padding: 12px 16px 14px 48px; border-top: 1px solid #eceff3; background: #fafbfc; }
++.event-title-editor-copy { display: grid; gap: 4px; min-width: 0; }
++.event-title-editor-copy label { font-size: 12px; font-weight: 800; }
++.event-title-editor-copy span { color: #6b7280; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.event-title-editor input { width: 100%; min-width: 0; }
++.event-title-editor-actions { display: flex; gap: 8px; }
+ .event-children { border-top: 1px solid #eceff3; padding: 14px 16px 6px; }
+ .section-label { margin-bottom: 8px; font-size: 11px; font-weight: 800; letter-spacing: .08em; color: #6b7280; }
+ .session-row { display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 12px 0; border-top: 1px solid #f0f2f5; }
+@@ -65,8 +78,13 @@ button:disabled { cursor: not-allowed; opacity: .5; }
+ .empty-child { padding: 10px 0 14px; color: #6b7280; }
+ 
+ @media (max-width: 760px) {
+-  .event-summary { grid-template-columns: 20px minmax(0, 1fr); }
+-  .event-badges { grid-column: 2; justify-content: flex-start; }
++  .events-title-mode { width: 100%; }
++  .events-title-mode button { flex: 1; }
++  .event-summary-row { grid-template-columns: 44px minmax(0, 1fr); }
++  .event-summary { grid-template-columns: 1fr; padding-left: 4px; }
++  .event-badges { grid-column: auto; justify-content: flex-start; }
++  .event-title-editor { grid-template-columns: 1fr; padding-left: 16px; }
++  .event-title-editor-actions { justify-content: flex-start; }
+   .session-row { grid-template-columns: 32px minmax(0, 1fr); }
+   .session-actions { grid-column: 2; justify-content: flex-start; }
+ }

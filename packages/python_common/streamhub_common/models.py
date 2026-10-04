@@ -513,6 +513,30 @@ class StorageOutputSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class EventPurgeJob(Base):
+    __tablename__ = "event_purge_jobs"
+    __table_args__ = (
+        Index("ix_event_purge_jobs_status_id", "status", "id"),
+        Index("ix_event_purge_jobs_event_status", "event_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    total_chat_sessions: Mapped[int] = mapped_column(Integer, default=0)
+    total_video_sessions: Mapped[int] = mapped_column(Integer, default=0)
+    purged_chat_sessions: Mapped[int] = mapped_column(Integer, default=0)
+    purged_video_sessions: Mapped[int] = mapped_column(Integer, default=0)
+    result_json: Mapped[dict | None] = mapped_column(JSON)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class StorageMigrationJob(Base):
     __tablename__ = "storage_migration_jobs"
 

@@ -93,9 +93,11 @@ function render() {
   const videoWriting = Boolean(activeVideoSession && ["arming", "recording", "reconnecting"].includes(activeVideoSession.status));
   const partialCapture = chatWriting !== videoWriting;
   const missingCapture = chatWriting ? "Video не пишется" : videoWriting ? "Chat не пишется" : null;
-  const statusText = context?.supported
-    ? `${context.mode?.toUpperCase()} · player ${context.player_open ? "open" : "closed"}`
-    : "Неподдерживаемая страница Twitch";
+  const statusText = context?.mode === "loading"
+    ? "Twitch загружается…"
+    : context?.supported
+      ? `${context.mode?.toUpperCase()} · player ${context.player_open ? "open" : "closed"}`
+      : "Неподдерживаемая страница Twitch";
   $("status").textContent = partialCapture && missingCapture
     ? `${statusText}\n⚠ ${missingCapture}`
     : statusText;
@@ -143,10 +145,79 @@ async function getTwitchIntegrity(tabId) {
   return chrome.runtime.sendMessage({ type: "STREAMHUB_GET_TWITCH_INTEGRITY", tabId });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function readTwitchContextDirect(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const serviceSegments = new Set([
+        "directory", "downloads", "jobs", "p", "settings", "subscriptions", "inventory",
+        "search", "wallet", "drops", "friends", "messages", "moderator", "creator-camp"
+      ]);
+      const url = new URL(location.href);
+      let route = { supported: false, mode: "unsupported" };
+      if (url.hostname === "www.twitch.tv" || url.hostname === "twitch.tv") {
+        const parts = url.pathname.split("/").filter(Boolean);
+        if (parts[0] === "videos" && /^\d+$/.test(parts[1] || "")) {
+          route = { supported: true, mode: "vod", video_id: parts[1] };
+        } else if (parts[0] === "clip" || parts[0] === "clips") {
+          route = { supported: false, mode: "unsupported_clip" };
+        } else if (parts.length === 1 && !serviceSegments.has(parts[0])) {
+          route = { supported: true, mode: "live", channel_login: parts[0].toLowerCase() };
+        }
+      }
+
+      const videos = [...document.querySelectorAll("video")];
+      const visibleVideo = videos.find((video) => {
+        const rect = video.getBoundingClientRect();
+        return rect.width > 160 && rect.height > 90;
+      });
+      const player = visibleVideo ? {
+        player_open: true,
+        current_time_ms: Number.isFinite(visibleVideo.currentTime) ? Math.round(visibleVideo.currentTime * 1000) : null,
+        duration_ms: Number.isFinite(visibleVideo.duration) ? Math.round(visibleVideo.duration * 1000) : null,
+        paused: visibleVideo.paused
+      } : { player_open: false };
+
+      return {
+        href: location.href,
+        ...route,
+        ...player,
+        observed_at: new Date().toISOString()
+      };
+    }
+  });
+  return results?.[0]?.result || null;
+}
+
+async function readTwitchContext(tabId) {
+  const delays = [0, 120, 350];
+  let lastError = null;
+  for (const delay of delays) {
+    if (delay) await sleep(delay);
+    try {
+      const value = await chrome.tabs.sendMessage(tabId, { type: "STREAMHUB_GET_CONTEXT" });
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    try {
+      const value = await readTwitchContextDirect(tabId);
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Не удалось прочитать контекст Twitch");
+}
+
 async function refreshContext() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id ?? null;
-  if (!tab?.id || !tab.url?.includes("twitch.tv")) {
+  if (!tab?.id || !/^https:\/\/(www\.)?twitch\.tv\//i.test(tab.url || "")) {
     context = { supported: false, mode: "unsupported", player_open: false };
     currentEventId = null;
     activeChatSession = null;
@@ -156,19 +227,23 @@ async function refreshContext() {
     return;
   }
   try {
-    context = await chrome.tabs.sendMessage(tab.id, { type: "STREAMHUB_GET_CONTEXT" });
+    context = await readTwitchContext(tab.id);
   } catch {
-    context = { supported: false, mode: "unsupported", player_open: false };
+    context = { supported: true, mode: "loading", player_open: false, href: tab.url };
   }
   render();
 }
 
 async function syncCurrentCaptureStatus({ silent = false } = {}) {
-  if (!context?.supported || !context?.player_open) {
+  if (!context?.supported) {
     currentEventId = null;
     activeChatSession = null;
     activeVideoSession = null;
     await persistActiveChatSession(null);
+    render();
+    return null;
+  }
+  if (!context?.player_open || context?.mode === "loading") {
     render();
     return null;
   }
@@ -392,6 +467,21 @@ async function startTwitchAuthorization({ automatic = false } = {}) {
 
 $("auth").addEventListener("click", () => {
   void startTwitchAuthorization();
+});
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type !== "STREAMHUB_CONTEXT_CHANGED") return false;
+  if (activeTabId == null || Number(sender.tab?.id) !== Number(activeTabId)) return false;
+  context = message.context;
+  render();
+  void syncCurrentCaptureStatus({ silent: true });
+  return false;
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (Number(tabId) !== Number(activeTabId)) return;
+  if (!changeInfo.url && changeInfo.status !== "complete") return;
+  void refreshContext().then(() => syncCurrentCaptureStatus({ silent: true }));
 });
 
 (async function init() {

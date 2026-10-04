@@ -19,7 +19,7 @@ def test_event_and_video_delete_routes_are_exposed():
 
     assert '@router.delete("/events/{event_id}")' in events
     assert '@router.post("/events/{event_id}/restore")' in events
-    assert '@router.delete("/deleted/events/{event_id}")' in events
+    assert '@router.delete("/deleted/events/{event_id}", status_code=202)' in events
     assert '@router.delete("/video-sessions/{session_id}")' in video
     assert '@router.post("/video-sessions/{session_id}/restore")' in video
     assert '@router.delete("/deleted/video-sessions/{session_id}")' in video
@@ -115,3 +115,24 @@ def test_permanent_event_purge_cleans_site_editorial_state_only_when_event_is_or
     assert 'action="site_editorial_cleanup"' in events
     assert "remove_site_asset_file(settings, storage_key)" in events
     assert '"site_asset_files_cleanup_requested"' in events
+
+
+def test_event_trash_permanent_delete_uses_durable_queue():
+    root = Path(__file__).resolve().parents[1]
+    events = (root / "apps/api/app/routers/events.py").read_text()
+    models = (root / "packages/python_common/streamhub_common/models.py").read_text()
+    migration = (root / "migrations/versions/0014_event_purge_queue.py").read_text()
+    web = (root / "apps/web/src/main.tsx").read_text()
+    api_main = (root / "apps/api/app/main.py").read_text()
+
+    assert "class EventPurgeJob(Base)" in models
+    assert 'down_revision = "0013_site_publication_visibility"' in migration
+    assert 'status="queued"' in events
+    assert 'EventPurgeJob.status == "queued"' in events
+    assert '.order_by(EventPurgeJob.id.asc())' in events
+    assert '@router.get("/deleted/event-purge-jobs")' in events
+    assert '@router.delete("/deleted/events/{event_id}", status_code=202)' in events
+    assert '@router.post("/deleted/event-purge-jobs/{job_id}/retry")' in events
+    assert "event_purge_queue_runtime.start()" in api_main
+    assert "ОЧЕРЕДЬ УДАЛЕНИЯ" in web
+    assert 'job.status === "queued" || job.status === "running"' in web

@@ -61,6 +61,7 @@ type VideoSession = {
     channel_login?: string | null;
     channel_display_name?: string | null;
     title?: string | null;
+    display_title?: string | null;
     external_key: string;
     source_started_at_utc?: string | null;
   };
@@ -183,6 +184,21 @@ type OutputSettings = {
   roots: OutputRoot[];
   batch_segments: number;
   applies_to: string;
+};
+
+type EventPurgeJob = {
+  id: number;
+  event_id: string;
+  status: "queued" | "running" | "completed" | "failed" | string;
+  total_chat_sessions: number;
+  total_video_sessions: number;
+  purged_chat_sessions: number;
+  purged_video_sessions: number;
+  result?: Record<string, unknown> | null;
+  last_error?: string | null;
+  created_at: string;
+  started_at_utc?: string | null;
+  completed_at_utc?: string | null;
 };
 
 type StorageMigration = {
@@ -445,6 +461,7 @@ type MediaEvent = {
   channel_login?: string | null;
   channel_display_name?: string | null;
   title?: string | null;
+  display_title?: string | null;
   source_started_at_utc?: string | null;
   source_duration_ms?: number | null;
   created_at: string;
@@ -615,6 +632,33 @@ const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
 const PROGRESS_POLL_MS = 5000;
 const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
 const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
+const EVENT_TITLE_MODE_KEY = "streamhub.events.titleMode";
+type EventTitleMode = "display" | "source";
+
+function storedEventTitleMode(): EventTitleMode {
+  try {
+    return window.localStorage.getItem(EVENT_TITLE_MODE_KEY) === "source" ? "source" : "display";
+  } catch {
+    return "display";
+  }
+}
+
+function fallbackEventTitle(event: MediaEvent) {
+  return event.media_type === "vod" ? `VOD ${event.external_key.split(":").pop()}` : "LIVE stream";
+}
+
+function visibleEventTitle(event: MediaEvent, mode: EventTitleMode) {
+  const fallback = fallbackEventTitle(event);
+  if (mode === "source") return event.title?.trim() || fallback;
+  return event.display_title?.trim() || event.title?.trim() || fallback;
+}
+
+function visibleVideoEventTitle(session: VideoSession, mode: EventTitleMode) {
+  const event = session.event;
+  const fallback = event?.external_key || session.id;
+  if (mode === "source") return event?.title?.trim() || fallback;
+  return event?.display_title?.trim() || event?.title?.trim() || fallback;
+}
 
 function storedPositiveInt(key: string, fallback: number) {
   try {
@@ -2417,8 +2461,12 @@ function SiteAdminPanel({
 function App() {
   const [events, setEvents] = useState<MediaEvent[]>([]);
   const [trashEvents, setTrashEvents] = useState<MediaEvent[]>([]);
+  const [eventPurgeJobs, setEventPurgeJobs] = useState<EventPurgeJob[]>([]);
   const [view, setView] = useState<ViewMode>(() => new URLSearchParams(window.location.search).has("site_event") ? "site" : "events");
   const [expandedIds, setExpandedIds] = useState<string[]>([]);
+  const [eventTitleMode, setEventTitleMode] = useState<EventTitleMode>(() => storedEventTitleMode());
+  const [editingEventTitleId, setEditingEventTitleId] = useState<string | null>(null);
+  const [eventTitleDraft, setEventTitleDraft] = useState("");
   const [selected, setSelected] = useState<Session | null>(null);
   const [selectedVideo, setSelectedVideo] = useState<VideoSession | null>(null);
   const [videoRuns, setVideoRuns] = useState<VideoRun[]>([]);
@@ -2538,6 +2586,47 @@ function App() {
       });
     return () => controller.abort();
   }, []);
+
+  function changeEventTitleMode(mode: EventTitleMode) {
+    setEventTitleMode(mode);
+    try { window.localStorage.setItem(EVENT_TITLE_MODE_KEY, mode); } catch { /* browser storage unavailable */ }
+  }
+
+  function beginEventTitleEdit(event: MediaEvent) {
+    setEditingEventTitleId(event.id);
+    setEventTitleDraft(event.display_title?.trim() || event.title?.trim() || fallbackEventTitle(event));
+  }
+
+  function cancelEventTitleEdit() {
+    setEditingEventTitleId(null);
+    setEventTitleDraft("");
+  }
+
+  async function saveEventDisplayTitle(event: MediaEvent) {
+    const displayTitle = eventTitleDraft.trim();
+    if (!displayTitle) return;
+    const actionKey = `event-title:${event.id}`;
+    setActionId(actionKey);
+    try {
+      const res = await fetch(`${API}/api/v1/events/${event.id}/display-title`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_title: displayTitle }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const updated = await res.json() as MediaEvent;
+      setEvents((current) => current.map((item) => item.id === event.id ? { ...item, display_title: updated.display_title } : item));
+      setSiteAdminEvents((current) => current.map((item) => item.id === event.id ? { ...item, title: displayTitle, display_title: displayTitle } : item));
+      setSiteEvents((current) => current.map((item) => item.id === event.id ? { ...item, title: displayTitle, display_title: displayTitle } : item));
+      setSelectedSiteEvent((current) => current?.id === event.id ? { ...current, title: displayTitle, display_title: displayTitle } : current);
+      cancelEventTitleEdit();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
 
   async function loadEvents() {
     try {
@@ -2958,10 +3047,15 @@ function App() {
 
   async function loadTrash() {
     try {
-      const res = await fetch(`${API}/api/v1/deleted/events?page_size=100`, { cache: "no-store" });
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
-      setTrashEvents(data.items || []);
+      const [eventsRes, jobsRes] = await Promise.all([
+        fetch(`${API}/api/v1/deleted/events?page_size=100`, { cache: "no-store" }),
+        fetch(`${API}/api/v1/deleted/event-purge-jobs?limit=100`, { cache: "no-store" }),
+      ]);
+      if (!eventsRes.ok) throw new Error(await eventsRes.text());
+      if (!jobsRes.ok) throw new Error(await jobsRes.text());
+      const [eventsData, jobsData] = await Promise.all([eventsRes.json(), jobsRes.json()]);
+      setTrashEvents(eventsData.items || []);
+      setEventPurgeJobs(jobsData.items || []);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -3320,10 +3414,28 @@ function App() {
   }
 
   async function purgeEvent(event: MediaEvent) {
-    if (!window.confirm("Удалить навсегда все sessions этого Event, которые сейчас находятся в корзине? Текущие sessions в Events и сам уникальный Event не затрагиваются.")) return;
+    if (!window.confirm("Поставить в очередь безвозвратное удаление всех sessions этого Event, которые сейчас находятся в корзине? Текущие sessions в Events и сам уникальный Event не затрагиваются.")) return;
     setActionId(event.id);
     try {
       const res = await fetch(`${API}/api/v1/deleted/events/${event.id}?permanent=true`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadTrash();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  function purgeJobForEvent(eventId: string) {
+    return eventPurgeJobs.find((job) => job.event_id === eventId && ["queued", "running", "failed"].includes(job.status)) || null;
+  }
+
+  async function retryEventPurge(job: EventPurgeJob) {
+    setActionId(job.event_id);
+    try {
+      const res = await fetch(`${API}/api/v1/deleted/event-purge-jobs/${job.id}/retry`, { method: "POST" });
       if (!res.ok) throw new Error(await res.text());
       await loadTrash();
       setError(null);
@@ -3344,6 +3456,17 @@ function App() {
     loadCurrentView(view);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view]);
+
+  const activeEventPurgeJobs = eventPurgeJobs.some((job) => job.status === "queued" || job.status === "running");
+
+  useEffect(() => {
+    if (view !== "trash" || !activeEventPurgeJobs) return;
+    const timer = window.setInterval(() => {
+      loadTrash();
+    }, 1500);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, activeEventPurgeJobs]);
 
   const activeStorageMigration = storageMigrations.find((job) => job.status === "queued" || job.status === "running");
 
@@ -3815,6 +3938,11 @@ function App() {
           <strong>{new Date(eventDate).toLocaleString("ru-RU")}</strong>
         </div>
         <button className="video-manager-back" onClick={() => setSelectedVideo(null)}>Назад</button>
+        <div className="events-title-mode" role="group" aria-label="Режим названий Video Manager">
+          <span>Название:</span>
+          <button type="button" className={eventTitleMode === "display" ? "active" : ""} onClick={() => changeEventTitleMode("display")}>Отображаемое</button>
+          <button type="button" className={eventTitleMode === "source" ? "active" : ""} onClick={() => changeEventTitleMode("source")}>Исходное</button>
+        </div>
         <header className="detail-header">
           <div>
             <h1>Video Manager · output</h1>
@@ -4057,28 +4185,66 @@ function App() {
 
       {view === "events" ? (
         <>
+          <div className="events-title-mode" role="group" aria-label="Режим названий Events">
+            <span>Название:</span>
+            <button type="button" className={eventTitleMode === "display" ? "active" : ""} onClick={() => changeEventTitleMode("display")}>Отображаемое</button>
+            <button type="button" className={eventTitleMode === "source" ? "active" : ""} onClick={() => changeEventTitleMode("source")}>Исходное</button>
+          </div>
           {events.length === 0 && <div className="empty">Events пока нет</div>}
           <section className="events-list">
             {events.map((event) => {
               const expanded = expandedIds.includes(event.id);
               const activeChat = event.chat_sessions.find(isCaptureBusy);
               const activeVideo = event.video_sessions.find(isVideoBusy);
+              const editingTitle = editingEventTitleId === event.id;
               return (
                 <article className="event-card" key={event.id}>
-                  <button className="event-summary" onClick={() => toggleEvent(event.id)} aria-expanded={expanded}>
-                    <div className="event-main">
-                      <div className="row"><strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong><span className="event-type">{event.media_type.toUpperCase()}</span></div>
-                      <div className="event-title">{event.title || (event.media_type === "vod" ? `VOD ${event.external_key.split(":").pop()}` : "LIVE stream")}</div>
-                      <div className="row muted event-meta"><span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span><span>{event.media_type === "vod" ? fmtMs(event.source_duration_ms) : "LIVE"}</span></div>
-                    </div>
-                    <div className="event-badges">
-                      <span>Chat: {event.chat_sessions_count}</span>
-                      <span>Video: {event.video_sessions_count}</span>
-                      {event.metadata?.identity_state && event.metadata.identity_state !== "canonical" && <span>legacy identity</span>}
-                      {activeChat && <span className="active-badge">chat {chatProgressLabel(activeChat, progressBySession[activeChat.id])}</span>}
-                      {activeVideo && <span className="active-badge">video {videoProgressLabel(activeVideo, videoProgressBySession[activeVideo.id])}</span>}
-                    </div>
-                  </button>
+                  <div className="event-summary-row">
+                    <button
+                      type="button"
+                      className="event-edit-title-button"
+                      aria-label={`Изменить отображаемое название: ${visibleEventTitle(event, "display")}`}
+                      title="Изменить отображаемое название"
+                      onClick={() => editingTitle ? cancelEventTitleEdit() : beginEventTitleEdit(event)}
+                    >
+                      ✎
+                    </button>
+                    <button className="event-summary" onClick={() => toggleEvent(event.id)} aria-expanded={expanded}>
+                      <div className="event-main">
+                        <div className="row"><strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong><span className="event-type">{event.media_type.toUpperCase()}</span></div>
+                        <div className="event-title">{visibleEventTitle(event, eventTitleMode)}</div>
+                        <div className="row muted event-meta"><span>{new Date(event.source_started_at_utc || event.created_at).toLocaleString()}</span><span>{event.media_type === "vod" ? fmtMs(event.source_duration_ms) : "LIVE"}</span></div>
+                      </div>
+                      <div className="event-badges">
+                        <span>Chat: {event.chat_sessions_count}</span>
+                        <span>Video: {event.video_sessions_count}</span>
+                        {event.metadata?.identity_state && event.metadata.identity_state !== "canonical" && <span>legacy identity</span>}
+                        {activeChat && <span className="active-badge">chat {chatProgressLabel(activeChat, progressBySession[activeChat.id])}</span>}
+                        {activeVideo && <span className="active-badge">video {videoProgressLabel(activeVideo, videoProgressBySession[activeVideo.id])}</span>}
+                      </div>
+                    </button>
+                  </div>
+
+                  {editingTitle && (
+                    <form className="event-title-editor" onSubmit={(e) => { e.preventDefault(); void saveEventDisplayTitle(event); }}>
+                      <div className="event-title-editor-copy">
+                        <label htmlFor={`event-display-title-${event.id}`}>Отображаемое название</label>
+                        <span>Исходное: {event.title?.trim() || fallbackEventTitle(event)}</span>
+                      </div>
+                      <input
+                        id={`event-display-title-${event.id}`}
+                        autoFocus
+                        maxLength={1024}
+                        value={eventTitleDraft}
+                        onChange={(e) => setEventTitleDraft(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Escape") cancelEventTitleEdit(); }}
+                      />
+                      <div className="event-title-editor-actions">
+                        <button type="submit" disabled={actionId === `event-title:${event.id}` || !eventTitleDraft.trim()}>Сохранить</button>
+                        <button type="button" className="subtle" disabled={actionId === `event-title:${event.id}`} onClick={cancelEventTitleEdit}>Отмена</button>
+                      </div>
+                    </form>
+                  )}
 
                   {expanded && (
                     <div className="event-children">
@@ -4138,6 +4304,11 @@ function App() {
        ) : view === "site" ? null : view === "video-manager" ? (
         <section className="storage-panel video-manager-index">
           <div className="section-label">VIDEO SESSIONS</div>
+          <div className="events-title-mode" role="group" aria-label="Режим названий Video Manager">
+            <span>Название:</span>
+            <button type="button" className={eventTitleMode === "display" ? "active" : ""} onClick={() => changeEventTitleMode("display")}>Отображаемое</button>
+            <button type="button" className={eventTitleMode === "source" ? "active" : ""} onClick={() => changeEventTitleMode("source")}>Исходное</button>
+          </div>
           {videoSessions.length === 0 ? <div className="empty-child">Video sessions пока нет</div> : (
             <div className="video-manager-list">
               {videoSessions.map((session) => (
@@ -4160,7 +4331,7 @@ function App() {
                       <strong>{new Date(session.event?.source_started_at_utc || session.recording_started_at_utc || session.created_at).toLocaleString("ru-RU")}</strong>
                     </div>
                     <div className="row"><strong>{session.event?.channel_display_name || session.event?.channel_login || session.metadata?.channel_login || "Twitch"}</strong><span>{session.event?.media_type?.toUpperCase() || session.metadata?.media_type?.toUpperCase() || "VIDEO"}</span></div>
-                    <div className="event-title">{session.event?.title || session.event?.external_key || session.id}</div>
+                    <div className="event-title">{visibleVideoEventTitle(session, eventTitleMode)}</div>
                     <div className="session-status-line"><strong>{session.status}</strong><span>{session.completeness_status}</span><span>{session.segment_count || 0} seg</span><span>{fmtBytes(session.bytes || 0)}</span><span>{fmtMs(session.duration_recorded_ms)}</span></div>
                     <div className="muted small"><code>{session.id}</code></div>
                   </div>
@@ -4255,6 +4426,23 @@ function App() {
         </section>
       ) : (
         <>
+          {eventPurgeJobs.some((job) => ["queued", "running", "failed"].includes(job.status)) && (
+            <section className="trash-purge-queue">
+              <div className="section-label">ОЧЕРЕДЬ УДАЛЕНИЯ</div>
+              {eventPurgeJobs.filter((job) => ["queued", "running", "failed"].includes(job.status)).map((job) => (
+                <div className="trash-purge-job" key={job.id}>
+                  <div>
+                    <strong>Job #{job.id}</strong>
+                    <span className={`trash-purge-status ${job.status}`}>{job.status}</span>
+                    <span className="muted small">Event {job.event_id} · Chat {job.total_chat_sessions} · Video {job.total_video_sessions}</span>
+                  </div>
+                  {job.last_error ? <div className="error small">{job.last_error}</div> : null}
+                  {job.status === "failed" ? <button disabled={actionId === job.event_id} onClick={() => retryEventPurge(job)}>Повторить</button> : null}
+                </div>
+              ))}
+            </section>
+          )}
+
           {trashEvents.length === 0 && <div className="empty">Корзина пуста</div>}
 
           {trashEvents.length > 0 && (
@@ -4277,8 +4465,15 @@ function App() {
                     <div className="event-delete-row">
                       <span className="muted small">Этот же уникальный Event может одновременно быть в Events с новыми sessions и здесь со старыми удалёнными sessions.</span>
                       <div className="actions">
-                        <button disabled={actionId === event.id} onClick={() => restoreEvent(event)}>Восстановить все sessions</button>
-                        <button className="danger" disabled={actionId === event.id} onClick={() => purgeEvent(event)}>Удалить из корзины навсегда</button>
+                        {purgeJobForEvent(event.id) ? <span className={`trash-purge-status ${purgeJobForEvent(event.id)?.status}`}>#{purgeJobForEvent(event.id)?.id} · {purgeJobForEvent(event.id)?.status}</span> : null}
+                        <button disabled={actionId === event.id || ["queued", "running"].includes(purgeJobForEvent(event.id)?.status || "")} onClick={() => restoreEvent(event)}>Восстановить все sessions</button>
+                        {purgeJobForEvent(event.id)?.status === "failed" ? (
+                          <button className="danger" disabled={actionId === event.id} onClick={() => retryEventPurge(purgeJobForEvent(event.id)!)}>Повторить удаление</button>
+                        ) : (
+                          <button className="danger" disabled={actionId === event.id || ["queued", "running"].includes(purgeJobForEvent(event.id)?.status || "")} onClick={() => purgeEvent(event)}>
+                            {purgeJobForEvent(event.id)?.status === "queued" ? "В очереди" : purgeJobForEvent(event.id)?.status === "running" ? "Удаляется…" : "Удалить из корзины навсегда"}
+                          </button>
+                        )}
                       </div>
                     </div>
 
