@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     part_build_allow_during_capture: bool = Field(default=False, alias="PART_BUILD_ALLOW_DURING_CAPTURE")
     part_build_lease_seconds: int = Field(default=30, ge=10, alias="PART_BUILD_LEASE_SECONDS")
 
+    site_asset_root: str = Field(default="/site_assets", alias="SITE_ASSET_ROOT")
+    site_asset_max_bytes: int = Field(default=15728640, ge=1048576, alias="SITE_ASSET_MAX_BYTES")
+    site_asset_max_pixels: int = Field(default=40000000, ge=1000000, alias="SITE_ASSET_MAX_PIXELS")
+    site_asset_webp_quality: int = Field(default=90, ge=60, le=100, alias="SITE_ASSET_WEBP_QUALITY")
+
     telegram_api_id: str | None = Field(default=None, alias="TELEGRAM_API_ID")
     telegram_api_hash: str | None = Field(default=None, alias="TELEGRAM_API_HASH")
     telegram_channel_id: str | None = Field(default=None, alias="TELEGRAM_CHANNEL_ID")

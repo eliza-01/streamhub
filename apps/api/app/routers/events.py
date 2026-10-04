@@ -57,6 +57,7 @@ def event_dict(row: MediaEvent) -> dict:
         "stream_external_id": row.stream_external_id,
         "video_external_id": row.video_external_id,
         "title": row.title,
+        "display_title": row.display_title,
         "category_id": row.category_id,
         "category_name": row.category_name,
         "source_started_at_utc": row.source_started_at_utc,

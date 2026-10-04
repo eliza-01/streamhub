@@ -135,6 +135,7 @@ services:
       - "${API_PUBLIC_PORT:-18741}:8000"
     volumes:
       - ./telegram_state:/telegram_state
+      - streamhub_site_assets:/site_assets
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -157,3 +158,4 @@ services:
 volumes:
   streamhub_mysql:
   streamhub_video_spool:
+  streamhub_site_assets:

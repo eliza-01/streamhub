@@ -224,3 +224,54 @@ def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
     assert '.site-chat-history-event' in css
     assert '.site-twitch-icon' in css
     assert 'left: 50%; bottom: 43px; transform: translateX(-50%)' in css
+
+
+def test_site_admin_assets_migration_keeps_source_title_and_persistent_asset_metadata():
+    migration = _read("migrations/versions/0011_site_admin_assets.py")
+    models = _read("packages/python_common/streamhub_common/models.py")
+    settings = _read("packages/python_common/streamhub_common/settings.py")
+    compose = _read("docker-compose.yml")
+    requirements = _read("requirements.txt")
+
+    assert 'down_revision = "0010_site_catalog"' in migration
+    assert '"display_title"' in migration
+    assert 'UPDATE media_events SET display_title = title' in migration
+    assert '"site_event_assets"' in migration
+    assert 'class SiteEventAsset(Base):' in models
+    assert 'display_title: Mapped[str | None]' in models
+    assert 'SITE_ASSET_ROOT' in settings
+    assert 'streamhub_site_assets:/site_assets' in compose
+    assert 'streamhub_site_assets:' in compose
+    assert 'Pillow>=' in requirements
+
+
+def test_site_admin_api_and_ui_manage_display_title_cover_and_four_manual_frames():
+    route = _read("apps/api/app/routers/site.py")
+    assets = _read("apps/api/app/site_assets.py")
+    domain = _read("apps/api/app/event_domain.py")
+    web = _read("apps/web/src/main.tsx")
+    css = _read("apps/web/src/styles.css")
+
+    assert 'display_title=title' in domain
+    assert 'return event.display_title or event.title' in route
+    assert '"source_title": event.title' in route
+    assert '@router.get("/admin/events")' in route
+    assert '@router.put("/admin/events/{event_id}")' in route
+    assert '@router.put("/admin/events/{event_id}/assets/{slot}")' in route
+    assert '@router.get("/assets/{event_id}/{slot}/{sha256}.webp")' in route
+    assert 'event requires one cover and exactly four preview frames before publishing' in route
+    assert 'SITE_ASSET_SLOTS = ("cover", "frame_1", "frame_2", "frame_3", "frame_4")' in assets
+    assert 'os.replace(temporary, destination)' in assets
+    assert 'format="WEBP"' in assets
+
+    assert '>StreamHub</button>' in web
+    assert '>Админка</button>' in web
+    assert 'function SiteAdminPanel(' in web
+    assert 'Исходное название:' in web
+    assert 'Отображаемое название' in web
+    assert '["frame_4", "Кадр 4"]' in web
+    assert 'src={latest.assets?.cover?.url}' in web
+    assert 'src={latest.assets?.frames?.[siteHeroFrame]?.url}' in web
+    assert 'onPublish={() => void openSitePublisher()}' not in web
+    assert '.site-admin-modal' in css
+    assert '.streamvault-artwork.has-image' in css

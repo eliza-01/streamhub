@@ -359,6 +359,24 @@ type SitePlaybackTimeline = {
   ranges: SitePlaybackTimelineRange[];
 };
 
+type SiteAsset = {
+  slot: string;
+  url: string;
+  content_type: string;
+  size_bytes: number;
+  width: number;
+  height: number;
+  sha256: string;
+  original_filename?: string | null;
+  updated_at: string;
+};
+
+type SiteAssets = {
+  cover?: SiteAsset | null;
+  frames: Array<SiteAsset | null>;
+  complete: boolean;
+};
+
 type SiteEvent = {
   id: string;
   platform: string;
@@ -367,11 +385,14 @@ type SiteEvent = {
   channel_login?: string | null;
   channel_display_name?: string | null;
   title: string;
+  display_title: string;
+  source_title?: string | null;
   source_started_at_utc?: string | null;
   source_duration_ms?: number | null;
   source_url?: string | null;
   published_at_utc: string;
   categories: Array<SiteCategory & { position?: number }>;
+  assets: SiteAssets;
   video_sessions: SiteVideoSession[];
   chat_sessions: SiteChatSession[];
   primary_chat_session_id?: string | null;
@@ -391,11 +412,19 @@ type SiteAvailableEvent = {
   channel_login?: string | null;
   channel_display_name?: string | null;
   title: string;
+  display_title: string;
+  source_title?: string | null;
   source_started_at_utc?: string | null;
   source_duration_ms?: number | null;
+  assets: SiteAssets;
   video_sessions: number;
   ready_parts: number;
   linked_parts: number;
+};
+
+type SiteAdminEvent = SiteAvailableEvent & {
+  published: boolean;
+  categories: Array<SiteCategory & { position?: number }>;
 };
 
 type MediaEvent = {
@@ -1663,14 +1692,14 @@ function StreamVaultHeader({
   onSubmit,
   onBrand,
   onAdmin,
-  onPublish,
+  onSiteAdmin,
 }: {
   query: string;
   onQueryChange: (value: string) => void;
   onSubmit: () => void;
   onBrand: () => void;
   onAdmin: () => void;
-  onPublish?: () => void;
+  onSiteAdmin: () => void;
 }) {
   return (
     <header className="streamvault-header">
@@ -1690,20 +1719,114 @@ function StreamVaultHeader({
           />
         </label>
         <div className="streamvault-header-actions">
-          {onPublish ? <button type="button" className="streamvault-header-button primary" onClick={onPublish}>+ Добавить событие</button> : null}
           <button type="button" className="streamvault-header-button" onClick={onAdmin}>StreamHub</button>
+          <button type="button" className="streamvault-header-button admin" onClick={onSiteAdmin}>Админка</button>
         </div>
       </div>
     </header>
   );
 }
 
-function SiteArtwork({ event, wide = false, label }: { event: SiteEvent; wide?: boolean; label?: string }) {
+function SiteArtwork({ event, wide = false, label, src }: { event: SiteEvent; wide?: boolean; label?: string; src?: string | null }) {
   const primaryCategory = event.categories[0]?.label || event.media_type.toUpperCase();
   return (
-    <div className={`streamvault-artwork${wide ? " wide" : ""}`} aria-hidden="true">
-      <span>{label || primaryCategory}</span>
-      <div><strong>{event.channel_display_name || event.channel_login || "TWITCH"}</strong><small>{event.media_type.toUpperCase()}</small></div>
+    <div className={`streamvault-artwork${wide ? " wide" : ""}${src ? " has-image" : ""}`} aria-hidden="true">
+      {src ? <img src={apiUrl(src)} alt="" loading="lazy" /> : (
+        <>
+          <span>{label || primaryCategory}</span>
+          <div><strong>{event.channel_display_name || event.channel_login || "TWITCH"}</strong><small>{event.media_type.toUpperCase()}</small></div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function SiteAdminPanel({
+  events,
+  drafts,
+  loading,
+  actionKey,
+  onDraftChange,
+  onSaveTitle,
+  onUpload,
+  onAddEvent,
+  onClose,
+}: {
+  events: SiteAdminEvent[];
+  drafts: Record<string, string>;
+  loading: boolean;
+  actionKey: string | null;
+  onDraftChange: (eventId: string, value: string) => void;
+  onSaveTitle: (eventId: string) => void;
+  onUpload: (eventId: string, slot: string, file: File) => void;
+  onAddEvent: () => void;
+  onClose: () => void;
+}) {
+  const assetSlots = [
+    ["cover", "Cover"],
+    ["frame_1", "Кадр 1"],
+    ["frame_2", "Кадр 2"],
+    ["frame_3", "Кадр 3"],
+    ["frame_4", "Кадр 4"],
+  ] as const;
+  const assetFor = (event: SiteAdminEvent, slot: string) => slot === "cover"
+    ? event.assets.cover
+    : event.assets.frames[Math.max(0, Number(slot.split("_")[1]) - 1)];
+
+  return (
+    <div className="site-modal-backdrop site-admin-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div className="site-modal site-admin-modal" role="dialog" aria-modal="true" aria-labelledby="siteAdminTitle">
+        <div className="site-admin-head">
+          <div><div className="section-label">STREAMVAULT ADMIN</div><h2 id="siteAdminTitle">События</h2></div>
+          <div className="site-admin-head-actions">
+            <button type="button" className="primary" onClick={onAddEvent}>+ Добавить событие</button>
+            <button type="button" onClick={onClose}>Закрыть</button>
+          </div>
+        </div>
+        <p className="site-admin-storage-note">Cover и четыре preview-кадра хранятся отдельно от БД в persistent storage. В БД остаются только метаданные и ссылки.</p>
+        {loading ? <div className="site-empty compact"><span className="site-inline-spinner" /> Загружаю события…</div> : events.length === 0 ? (
+          <div className="site-empty compact">Нет событий с готовым Telegram-backed видео.</div>
+        ) : (
+          <div className="site-admin-event-list">
+            {events.map((event) => (
+              <section className="site-admin-event" key={event.id}>
+                <div className="site-admin-event-top">
+                  <div>
+                    <span className={`site-admin-publish-state ${event.published ? "is-published" : ""}`}>{event.published ? "Опубликовано" : "Не опубликовано"}</span>
+                    <h3>{event.display_title}</h3>
+                    <p>Исходное название: <strong>{event.source_title || "—"}</strong></p>
+                    <small>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleString("ru-RU") : "Дата неизвестна"} · TG {event.linked_parts}/{event.ready_parts}</small>
+                  </div>
+                  <span className={`site-admin-assets-state ${event.assets.complete ? "is-complete" : ""}`}>{event.assets.complete ? "5/5 изображений" : `${Number(Boolean(event.assets.cover)) + event.assets.frames.filter(Boolean).length}/5 изображений`}</span>
+                </div>
+                <div className="site-admin-title-editor">
+                  <label>
+                    <span>Отображаемое название</span>
+                    <input value={drafts[event.id] ?? event.display_title} maxLength={1024} onChange={(e) => onDraftChange(event.id, e.target.value)} />
+                  </label>
+                  <button type="button" disabled={actionKey === `title:${event.id}` || !(drafts[event.id] ?? event.display_title).trim() || (drafts[event.id] ?? event.display_title).trim() === event.display_title} onClick={() => onSaveTitle(event.id)}>
+                    {actionKey === `title:${event.id}` ? "Сохраняю…" : "Сохранить"}
+                  </button>
+                </div>
+                <div className="site-admin-assets">
+                  {assetSlots.map(([slot, label]) => {
+                    const asset = assetFor(event, slot);
+                    const busy = actionKey === `asset:${event.id}:${slot}`;
+                    return (
+                      <label className={`site-admin-asset ${asset ? "has-asset" : ""}`} key={slot}>
+                        <span>{label}</span>
+                        <div>{asset ? <img src={apiUrl(asset.url)} alt="" /> : <b>+</b>}</div>
+                        <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height}` : "Выбрать изображение"}</small>
+                        <input type="file" accept="image/jpeg,image/png,image/webp" disabled={Boolean(actionKey)} onChange={(e) => { const file = e.target.files?.[0]; if (file) onUpload(event.id, slot, file); e.currentTarget.value = ""; }} />
+                      </label>
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1756,6 +1879,11 @@ function App() {
   const [selectedSiteEvent, setSelectedSiteEvent] = useState<SiteEvent | null>(null);
   const siteVideoRef = useRef<HTMLVideoElement | null>(null);
   const [sitePublisherOpen, setSitePublisherOpen] = useState(false);
+  const [siteAdminOpen, setSiteAdminOpen] = useState(false);
+  const [siteAdminEvents, setSiteAdminEvents] = useState<SiteAdminEvent[]>([]);
+  const [siteAdminDrafts, setSiteAdminDrafts] = useState<Record<string, string>>({});
+  const [siteAdminLoading, setSiteAdminLoading] = useState(false);
+  const [siteAdminActionKey, setSiteAdminActionKey] = useState<string | null>(null);
   const [siteAvailableEvents, setSiteAvailableEvents] = useState<SiteAvailableEvent[]>([]);
   const [sitePublishEventId, setSitePublishEventId] = useState("");
   const [sitePublishCategories, setSitePublishCategories] = useState<string[]>([]);
@@ -1988,6 +2116,73 @@ function App() {
     }, 0);
   }
 
+  async function loadSiteAdminEvents() {
+    const res = await fetch(`${API}/api/v1/site/admin/events`, { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json() as { items?: SiteAdminEvent[] };
+    const items = data.items || [];
+    setSiteAdminEvents(items);
+    setSiteAdminDrafts((current) => Object.fromEntries(items.map((event) => [event.id, current[event.id] ?? event.display_title])));
+    return items;
+  }
+
+  async function openSiteAdmin() {
+    setSiteAdminOpen(true);
+    setSiteAdminLoading(true);
+    try {
+      await loadSiteAdminEvents();
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSiteAdminLoading(false);
+    }
+  }
+
+  async function saveSiteDisplayTitle(eventId: string) {
+    const value = (siteAdminDrafts[eventId] || "").trim();
+    if (!value) return;
+    setSiteAdminActionKey(`title:${eventId}`);
+    try {
+      const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_title: value }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setSiteAdminEvents((current) => current.map((event) => event.id === eventId ? { ...event, title: value, display_title: value } : event));
+      setSiteEvents((current) => current.map((event) => event.id === eventId ? { ...event, title: value, display_title: value } : event));
+      setSelectedSiteEvent((current) => current?.id === eventId ? { ...current, title: value, display_title: value } : current);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSiteAdminActionKey(null);
+    }
+  }
+
+  async function uploadSiteAsset(eventId: string, slot: string, file: File) {
+    const actionKey = `asset:${eventId}:${slot}`;
+    setSiteAdminActionKey(actionKey);
+    try {
+      const form = new FormData();
+      form.append("image", file);
+      const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}/assets/${slot}`, { method: "PUT", body: form });
+      if (!res.ok) throw new Error(await res.text());
+      await loadSiteAdminEvents();
+      await loadSiteFeed(siteCategory, siteQuery);
+      if (selectedSiteEvent?.id === eventId) {
+        const detail = await fetch(`${API}/api/v1/site/events/${eventId}`, { cache: "no-store" });
+        if (detail.ok) setSelectedSiteEvent(await detail.json() as SiteEvent);
+      }
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSiteAdminActionKey(null);
+    }
+  }
+
   async function openSitePublisher() {
     setSiteAction(true);
     try {
@@ -2022,7 +2217,8 @@ function App() {
   }
 
   async function publishSiteEvent() {
-    if (!sitePublishEventId || sitePublishCategories.length === 0) return;
+    const selectedPublishEvent = siteAvailableEvents.find((event) => event.id === sitePublishEventId);
+    if (!sitePublishEventId || sitePublishCategories.length === 0 || !selectedPublishEvent?.assets.complete) return;
     setSiteAction(true);
     try {
       const res = await fetch(`${API}/api/v1/site/admin/events`, {
@@ -2033,6 +2229,7 @@ function App() {
       if (!res.ok) throw new Error(await res.text());
       setSitePublisherOpen(false);
       await loadSiteFeed(siteCategory, siteQuery);
+      if (siteAdminOpen) await loadSiteAdminEvents();
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -2613,6 +2810,7 @@ function App() {
           onSubmit={() => { setSelectedSiteEvent(null); void loadSiteFeed(siteCategory, siteQuery); }}
           onBrand={() => setSelectedSiteEvent(null)}
           onAdmin={() => { setSelectedSiteEvent(null); setView("events"); }}
+          onSiteAdmin={() => void openSiteAdmin()}
         />
         <main className="streamvault-watch-shell">
           <button className="streamvault-back" type="button" onClick={() => setSelectedSiteEvent(null)}>← К записям</button>
@@ -2686,6 +2884,19 @@ function App() {
             />
           </div>
         </main>
+        {siteAdminOpen ? (
+          <SiteAdminPanel
+            events={siteAdminEvents}
+            drafts={siteAdminDrafts}
+            loading={siteAdminLoading}
+            actionKey={siteAdminActionKey}
+            onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
+            onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
+            onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
+            onAddEvent={() => { setSiteAdminOpen(false); setSelectedSiteEvent(null); void openSitePublisher(); }}
+            onClose={() => setSiteAdminOpen(false)}
+          />
+        ) : null}
       </div>
     );
   }
@@ -2700,7 +2911,7 @@ function App() {
           onSubmit={() => void loadSiteFeed(siteCategory, siteQuery)}
           onBrand={() => { setSiteCategory("all"); setSiteQuery(""); void loadSiteFeed("all", ""); }}
           onAdmin={() => setView("events")}
-          onPublish={() => void openSitePublisher()}
+          onSiteAdmin={() => void openSiteAdmin()}
         />
 
         <nav className="streamvault-mobile-categories" aria-label="Категории">
@@ -2727,16 +2938,16 @@ function App() {
                 <h1>Последний стрим</h1>
                 <div className="streamvault-latest-layout">
                   <button type="button" className="streamvault-latest-cover" onClick={() => openSiteEvent(latest)} aria-label={`Открыть ${latest.title}`}>
-                    <SiteArtwork event={latest} label="COVER" />
+                    <SiteArtwork event={latest} label="COVER" src={latest.assets?.cover?.url} />
                   </button>
                   <div className="streamvault-preview-stage">
                     <button type="button" className="streamvault-preview-main" onClick={() => openSiteEvent(latest)}>
-                      <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} />
+                      <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} src={latest.assets?.frames?.[siteHeroFrame]?.url} />
                     </button>
                     <div className="streamvault-preview-rail" aria-label="Четыре preview-кадра">
                       {[0, 1, 2, 3].map((frame) => (
                         <button key={frame} type="button" className={siteHeroFrame === frame ? "active" : ""} onClick={() => setSiteHeroFrame(frame)}>
-                          <SiteArtwork event={latest} wide label={`#${frame + 1}`} />
+                          <SiteArtwork event={latest} wide label={`#${frame + 1}`} src={latest.assets?.frames?.[frame]?.url} />
                         </button>
                       ))}
                     </div>
@@ -2766,7 +2977,7 @@ function App() {
                 <div className="streamvault-recording-grid">
                   {siteEvents.map((event) => (
                     <button type="button" className="streamvault-recording-card" key={event.id} onClick={() => openSiteEvent(event)}>
-                      <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" /></div>
+                      <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" src={event.assets?.cover?.url} /></div>
                       <div className="streamvault-recording-body">
                         <h3>{event.title}</h3>
                         <p>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleDateString("ru-RU") : "Дата неизвестна"} · {(event.chat_message_count || 0).toLocaleString("ru-RU")} сообщений</p>
@@ -2779,6 +2990,20 @@ function App() {
             </section>
           </main>
         </div>
+
+        {siteAdminOpen ? (
+          <SiteAdminPanel
+            events={siteAdminEvents}
+            drafts={siteAdminDrafts}
+            loading={siteAdminLoading}
+            actionKey={siteAdminActionKey}
+            onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
+            onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
+            onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
+            onAddEvent={() => { setSiteAdminOpen(false); void openSitePublisher(); }}
+            onClose={() => setSiteAdminOpen(false)}
+          />
+        ) : null}
 
         {sitePublisherOpen && (
           <div className="site-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSitePublisherOpen(false); }}>
@@ -2794,7 +3019,7 @@ function App() {
                   <label className="storage-field site-modal-field">
                     <span>Событие из хранилища</span>
                     <select value={sitePublishEventId} onChange={(event) => setSitePublishEventId(event.target.value)}>
-                      {siteAvailableEvents.map((event) => <option key={event.id} value={event.id}>{event.title} · {event.channel_display_name || event.channel_login || event.media_type} · TG {event.linked_parts}/{event.ready_parts}</option>)}
+                      {siteAvailableEvents.map((event) => <option key={event.id} value={event.id}>{event.title} · {event.channel_display_name || event.channel_login || event.media_type} · TG {event.linked_parts}/{event.ready_parts} · {event.assets.complete ? "арт 5/5" : "нужны Cover + 4 кадра"}</option>)}
                     </select>
                   </label>
                   <div className="site-publish-categories"><span>Категории · до 3</span><div>
@@ -2805,7 +3030,8 @@ function App() {
                       </label>
                     ))}
                   </div></div>
-                  <div className="actions site-modal-actions"><button disabled={siteAction || !sitePublishEventId || sitePublishCategories.length === 0} onClick={publishSiteEvent}>{siteAction ? "Добавляю…" : "Добавить на сайт"}</button></div>
+                  {!siteAvailableEvents.find((event) => event.id === sitePublishEventId)?.assets.complete ? <div className="site-admin-publish-warning">Перед публикацией загрузите Cover и все 4 preview-кадра в админке.</div> : null}
+                  <div className="actions site-modal-actions"><button disabled={siteAction || !sitePublishEventId || sitePublishCategories.length === 0 || !siteAvailableEvents.find((event) => event.id === sitePublishEventId)?.assets.complete} onClick={publishSiteEvent}>{siteAction ? "Добавляю…" : "Добавить на сайт"}</button></div>
                 </>
               )}
             </div>

@@ -1,0 +1,1190 @@
+diff --git a/.env.example b/.env.example
+index ff3f839..6b3dd1e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -182,6 +182,14 @@ PART_BUILD_TARGET_MIB_DEFAULT=1990
+ PART_BUILD_ALLOW_DURING_CAPTURE=false
+ PART_BUILD_LEASE_SECONDS=30
+ 
++# -----------------------------------------------------------------------------
++# StreamVault artwork storage (persistent API volume; images are normalized to WebP)
++# -----------------------------------------------------------------------------
++SITE_ASSET_ROOT=/site_assets
++SITE_ASSET_MAX_BYTES=15728640
++SITE_ASSET_MAX_PIXELS=40000000
++SITE_ASSET_WEBP_QUALITY=90
++
+ # -----------------------------------------------------------------------------
+ # Telegram read-only part storage (user MTProto session, NOT Bot API)
+ # -----------------------------------------------------------------------------
+diff --git a/apps/api/app/event_domain.py b/apps/api/app/event_domain.py
+index e1cf8c5..3edd424 100644
+--- a/apps/api/app/event_domain.py
++++ b/apps/api/app/event_domain.py
+@@ -50,6 +50,7 @@ async def resolve_or_create_media_event(
+             stream_external_id=stream_external_id,
+             video_external_id=video_external_id,
+             title=title,
++            display_title=title,
+             category_id=category_id,
+             category_name=category_name,
+             source_started_at_utc=source_started_at_utc,
+@@ -80,6 +81,8 @@ async def resolve_or_create_media_event(
+     event.stream_external_id = stream_external_id or event.stream_external_id
+     event.video_external_id = video_external_id or event.video_external_id
+     event.title = title or event.title
++    if not event.display_title and event.title:
++        event.display_title = event.title
+     event.category_id = category_id or event.category_id
+     event.category_name = category_name or event.category_name
+     event.source_started_at_utc = source_started_at_utc or event.source_started_at_utc
+diff --git a/apps/api/app/routers/events.py b/apps/api/app/routers/events.py
+index b114913..355f805 100644
+--- a/apps/api/app/routers/events.py
++++ b/apps/api/app/routers/events.py
+@@ -57,6 +57,7 @@ def event_dict(row: MediaEvent) -> dict:
+         "stream_external_id": row.stream_external_id,
+         "video_external_id": row.video_external_id,
+         "title": row.title,
++        "display_title": row.display_title,
+         "category_id": row.category_id,
+         "category_name": row.category_name,
+         "source_started_at_utc": row.source_started_at_utc,
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+index e3decf8..2fd3e16 100644
+--- a/apps/api/app/routers/site.py
++++ b/apps/api/app/routers/site.py
+@@ -6,7 +6,8 @@ import httpx
+ from collections import defaultdict
+ from datetime import UTC, datetime
+ 
+-from fastapi import APIRouter, Depends, HTTPException, Query, status
++from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
++from fastapi.responses import FileResponse
+ from pydantic import BaseModel, Field
+ from sqlalchemy import and_, delete, func, or_, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+@@ -20,6 +21,7 @@ from streamhub_common.models import (
+     EventCategory,
+     MediaEvent,
+     Session,
++    SiteEventAsset,
+     SiteEventPublication,
+     TelegramVideoPartBinding,
+     VideoPart,
+@@ -29,6 +31,14 @@ from streamhub_common.models import (
+     VideoSession,
+ )
+ 
++from ..site_assets import (
++    SITE_ASSET_SLOTS,
++    prepare_and_store_site_asset,
++    remove_site_asset_file,
++    site_asset_path,
++    validate_site_asset_slot,
++)
++
+ router = APIRouter(prefix="/api/v1/site", tags=["site"])
+ settings = get_settings()
+ 
+@@ -44,8 +54,12 @@ class SiteCategoriesRequest(BaseModel):
+     categories: list[str] = Field(min_length=1, max_length=MAX_EVENT_CATEGORIES)
+ 
+ 
++class SiteEventAdminUpdateRequest(BaseModel):
++    display_title: str = Field(min_length=1, max_length=1024)
++
++
+ def _event_title(event: MediaEvent) -> str:
+-    return event.title or event.channel_display_name or event.channel_login or event.external_key
++    return event.display_title or event.title or event.channel_display_name or event.channel_login or event.external_key
+ 
+ 
+ def _base_event_payload(event: MediaEvent) -> dict:
+@@ -57,12 +71,56 @@ def _base_event_payload(event: MediaEvent) -> dict:
+         "channel_login": event.channel_login,
+         "channel_display_name": event.channel_display_name,
+         "title": _event_title(event),
++        "display_title": _event_title(event),
++        "source_title": event.title,
+         "source_started_at_utc": event.source_started_at_utc,
+         "source_duration_ms": event.source_duration_ms,
+         "source_url": event.source_url,
+     }
+ 
+ 
++def _site_asset_payload(asset: SiteEventAsset) -> dict:
++    return {
++        "slot": asset.slot,
++        "url": f"/api/v1/site/assets/{asset.event_id}/{asset.slot}/{asset.sha256}.webp",
++        "content_type": asset.content_type,
++        "size_bytes": int(asset.size_bytes),
++        "width": int(asset.width),
++        "height": int(asset.height),
++        "sha256": asset.sha256,
++        "original_filename": asset.original_filename,
++        "updated_at": asset.updated_at,
++    }
++
++
++async def _event_assets(
++    db: AsyncSession, event_ids: list[uuid.UUID]
++) -> dict[uuid.UUID, dict[str, SiteEventAsset]]:
++    if not event_ids:
++        return {}
++    rows = (
++        await db.execute(
++            select(SiteEventAsset)
++            .where(SiteEventAsset.event_id.in_(event_ids))
++            .order_by(SiteEventAsset.event_id, SiteEventAsset.slot)
++        )
++    ).scalars().all()
++    grouped: dict[uuid.UUID, dict[str, SiteEventAsset]] = defaultdict(dict)
++    for row in rows:
++        grouped[row.event_id][row.slot] = row
++    return grouped
++
++
++def _site_assets_payload(rows: dict[str, SiteEventAsset]) -> dict:
++    cover = rows.get("cover")
++    frames = [rows.get(f"frame_{index}") for index in range(1, 5)]
++    return {
++        "cover": _site_asset_payload(cover) if cover else None,
++        "frames": [_site_asset_payload(frame) if frame else None for frame in frames],
++        "complete": all(rows.get(slot) is not None for slot in SITE_ASSET_SLOTS),
++    }
++
++
+ def _clean_category_slugs(values: list[str]) -> list[str]:
+     cleaned: list[str] = []
+     for value in values:
+@@ -240,6 +298,7 @@ async def _site_payloads(
+     categories = await _event_categories(db, event_ids)
+     videos = await _video_summaries(db, event_ids)
+     chats = await _chat_summaries(db, event_ids)
++    assets = await _event_assets(db, event_ids)
+     payloads: list[dict] = []
+     for publication, event in publication_rows:
+         sessions = videos.get(event.id, [])
+@@ -251,6 +310,7 @@ async def _site_payloads(
+                 **_base_event_payload(event),
+                 "published_at_utc": publication.published_at_utc,
+                 "categories": categories.get(event.id, []),
++                "assets": _site_assets_payload(assets.get(event.id, {})),
+                 "video_sessions": sessions,
+                 "chat_sessions": chat_sessions,
+                 "primary_chat_session_id": primary_chat["id"] if primary_chat else None,
+@@ -295,6 +355,31 @@ async def list_categories(db: AsyncSession = Depends(get_db)) -> dict:
+     }
+ 
+ 
++@router.get("/assets/{event_id}/{slot}/{sha256}.webp")
++async def site_asset(
++    event_id: uuid.UUID,
++    slot: str,
++    sha256: str,
++    db: AsyncSession = Depends(get_db),
++):
++    validate_site_asset_slot(slot)
++    asset = await db.get(SiteEventAsset, (event_id, slot))
++    if asset is None or asset.sha256 != sha256:
++        raise HTTPException(404, "site asset not found")
++    path = site_asset_path(settings, asset.storage_key)
++    if not path.is_file():
++        raise HTTPException(404, "site asset file not found")
++    return FileResponse(
++        path,
++        media_type=asset.content_type,
++        filename=None,
++        headers={
++            "Cache-Control": "public, max-age=31536000, immutable",
++            "ETag": f'"{asset.sha256}"',
++        },
++    )
++
++
+ @router.get("/feed")
+ async def site_feed(
+     category: str | None = Query(default=None, max_length=64),
+@@ -323,6 +408,7 @@ async def site_feed(
+         needle = f"%{query_clean}%"
+         stmt = stmt.where(
+             or_(
++                MediaEvent.display_title.like(needle),
+                 MediaEvent.title.like(needle),
+                 MediaEvent.channel_display_name.like(needle),
+                 MediaEvent.channel_login.like(needle),
+@@ -1004,6 +1090,45 @@ async def site_event_chat_user_events(
+     }
+ 
+ 
++@router.get("/admin/events")
++async def site_admin_events(db: AsyncSession = Depends(get_db)) -> dict:
++    storage_ids = await _storage_event_ids(db)
++    if not storage_ids:
++        return {"items": []}
++    events = (
++        await db.execute(
++            select(MediaEvent)
++            .where(MediaEvent.id.in_(storage_ids))
++            .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
++        )
++    ).scalars().all()
++    event_ids = [event.id for event in events]
++    publication_ids = set(
++        (
++            await db.execute(
++                select(SiteEventPublication.event_id).where(SiteEventPublication.event_id.in_(event_ids))
++            )
++        ).scalars().all()
++    )
++    categories = await _event_categories(db, event_ids)
++    assets = await _event_assets(db, event_ids)
++    videos = await _video_summaries(db, event_ids)
++    return {
++        "items": [
++            {
++                **_base_event_payload(event),
++                "published": event.id in publication_ids,
++                "categories": categories.get(event.id, []),
++                "assets": _site_assets_payload(assets.get(event.id, {})),
++                "video_sessions": len(videos.get(event.id, [])),
++                "ready_parts": sum(item["ready_parts"] for item in videos.get(event.id, [])),
++                "linked_parts": sum(item["linked_parts"] for item in videos.get(event.id, [])),
++            }
++            for event in events
++        ]
++    }
++
++
+ @router.get("/admin/available-events")
+ async def site_available_events(db: AsyncSession = Depends(get_db)) -> dict:
+     storage_ids = await _storage_event_ids(db)
+@@ -1020,13 +1145,16 @@ async def site_available_events(db: AsyncSession = Depends(get_db)) -> dict:
+             .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
+         )
+     ).scalars().all()
+-    videos = await _video_summaries(db, [event.id for event in events])
++    event_ids = [event.id for event in events]
++    videos = await _video_summaries(db, event_ids)
++    assets = await _event_assets(db, event_ids)
+     items = []
+     for event in events:
+         sessions = videos.get(event.id, [])
+         items.append(
+             {
+                 **_base_event_payload(event),
++                "assets": _site_assets_payload(assets.get(event.id, {})),
+                 "video_sessions": len(sessions),
+                 "ready_parts": sum(item["ready_parts"] for item in sessions),
+                 "linked_parts": sum(item["linked_parts"] for item in sessions),
+@@ -1035,6 +1163,83 @@ async def site_available_events(db: AsyncSession = Depends(get_db)) -> dict:
+     return {"items": items}
+ 
+ 
++@router.put("/admin/events/{event_id}")
++async def update_site_event(
++    event_id: uuid.UUID,
++    payload: SiteEventAdminUpdateRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    event = await db.get(MediaEvent, event_id)
++    if event is None:
++        raise HTTPException(404, "event not found")
++    display_title = payload.display_title.strip()
++    if not display_title:
++        raise HTTPException(400, "display_title must not be empty")
++    event.display_title = display_title
++    db.add(
++        AuditLog(
++            event_id=event_id,
++            action="site_display_title_update",
++            payload_json={"display_title": display_title},
++        )
++    )
++    await db.commit()
++    return _base_event_payload(event)
++
++
++@router.put("/admin/events/{event_id}/assets/{slot}")
++async def upload_site_event_asset(
++    event_id: uuid.UUID,
++    slot: str,
++    image: UploadFile = File(...),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    validate_site_asset_slot(slot)
++    event = await db.get(MediaEvent, event_id)
++    if event is None:
++        raise HTTPException(404, "event not found")
++
++    prepared = await prepare_and_store_site_asset(
++        image, event_id=event_id, slot=slot, settings=settings
++    )
++    asset = await db.get(SiteEventAsset, (event_id, slot))
++    old_storage_key = asset.storage_key if asset else None
++    if asset is None:
++        asset = SiteEventAsset(event_id=event_id, slot=slot, storage_key=prepared.storage_key)
++        db.add(asset)
++    asset.storage_key = prepared.storage_key
++    asset.content_type = prepared.content_type
++    asset.size_bytes = prepared.size_bytes
++    asset.width = prepared.width
++    asset.height = prepared.height
++    asset.sha256 = prepared.sha256
++    asset.original_filename = prepared.original_filename
++    db.add(
++        AuditLog(
++            event_id=event_id,
++            action="site_asset_upload",
++            payload_json={
++                "slot": slot,
++                "sha256": prepared.sha256,
++                "width": prepared.width,
++                "height": prepared.height,
++                "size_bytes": prepared.size_bytes,
++            },
++        )
++    )
++    try:
++        await db.commit()
++    except Exception:
++        await db.rollback()
++        if prepared.storage_key != old_storage_key:
++            remove_site_asset_file(settings, prepared.storage_key)
++        raise
++    await db.refresh(asset)
++    if old_storage_key and old_storage_key != asset.storage_key:
++        remove_site_asset_file(settings, old_storage_key)
++    return _site_asset_payload(asset)
++
++
+ @router.post("/admin/events", status_code=status.HTTP_201_CREATED)
+ async def publish_site_event(payload: SitePublishRequest, db: AsyncSession = Depends(get_db)) -> dict:
+     event = await db.get(MediaEvent, payload.event_id)
+@@ -1044,6 +1249,9 @@ async def publish_site_event(payload: SitePublishRequest, db: AsyncSession = Dep
+         raise HTTPException(409, "event is already published on the site")
+     if payload.event_id not in await _storage_event_ids(db):
+         raise HTTPException(409, "event has no Telegram-linked ready video parts")
++    assets = await _event_assets(db, [event.id])
++    if not _site_assets_payload(assets.get(event.id, {}))["complete"]:
++        raise HTTPException(409, "event requires one cover and exactly four preview frames before publishing")
+ 
+     publication = SiteEventPublication(
+         event_id=event.id,
+diff --git a/apps/api/app/site_assets.py b/apps/api/app/site_assets.py
+new file mode 100644
+index 0000000..a32dbf8
+--- /dev/null
++++ b/apps/api/app/site_assets.py
+@@ -0,0 +1,120 @@
++from __future__ import annotations
++
++import hashlib
++import os
++from dataclasses import dataclass
++from io import BytesIO
++from pathlib import Path
++from uuid import UUID, uuid4
++
++from fastapi import HTTPException, UploadFile
++from PIL import Image, ImageOps, UnidentifiedImageError
++
++from streamhub_common.settings import Settings
++
++SITE_ASSET_SLOTS = ("cover", "frame_1", "frame_2", "frame_3", "frame_4")
++ALLOWED_SOURCE_FORMATS = {"JPEG", "PNG", "WEBP"}
++
++
++@dataclass(frozen=True)
++class PreparedSiteAsset:
++    storage_key: str
++    sha256: str
++    size_bytes: int
++    width: int
++    height: int
++    content_type: str
++    original_filename: str | None
++
++
++def validate_site_asset_slot(slot: str) -> str:
++    if slot not in SITE_ASSET_SLOTS:
++        raise HTTPException(404, "unknown site asset slot")
++    return slot
++
++
++def site_asset_path(settings: Settings, storage_key: str) -> Path:
++    root = Path(settings.site_asset_root).resolve()
++    path = (root / storage_key).resolve()
++    if root != path and root not in path.parents:
++        raise HTTPException(500, "invalid site asset storage key")
++    return path
++
++
++async def prepare_and_store_site_asset(
++    upload: UploadFile,
++    *,
++    event_id: UUID,
++    slot: str,
++    settings: Settings,
++) -> PreparedSiteAsset:
++    validate_site_asset_slot(slot)
++    raw = await upload.read(settings.site_asset_max_bytes + 1)
++    if not raw:
++        raise HTTPException(400, "empty image")
++    if len(raw) > settings.site_asset_max_bytes:
++        raise HTTPException(413, f"image exceeds {settings.site_asset_max_bytes} bytes")
++
++    try:
++        source = Image.open(BytesIO(raw))
++    except (UnidentifiedImageError, OSError, ValueError) as exc:
++        raise HTTPException(400, "file is not a supported image") from exc
++
++    if (source.format or "").upper() not in ALLOWED_SOURCE_FORMATS:
++        raise HTTPException(400, "only JPEG, PNG and WebP images are supported")
++    if getattr(source, "n_frames", 1) != 1:
++        raise HTTPException(400, "animated images are not supported")
++    if (
++        source.width <= 0
++        or source.height <= 0
++        or source.width * source.height > settings.site_asset_max_pixels
++    ):
++        raise HTTPException(400, "image dimensions are outside the allowed range")
++    try:
++        source.load()
++    except (OSError, ValueError) as exc:
++        raise HTTPException(400, "image data is corrupted") from exc
++
++    image = ImageOps.exif_transpose(source)
++    if image.mode not in {"RGB", "RGBA"}:
++        image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
++
++    encoded = BytesIO()
++    image.save(encoded, format="WEBP", quality=settings.site_asset_webp_quality, method=6)
++    data = encoded.getvalue()
++    if len(data) > settings.site_asset_max_bytes:
++        raise HTTPException(413, "normalized image is too large")
++    digest = hashlib.sha256(data).hexdigest()
++    storage_key = f"events/{event_id}/{slot}-{digest[:20]}.webp"
++    destination = site_asset_path(settings, storage_key)
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
++    try:
++        with temporary.open("wb") as handle:
++            handle.write(data)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, destination)
++    finally:
++        temporary.unlink(missing_ok=True)
++
++    return PreparedSiteAsset(
++        storage_key=storage_key,
++        sha256=digest,
++        size_bytes=len(data),
++        width=image.width,
++        height=image.height,
++        content_type="image/webp",
++        original_filename=Path((upload.filename or "").strip()).name[:255] or None,
++    )
++
++
++def remove_site_asset_file(settings: Settings, storage_key: str | None) -> None:
++    if not storage_key:
++        return
++    try:
++        site_asset_path(settings, storage_key).unlink(missing_ok=True)
++    except OSError:
++        # Database state is authoritative. An orphan is safer than failing a
++        # successful metadata replacement because cleanup could not run.
++        pass
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 76f297a..23bb9f7 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -359,6 +359,24 @@ type SitePlaybackTimeline = {
+   ranges: SitePlaybackTimelineRange[];
+ };
+ 
++type SiteAsset = {
++  slot: string;
++  url: string;
++  content_type: string;
++  size_bytes: number;
++  width: number;
++  height: number;
++  sha256: string;
++  original_filename?: string | null;
++  updated_at: string;
++};
++
++type SiteAssets = {
++  cover?: SiteAsset | null;
++  frames: Array<SiteAsset | null>;
++  complete: boolean;
++};
++
+ type SiteEvent = {
+   id: string;
+   platform: string;
+@@ -367,11 +385,14 @@ type SiteEvent = {
+   channel_login?: string | null;
+   channel_display_name?: string | null;
+   title: string;
++  display_title: string;
++  source_title?: string | null;
+   source_started_at_utc?: string | null;
+   source_duration_ms?: number | null;
+   source_url?: string | null;
+   published_at_utc: string;
+   categories: Array<SiteCategory & { position?: number }>;
++  assets: SiteAssets;
+   video_sessions: SiteVideoSession[];
+   chat_sessions: SiteChatSession[];
+   primary_chat_session_id?: string | null;
+@@ -391,13 +412,21 @@ type SiteAvailableEvent = {
+   channel_login?: string | null;
+   channel_display_name?: string | null;
+   title: string;
++  display_title: string;
++  source_title?: string | null;
+   source_started_at_utc?: string | null;
+   source_duration_ms?: number | null;
++  assets: SiteAssets;
+   video_sessions: number;
+   ready_parts: number;
+   linked_parts: number;
+ };
+ 
++type SiteAdminEvent = SiteAvailableEvent & {
++  published: boolean;
++  categories: Array<SiteCategory & { position?: number }>;
++};
++
+ type MediaEvent = {
+   id: string;
+   platform: string;
+@@ -1663,14 +1692,14 @@ function StreamVaultHeader({
+   onSubmit,
+   onBrand,
+   onAdmin,
+-  onPublish,
++  onSiteAdmin,
+ }: {
+   query: string;
+   onQueryChange: (value: string) => void;
+   onSubmit: () => void;
+   onBrand: () => void;
+   onAdmin: () => void;
+-  onPublish?: () => void;
++  onSiteAdmin: () => void;
+ }) {
+   return (
+     <header className="streamvault-header">
+@@ -1690,20 +1719,114 @@ function StreamVaultHeader({
+           />
+         </label>
+         <div className="streamvault-header-actions">
+-          {onPublish ? <button type="button" className="streamvault-header-button primary" onClick={onPublish}>+ Добавить событие</button> : null}
+           <button type="button" className="streamvault-header-button" onClick={onAdmin}>StreamHub</button>
++          <button type="button" className="streamvault-header-button admin" onClick={onSiteAdmin}>Админка</button>
+         </div>
+       </div>
+     </header>
+   );
+ }
+ 
+-function SiteArtwork({ event, wide = false, label }: { event: SiteEvent; wide?: boolean; label?: string }) {
++function SiteArtwork({ event, wide = false, label, src }: { event: SiteEvent; wide?: boolean; label?: string; src?: string | null }) {
+   const primaryCategory = event.categories[0]?.label || event.media_type.toUpperCase();
+   return (
+-    <div className={`streamvault-artwork${wide ? " wide" : ""}`} aria-hidden="true">
+-      <span>{label || primaryCategory}</span>
+-      <div><strong>{event.channel_display_name || event.channel_login || "TWITCH"}</strong><small>{event.media_type.toUpperCase()}</small></div>
++    <div className={`streamvault-artwork${wide ? " wide" : ""}${src ? " has-image" : ""}`} aria-hidden="true">
++      {src ? <img src={apiUrl(src)} alt="" loading="lazy" /> : (
++        <>
++          <span>{label || primaryCategory}</span>
++          <div><strong>{event.channel_display_name || event.channel_login || "TWITCH"}</strong><small>{event.media_type.toUpperCase()}</small></div>
++        </>
++      )}
++    </div>
++  );
++}
++
++function SiteAdminPanel({
++  events,
++  drafts,
++  loading,
++  actionKey,
++  onDraftChange,
++  onSaveTitle,
++  onUpload,
++  onAddEvent,
++  onClose,
++}: {
++  events: SiteAdminEvent[];
++  drafts: Record<string, string>;
++  loading: boolean;
++  actionKey: string | null;
++  onDraftChange: (eventId: string, value: string) => void;
++  onSaveTitle: (eventId: string) => void;
++  onUpload: (eventId: string, slot: string, file: File) => void;
++  onAddEvent: () => void;
++  onClose: () => void;
++}) {
++  const assetSlots = [
++    ["cover", "Cover"],
++    ["frame_1", "Кадр 1"],
++    ["frame_2", "Кадр 2"],
++    ["frame_3", "Кадр 3"],
++    ["frame_4", "Кадр 4"],
++  ] as const;
++  const assetFor = (event: SiteAdminEvent, slot: string) => slot === "cover"
++    ? event.assets.cover
++    : event.assets.frames[Math.max(0, Number(slot.split("_")[1]) - 1)];
++
++  return (
++    <div className="site-modal-backdrop site-admin-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
++      <div className="site-modal site-admin-modal" role="dialog" aria-modal="true" aria-labelledby="siteAdminTitle">
++        <div className="site-admin-head">
++          <div><div className="section-label">STREAMVAULT ADMIN</div><h2 id="siteAdminTitle">События</h2></div>
++          <div className="site-admin-head-actions">
++            <button type="button" className="primary" onClick={onAddEvent}>+ Добавить событие</button>
++            <button type="button" onClick={onClose}>Закрыть</button>
++          </div>
++        </div>
++        <p className="site-admin-storage-note">Cover и четыре preview-кадра хранятся отдельно от БД в persistent storage. В БД остаются только метаданные и ссылки.</p>
++        {loading ? <div className="site-empty compact"><span className="site-inline-spinner" /> Загружаю события…</div> : events.length === 0 ? (
++          <div className="site-empty compact">Нет событий с готовым Telegram-backed видео.</div>
++        ) : (
++          <div className="site-admin-event-list">
++            {events.map((event) => (
++              <section className="site-admin-event" key={event.id}>
++                <div className="site-admin-event-top">
++                  <div>
++                    <span className={`site-admin-publish-state ${event.published ? "is-published" : ""}`}>{event.published ? "Опубликовано" : "Не опубликовано"}</span>
++                    <h3>{event.display_title}</h3>
++                    <p>Исходное название: <strong>{event.source_title || "—"}</strong></p>
++                    <small>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleString("ru-RU") : "Дата неизвестна"} · TG {event.linked_parts}/{event.ready_parts}</small>
++                  </div>
++                  <span className={`site-admin-assets-state ${event.assets.complete ? "is-complete" : ""}`}>{event.assets.complete ? "5/5 изображений" : `${Number(Boolean(event.assets.cover)) + event.assets.frames.filter(Boolean).length}/5 изображений`}</span>
++                </div>
++                <div className="site-admin-title-editor">
++                  <label>
++                    <span>Отображаемое название</span>
++                    <input value={drafts[event.id] ?? event.display_title} maxLength={1024} onChange={(e) => onDraftChange(event.id, e.target.value)} />
++                  </label>
++                  <button type="button" disabled={actionKey === `title:${event.id}` || !(drafts[event.id] ?? event.display_title).trim() || (drafts[event.id] ?? event.display_title).trim() === event.display_title} onClick={() => onSaveTitle(event.id)}>
++                    {actionKey === `title:${event.id}` ? "Сохраняю…" : "Сохранить"}
++                  </button>
++                </div>
++                <div className="site-admin-assets">
++                  {assetSlots.map(([slot, label]) => {
++                    const asset = assetFor(event, slot);
++                    const busy = actionKey === `asset:${event.id}:${slot}`;
++                    return (
++                      <label className={`site-admin-asset ${asset ? "has-asset" : ""}`} key={slot}>
++                        <span>{label}</span>
++                        <div>{asset ? <img src={apiUrl(asset.url)} alt="" /> : <b>+</b>}</div>
++                        <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height}` : "Выбрать изображение"}</small>
++                        <input type="file" accept="image/jpeg,image/png,image/webp" disabled={Boolean(actionKey)} onChange={(e) => { const file = e.target.files?.[0]; if (file) onUpload(event.id, slot, file); e.currentTarget.value = ""; }} />
++                      </label>
++                    );
++                  })}
++                </div>
++              </section>
++            ))}
++          </div>
++        )}
++      </div>
+     </div>
+   );
+ }
+@@ -1756,6 +1879,11 @@ function App() {
+   const [selectedSiteEvent, setSelectedSiteEvent] = useState<SiteEvent | null>(null);
+   const siteVideoRef = useRef<HTMLVideoElement | null>(null);
+   const [sitePublisherOpen, setSitePublisherOpen] = useState(false);
++  const [siteAdminOpen, setSiteAdminOpen] = useState(false);
++  const [siteAdminEvents, setSiteAdminEvents] = useState<SiteAdminEvent[]>([]);
++  const [siteAdminDrafts, setSiteAdminDrafts] = useState<Record<string, string>>({});
++  const [siteAdminLoading, setSiteAdminLoading] = useState(false);
++  const [siteAdminActionKey, setSiteAdminActionKey] = useState<string | null>(null);
+   const [siteAvailableEvents, setSiteAvailableEvents] = useState<SiteAvailableEvent[]>([]);
+   const [sitePublishEventId, setSitePublishEventId] = useState("");
+   const [sitePublishCategories, setSitePublishCategories] = useState<string[]>([]);
+@@ -1988,6 +2116,73 @@ function App() {
+     }, 0);
+   }
+ 
++  async function loadSiteAdminEvents() {
++    const res = await fetch(`${API}/api/v1/site/admin/events`, { cache: "no-store" });
++    if (!res.ok) throw new Error(await res.text());
++    const data = await res.json() as { items?: SiteAdminEvent[] };
++    const items = data.items || [];
++    setSiteAdminEvents(items);
++    setSiteAdminDrafts((current) => Object.fromEntries(items.map((event) => [event.id, current[event.id] ?? event.display_title])));
++    return items;
++  }
++
++  async function openSiteAdmin() {
++    setSiteAdminOpen(true);
++    setSiteAdminLoading(true);
++    try {
++      await loadSiteAdminEvents();
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setSiteAdminLoading(false);
++    }
++  }
++
++  async function saveSiteDisplayTitle(eventId: string) {
++    const value = (siteAdminDrafts[eventId] || "").trim();
++    if (!value) return;
++    setSiteAdminActionKey(`title:${eventId}`);
++    try {
++      const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}`, {
++        method: "PUT",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ display_title: value }),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      setSiteAdminEvents((current) => current.map((event) => event.id === eventId ? { ...event, title: value, display_title: value } : event));
++      setSiteEvents((current) => current.map((event) => event.id === eventId ? { ...event, title: value, display_title: value } : event));
++      setSelectedSiteEvent((current) => current?.id === eventId ? { ...current, title: value, display_title: value } : current);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setSiteAdminActionKey(null);
++    }
++  }
++
++  async function uploadSiteAsset(eventId: string, slot: string, file: File) {
++    const actionKey = `asset:${eventId}:${slot}`;
++    setSiteAdminActionKey(actionKey);
++    try {
++      const form = new FormData();
++      form.append("image", file);
++      const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}/assets/${slot}`, { method: "PUT", body: form });
++      if (!res.ok) throw new Error(await res.text());
++      await loadSiteAdminEvents();
++      await loadSiteFeed(siteCategory, siteQuery);
++      if (selectedSiteEvent?.id === eventId) {
++        const detail = await fetch(`${API}/api/v1/site/events/${eventId}`, { cache: "no-store" });
++        if (detail.ok) setSelectedSiteEvent(await detail.json() as SiteEvent);
++      }
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setSiteAdminActionKey(null);
++    }
++  }
++
+   async function openSitePublisher() {
+     setSiteAction(true);
+     try {
+@@ -2022,7 +2217,8 @@ function App() {
+   }
+ 
+   async function publishSiteEvent() {
+-    if (!sitePublishEventId || sitePublishCategories.length === 0) return;
++    const selectedPublishEvent = siteAvailableEvents.find((event) => event.id === sitePublishEventId);
++    if (!sitePublishEventId || sitePublishCategories.length === 0 || !selectedPublishEvent?.assets.complete) return;
+     setSiteAction(true);
+     try {
+       const res = await fetch(`${API}/api/v1/site/admin/events`, {
+@@ -2033,6 +2229,7 @@ function App() {
+       if (!res.ok) throw new Error(await res.text());
+       setSitePublisherOpen(false);
+       await loadSiteFeed(siteCategory, siteQuery);
++      if (siteAdminOpen) await loadSiteAdminEvents();
+       setError(null);
+     } catch (e) {
+       setError(String(e));
+@@ -2613,6 +2810,7 @@ function App() {
+           onSubmit={() => { setSelectedSiteEvent(null); void loadSiteFeed(siteCategory, siteQuery); }}
+           onBrand={() => setSelectedSiteEvent(null)}
+           onAdmin={() => { setSelectedSiteEvent(null); setView("events"); }}
++          onSiteAdmin={() => void openSiteAdmin()}
+         />
+         <main className="streamvault-watch-shell">
+           <button className="streamvault-back" type="button" onClick={() => setSelectedSiteEvent(null)}>← К записям</button>
+@@ -2686,6 +2884,19 @@ function App() {
+             />
+           </div>
+         </main>
++        {siteAdminOpen ? (
++          <SiteAdminPanel
++            events={siteAdminEvents}
++            drafts={siteAdminDrafts}
++            loading={siteAdminLoading}
++            actionKey={siteAdminActionKey}
++            onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
++            onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
++            onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
++            onAddEvent={() => { setSiteAdminOpen(false); setSelectedSiteEvent(null); void openSitePublisher(); }}
++            onClose={() => setSiteAdminOpen(false)}
++          />
++        ) : null}
+       </div>
+     );
+   }
+@@ -2700,7 +2911,7 @@ function App() {
+           onSubmit={() => void loadSiteFeed(siteCategory, siteQuery)}
+           onBrand={() => { setSiteCategory("all"); setSiteQuery(""); void loadSiteFeed("all", ""); }}
+           onAdmin={() => setView("events")}
+-          onPublish={() => void openSitePublisher()}
++          onSiteAdmin={() => void openSiteAdmin()}
+         />
+ 
+         <nav className="streamvault-mobile-categories" aria-label="Категории">
+@@ -2727,16 +2938,16 @@ function App() {
+                 <h1>Последний стрим</h1>
+                 <div className="streamvault-latest-layout">
+                   <button type="button" className="streamvault-latest-cover" onClick={() => openSiteEvent(latest)} aria-label={`Открыть ${latest.title}`}>
+-                    <SiteArtwork event={latest} label="COVER" />
++                    <SiteArtwork event={latest} label="COVER" src={latest.assets?.cover?.url} />
+                   </button>
+                   <div className="streamvault-preview-stage">
+                     <button type="button" className="streamvault-preview-main" onClick={() => openSiteEvent(latest)}>
+-                      <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} />
++                      <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} src={latest.assets?.frames?.[siteHeroFrame]?.url} />
+                     </button>
+                     <div className="streamvault-preview-rail" aria-label="Четыре preview-кадра">
+                       {[0, 1, 2, 3].map((frame) => (
+                         <button key={frame} type="button" className={siteHeroFrame === frame ? "active" : ""} onClick={() => setSiteHeroFrame(frame)}>
+-                          <SiteArtwork event={latest} wide label={`#${frame + 1}`} />
++                          <SiteArtwork event={latest} wide label={`#${frame + 1}`} src={latest.assets?.frames?.[frame]?.url} />
+                         </button>
+                       ))}
+                     </div>
+@@ -2766,7 +2977,7 @@ function App() {
+                 <div className="streamvault-recording-grid">
+                   {siteEvents.map((event) => (
+                     <button type="button" className="streamvault-recording-card" key={event.id} onClick={() => openSiteEvent(event)}>
+-                      <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" /></div>
++                      <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" src={event.assets?.cover?.url} /></div>
+                       <div className="streamvault-recording-body">
+                         <h3>{event.title}</h3>
+                         <p>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleDateString("ru-RU") : "Дата неизвестна"} · {(event.chat_message_count || 0).toLocaleString("ru-RU")} сообщений</p>
+@@ -2780,6 +2991,20 @@ function App() {
+           </main>
+         </div>
+ 
++        {siteAdminOpen ? (
++          <SiteAdminPanel
++            events={siteAdminEvents}
++            drafts={siteAdminDrafts}
++            loading={siteAdminLoading}
++            actionKey={siteAdminActionKey}
++            onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
++            onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
++            onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
++            onAddEvent={() => { setSiteAdminOpen(false); void openSitePublisher(); }}
++            onClose={() => setSiteAdminOpen(false)}
++          />
++        ) : null}
++
+         {sitePublisherOpen && (
+           <div className="site-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSitePublisherOpen(false); }}>
+             <div className="site-modal" role="dialog" aria-modal="true" aria-labelledby="sitePublisherTitle">
+@@ -2794,7 +3019,7 @@ function App() {
+                   <label className="storage-field site-modal-field">
+                     <span>Событие из хранилища</span>
+                     <select value={sitePublishEventId} onChange={(event) => setSitePublishEventId(event.target.value)}>
+-                      {siteAvailableEvents.map((event) => <option key={event.id} value={event.id}>{event.title} · {event.channel_display_name || event.channel_login || event.media_type} · TG {event.linked_parts}/{event.ready_parts}</option>)}
++                      {siteAvailableEvents.map((event) => <option key={event.id} value={event.id}>{event.title} · {event.channel_display_name || event.channel_login || event.media_type} · TG {event.linked_parts}/{event.ready_parts} · {event.assets.complete ? "арт 5/5" : "нужны Cover + 4 кадра"}</option>)}
+                     </select>
+                   </label>
+                   <div className="site-publish-categories"><span>Категории · до 3</span><div>
+@@ -2805,7 +3030,8 @@ function App() {
+                       </label>
+                     ))}
+                   </div></div>
+-                  <div className="actions site-modal-actions"><button disabled={siteAction || !sitePublishEventId || sitePublishCategories.length === 0} onClick={publishSiteEvent}>{siteAction ? "Добавляю…" : "Добавить на сайт"}</button></div>
++                  {!siteAvailableEvents.find((event) => event.id === sitePublishEventId)?.assets.complete ? <div className="site-admin-publish-warning">Перед публикацией загрузите Cover и все 4 preview-кадра в админке.</div> : null}
++                  <div className="actions site-modal-actions"><button disabled={siteAction || !sitePublishEventId || sitePublishCategories.length === 0 || !siteAvailableEvents.find((event) => event.id === sitePublishEventId)?.assets.complete} onClick={publishSiteEvent}>{siteAction ? "Добавляю…" : "Добавить на сайт"}</button></div>
+                 </>
+               )}
+             </div>
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 830dbc0..aad0911 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -681,3 +681,53 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .video-manager-session.is-clickable { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+ .video-manager-session.is-clickable:hover { border-color: #a1a1aa; box-shadow: 0 5px 18px rgba(0,0,0,.08); transform: translateY(-1px); }
+ .video-manager-session.is-clickable:focus-visible { outline: 2px solid #f59e0b; outline-offset: 2px; }
++
++/* StreamVault admin: editable public metadata + persistent manual artwork. */
++.streamvault-header-button.admin { border-color: rgba(255,120,24,.72); color: var(--sv-orange-2); background: rgba(255,120,24,.08); }
++.streamvault-header-button.admin:hover { border-color: var(--sv-orange); background: rgba(255,120,24,.16); color: #fff; }
++.streamvault-artwork.has-image { padding: 0; background: #090c0f; }
++.streamvault-artwork.has-image::after { display: none; }
++.streamvault-artwork > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
++.site-admin-backdrop { z-index: 70; }
++.site-admin-modal { width: min(1180px, 100%); max-height: 92vh; padding: 22px; }
++.site-admin-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
++.site-admin-head-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
++.site-admin-head-actions .primary { border-color: var(--sv-orange); background: var(--sv-orange); color: #17100b; font-weight: 800; }
++.site-admin-storage-note { margin: 10px 0 18px; color: #78848f; font-size: 11px; line-height: 1.5; }
++.site-admin-event-list { display: grid; gap: 14px; }
++.site-admin-event { padding: 16px; border: 1px solid #2a3540; border-radius: 14px; background: #0d1318; }
++.site-admin-event-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
++.site-admin-event-top h3 { margin: 8px 0 5px; color: #f0f3f5; font-size: 16px; line-height: 1.3; }
++.site-admin-event-top p { margin: 0; color: #7f8a94; font-size: 11px; }
++.site-admin-event-top p strong { color: #aeb7bf; font-weight: 650; }
++.site-admin-event-top small { display: block; margin-top: 6px; color: #606c77; font-size: 10px; }
++.site-admin-publish-state, .site-admin-assets-state { display: inline-flex; align-items: center; min-height: 23px; width: max-content; padding: 0 8px; border: 1px solid #34414e; border-radius: 999px; color: #89949e; font-size: 9px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
++.site-admin-publish-state.is-published, .site-admin-assets-state.is-complete { border-color: rgba(69,178,116,.48); background: rgba(69,178,116,.08); color: #75c99a; }
++.site-admin-title-editor { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: end; margin-top: 14px; }
++.site-admin-title-editor label { display: grid; gap: 6px; }
++.site-admin-title-editor label > span { color: #929ca5; font-size: 10px; font-weight: 750; }
++.site-admin-title-editor input { width: 100%; min-width: 0; border: 1px solid #34414e; border-radius: 9px; background: #111920; color: #eef2f5; padding: 10px 11px; outline: none; }
++.site-admin-title-editor input:focus { border-color: var(--sv-orange); box-shadow: 0 0 0 2px rgba(255,120,24,.1); }
++.site-admin-title-editor button { height: 38px; border-color: #3a4651; background: #151d24; color: #dce2e7; }
++.site-admin-assets { display: grid; grid-template-columns: 1.1fr repeat(4, minmax(0,1fr)); gap: 9px; margin-top: 14px; }
++.site-admin-asset { min-width: 0; display: grid; gap: 6px; cursor: pointer; }
++.site-admin-asset > span { color: #8c97a1; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
++.site-admin-asset > div { position: relative; aspect-ratio: 16 / 9; overflow: hidden; display: grid; place-items: center; border: 1px dashed #394652; border-radius: 9px; background: #11181f; transition: border-color .15s ease, transform .15s ease; }
++.site-admin-asset:first-child > div { aspect-ratio: .86 / 1; }
++.site-admin-asset:hover > div { border-color: var(--sv-orange); transform: translateY(-1px); }
++.site-admin-asset.has-asset > div { border-style: solid; }
++.site-admin-asset img { width: 100%; height: 100%; object-fit: cover; display: block; }
++.site-admin-asset b { color: #56626d; font-size: 24px; font-weight: 400; }
++.site-admin-asset small { overflow: hidden; color: #68747e; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
++.site-admin-asset input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
++.site-admin-publish-warning { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,120,24,.28); border-radius: 9px; background: rgba(255,120,24,.06); color: #d89a6a; font-size: 11px; }
++@media (max-width: 900px) {
++  .site-admin-modal { padding: 16px; }
++  .site-admin-assets { grid-template-columns: repeat(3, minmax(0,1fr)); }
++}
++@media (max-width: 660px) {
++  .site-admin-head, .site-admin-event-top { display: grid; }
++  .site-admin-head-actions { justify-content: flex-start; }
++  .site-admin-title-editor { grid-template-columns: 1fr; }
++  .site-admin-assets { grid-template-columns: repeat(2, minmax(0,1fr)); }
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 8366aaa..b74196b 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -135,6 +135,7 @@ services:
+       - "${API_PUBLIC_PORT:-18741}:8000"
+     volumes:
+       - ./telegram_state:/telegram_state
++      - streamhub_site_assets:/site_assets
+     depends_on:
+       migrate:
+         condition: service_completed_successfully
+@@ -157,3 +158,4 @@ services:
+ volumes:
+   streamhub_mysql:
+   streamhub_video_spool:
++  streamhub_site_assets:
+diff --git a/migrations/versions/0011_site_admin_assets.py b/migrations/versions/0011_site_admin_assets.py
+new file mode 100644
+index 0000000..a7e4645
+--- /dev/null
++++ b/migrations/versions/0011_site_admin_assets.py
+@@ -0,0 +1,72 @@
++"""site admin display titles and persistent artwork assets
++
++Revision ID: 0011_site_admin_assets
++Revises: 0010_site_catalog
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0011_site_admin_assets"
++down_revision = "0010_site_catalog"
++branch_labels = None
++depends_on = None
++
++
++def _table_exists(name: str) -> bool:
++    return name in sa.inspect(op.get_bind()).get_table_names()
++
++
++def _column_exists(table_name: str, column_name: str) -> bool:
++    inspector = sa.inspect(op.get_bind())
++    return any(column["name"] == column_name for column in inspector.get_columns(table_name))
++
++
++def upgrade() -> None:
++    if not _column_exists("media_events", "display_title"):
++        op.add_column("media_events", sa.Column("display_title", sa.String(length=1024), nullable=True))
++
++    # Existing events keep their original Twitch/source title and start with the
++    # same text as the editable public title.
++    op.get_bind().execute(
++        sa.text("UPDATE media_events SET display_title = title WHERE display_title IS NULL")
++    )
++
++    if not _table_exists("site_event_assets"):
++        op.create_table(
++            "site_event_assets",
++            sa.Column("event_id", sa.BINARY(16), nullable=False),
++            sa.Column("slot", sa.String(length=32), nullable=False),
++            sa.Column("storage_key", sa.String(length=512), nullable=False),
++            sa.Column("content_type", sa.String(length=64), nullable=False, server_default="image/webp"),
++            sa.Column("size_bytes", mysql.BIGINT(unsigned=True), nullable=False),
++            sa.Column("width", mysql.INTEGER(unsigned=True), nullable=False),
++            sa.Column("height", mysql.INTEGER(unsigned=True), nullable=False),
++            sa.Column("sha256", sa.String(length=64), nullable=False),
++            sa.Column("original_filename", sa.String(length=255), nullable=True),
++            sa.Column(
++                "created_at",
++                mysql.DATETIME(fsp=6),
++                nullable=False,
++                server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++            ),
++            sa.Column(
++                "updated_at",
++                mysql.DATETIME(fsp=6),
++                nullable=False,
++                server_default=sa.text("CURRENT_TIMESTAMP(6)"),
++            ),
++            sa.ForeignKeyConstraint(["event_id"], ["media_events.id"], ondelete="CASCADE"),
++            sa.PrimaryKeyConstraint("event_id", "slot"),
++            sa.UniqueConstraint("storage_key", name="uq_site_event_assets_storage_key"),
++        )
++        op.create_index("ix_site_event_assets_sha256", "site_event_assets", ["sha256"])
++
++
++def downgrade() -> None:
++    if _table_exists("site_event_assets"):
++        op.drop_table("site_event_assets")
++    if _column_exists("media_events", "display_title"):
++        op.drop_column("media_events", "display_title")
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index 75241f1..5b73c81 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -35,6 +35,7 @@ class MediaEvent(Base):
+     stream_external_id: Mapped[str | None] = mapped_column(String(64), index=True)
+     video_external_id: Mapped[str | None] = mapped_column(String(64), index=True)
+     title: Mapped[str | None] = mapped_column(String(1024))
++    display_title: Mapped[str | None] = mapped_column(String(1024))
+     category_id: Mapped[str | None] = mapped_column(String(64))
+     category_name: Mapped[str | None] = mapped_column(String(255))
+     source_started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+@@ -73,6 +74,26 @@ class SiteEventPublication(Base):
+     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+ 
+ 
++class SiteEventAsset(Base):
++    __tablename__ = "site_event_assets"
++
++    event_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), primary_key=True
++    )
++    slot: Mapped[str] = mapped_column(String(32), primary_key=True)
++    storage_key: Mapped[str] = mapped_column(String(512), unique=True)
++    content_type: Mapped[str] = mapped_column(String(64), default="image/webp")
++    size_bytes: Mapped[int] = mapped_column(BigInteger)
++    width: Mapped[int] = mapped_column(Integer)
++    height: Mapped[int] = mapped_column(Integer)
++    sha256: Mapped[str] = mapped_column(String(64), index=True)
++    original_filename: Mapped[str | None] = mapped_column(String(255))
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(
++        DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow
++    )
++
++
+ class EventCategory(Base):
+     __tablename__ = "event_categories"
+     __table_args__ = (
+diff --git a/packages/python_common/streamhub_common/settings.py b/packages/python_common/streamhub_common/settings.py
+index 98151ea..2db1a00 100644
+--- a/packages/python_common/streamhub_common/settings.py
++++ b/packages/python_common/streamhub_common/settings.py
+@@ -59,6 +59,11 @@ class Settings(BaseSettings):
+     part_build_allow_during_capture: bool = Field(default=False, alias="PART_BUILD_ALLOW_DURING_CAPTURE")
+     part_build_lease_seconds: int = Field(default=30, ge=10, alias="PART_BUILD_LEASE_SECONDS")
+ 
++    site_asset_root: str = Field(default="/site_assets", alias="SITE_ASSET_ROOT")
++    site_asset_max_bytes: int = Field(default=15728640, ge=1048576, alias="SITE_ASSET_MAX_BYTES")
++    site_asset_max_pixels: int = Field(default=40000000, ge=1000000, alias="SITE_ASSET_MAX_PIXELS")
++    site_asset_webp_quality: int = Field(default=90, ge=60, le=100, alias="SITE_ASSET_WEBP_QUALITY")
++
+     telegram_api_id: str | None = Field(default=None, alias="TELEGRAM_API_ID")
+     telegram_api_hash: str | None = Field(default=None, alias="TELEGRAM_API_HASH")
+     telegram_channel_id: str | None = Field(default=None, alias="TELEGRAM_CHANNEL_ID")
+diff --git a/requirements.txt b/requirements.txt
+index c887b93..0270c04 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -11,4 +11,5 @@ cryptography>=44,<47
+ PyJWT>=2.10,<3
+ websockets>=14,<16
+ python-multipart>=0.0.20,<1
++Pillow>=11,<13
+ Telethon>=1.45,<2
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+index 1d8c864..ff1322e 100644
+--- a/tests/test_site_catalog.py
++++ b/tests/test_site_catalog.py
+@@ -224,3 +224,54 @@ def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
+     assert '.site-chat-history-event' in css
+     assert '.site-twitch-icon' in css
+     assert 'left: 50%; bottom: 43px; transform: translateX(-50%)' in css
++
++
++def test_site_admin_assets_migration_keeps_source_title_and_persistent_asset_metadata():
++    migration = _read("migrations/versions/0011_site_admin_assets.py")
++    models = _read("packages/python_common/streamhub_common/models.py")
++    settings = _read("packages/python_common/streamhub_common/settings.py")
++    compose = _read("docker-compose.yml")
++    requirements = _read("requirements.txt")
++
++    assert 'down_revision = "0010_site_catalog"' in migration
++    assert '"display_title"' in migration
++    assert 'UPDATE media_events SET display_title = title' in migration
++    assert '"site_event_assets"' in migration
++    assert 'class SiteEventAsset(Base):' in models
++    assert 'display_title: Mapped[str | None]' in models
++    assert 'SITE_ASSET_ROOT' in settings
++    assert 'streamhub_site_assets:/site_assets' in compose
++    assert 'streamhub_site_assets:' in compose
++    assert 'Pillow>=' in requirements
++
++
++def test_site_admin_api_and_ui_manage_display_title_cover_and_four_manual_frames():
++    route = _read("apps/api/app/routers/site.py")
++    assets = _read("apps/api/app/site_assets.py")
++    domain = _read("apps/api/app/event_domain.py")
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert 'display_title=title' in domain
++    assert 'return event.display_title or event.title' in route
++    assert '"source_title": event.title' in route
++    assert '@router.get("/admin/events")' in route
++    assert '@router.put("/admin/events/{event_id}")' in route
++    assert '@router.put("/admin/events/{event_id}/assets/{slot}")' in route
++    assert '@router.get("/assets/{event_id}/{slot}/{sha256}.webp")' in route
++    assert 'event requires one cover and exactly four preview frames before publishing' in route
++    assert 'SITE_ASSET_SLOTS = ("cover", "frame_1", "frame_2", "frame_3", "frame_4")' in assets
++    assert 'os.replace(temporary, destination)' in assets
++    assert 'format="WEBP"' in assets
++
++    assert '>StreamHub</button>' in web
++    assert '>Админка</button>' in web
++    assert 'function SiteAdminPanel(' in web
++    assert 'Исходное название:' in web
++    assert 'Отображаемое название' in web
++    assert '["frame_4", "Кадр 4"]' in web
++    assert 'src={latest.assets?.cover?.url}' in web
++    assert 'src={latest.assets?.frames?.[siteHeroFrame]?.url}' in web
++    assert 'onPublish={() => void openSitePublisher()}' not in web
++    assert '.site-admin-modal' in css
++    assert '.streamvault-artwork.has-image' in css

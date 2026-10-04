@@ -6,7 +6,8 @@ import httpx
 from collections import defaultdict
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +21,7 @@ from streamhub_common.models import (
     EventCategory,
     MediaEvent,
     Session,
+    SiteEventAsset,
     SiteEventPublication,
     TelegramVideoPartBinding,
     VideoPart,
@@ -27,6 +29,14 @@ from streamhub_common.models import (
     VideoRun,
     VideoSegment,
     VideoSession,
+)
+
+from ..site_assets import (
+    SITE_ASSET_SLOTS,
+    prepare_and_store_site_asset,
+    remove_site_asset_file,
+    site_asset_path,
+    validate_site_asset_slot,
 )
 
 router = APIRouter(prefix="/api/v1/site", tags=["site"])
@@ -44,8 +54,12 @@ class SiteCategoriesRequest(BaseModel):
     categories: list[str] = Field(min_length=1, max_length=MAX_EVENT_CATEGORIES)
 
 
+class SiteEventAdminUpdateRequest(BaseModel):
+    display_title: str = Field(min_length=1, max_length=1024)
+
+
 def _event_title(event: MediaEvent) -> str:
-    return event.title or event.channel_display_name or event.channel_login or event.external_key
+    return event.display_title or event.title or event.channel_display_name or event.channel_login or event.external_key
 
 
 def _base_event_payload(event: MediaEvent) -> dict:
@@ -57,9 +71,53 @@ def _base_event_payload(event: MediaEvent) -> dict:
         "channel_login": event.channel_login,
         "channel_display_name": event.channel_display_name,
         "title": _event_title(event),
+        "display_title": _event_title(event),
+        "source_title": event.title,
         "source_started_at_utc": event.source_started_at_utc,
         "source_duration_ms": event.source_duration_ms,
         "source_url": event.source_url,
+    }
+
+
+def _site_asset_payload(asset: SiteEventAsset) -> dict:
+    return {
+        "slot": asset.slot,
+        "url": f"/api/v1/site/assets/{asset.event_id}/{asset.slot}/{asset.sha256}.webp",
+        "content_type": asset.content_type,
+        "size_bytes": int(asset.size_bytes),
+        "width": int(asset.width),
+        "height": int(asset.height),
+        "sha256": asset.sha256,
+        "original_filename": asset.original_filename,
+        "updated_at": asset.updated_at,
+    }
+
+
+async def _event_assets(
+    db: AsyncSession, event_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, dict[str, SiteEventAsset]]:
+    if not event_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(SiteEventAsset)
+            .where(SiteEventAsset.event_id.in_(event_ids))
+            .order_by(SiteEventAsset.event_id, SiteEventAsset.slot)
+        )
+    ).scalars().all()
+    grouped: dict[uuid.UUID, dict[str, SiteEventAsset]] = defaultdict(dict)
+    for row in rows:
+        grouped[row.event_id][row.slot] = row
+    return grouped
+
+
+def _site_assets_payload(rows: dict[str, SiteEventAsset]) -> dict:
+    cover = rows.get("cover")
+    frames = [rows.get(f"frame_{index}") for index in range(1, 5)]
+    return {
+        "cover": _site_asset_payload(cover) if cover else None,
+        "frames": [_site_asset_payload(frame) if frame else None for frame in frames],
+        "complete": all(rows.get(slot) is not None for slot in SITE_ASSET_SLOTS),
     }
 
 
@@ -240,6 +298,7 @@ async def _site_payloads(
     categories = await _event_categories(db, event_ids)
     videos = await _video_summaries(db, event_ids)
     chats = await _chat_summaries(db, event_ids)
+    assets = await _event_assets(db, event_ids)
     payloads: list[dict] = []
     for publication, event in publication_rows:
         sessions = videos.get(event.id, [])
@@ -251,6 +310,7 @@ async def _site_payloads(
                 **_base_event_payload(event),
                 "published_at_utc": publication.published_at_utc,
                 "categories": categories.get(event.id, []),
+                "assets": _site_assets_payload(assets.get(event.id, {})),
                 "video_sessions": sessions,
                 "chat_sessions": chat_sessions,
                 "primary_chat_session_id": primary_chat["id"] if primary_chat else None,
@@ -295,6 +355,31 @@ async def list_categories(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
+@router.get("/assets/{event_id}/{slot}/{sha256}.webp")
+async def site_asset(
+    event_id: uuid.UUID,
+    slot: str,
+    sha256: str,
+    db: AsyncSession = Depends(get_db),
+):
+    validate_site_asset_slot(slot)
+    asset = await db.get(SiteEventAsset, (event_id, slot))
+    if asset is None or asset.sha256 != sha256:
+        raise HTTPException(404, "site asset not found")
+    path = site_asset_path(settings, asset.storage_key)
+    if not path.is_file():
+        raise HTTPException(404, "site asset file not found")
+    return FileResponse(
+        path,
+        media_type=asset.content_type,
+        filename=None,
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag": f'"{asset.sha256}"',
+        },
+    )
+
+
 @router.get("/feed")
 async def site_feed(
     category: str | None = Query(default=None, max_length=64),
@@ -323,6 +408,7 @@ async def site_feed(
         needle = f"%{query_clean}%"
         stmt = stmt.where(
             or_(
+                MediaEvent.display_title.like(needle),
                 MediaEvent.title.like(needle),
                 MediaEvent.channel_display_name.like(needle),
                 MediaEvent.channel_login.like(needle),
@@ -1004,6 +1090,45 @@ async def site_event_chat_user_events(
     }
 
 
+@router.get("/admin/events")
+async def site_admin_events(db: AsyncSession = Depends(get_db)) -> dict:
+    storage_ids = await _storage_event_ids(db)
+    if not storage_ids:
+        return {"items": []}
+    events = (
+        await db.execute(
+            select(MediaEvent)
+            .where(MediaEvent.id.in_(storage_ids))
+            .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
+        )
+    ).scalars().all()
+    event_ids = [event.id for event in events]
+    publication_ids = set(
+        (
+            await db.execute(
+                select(SiteEventPublication.event_id).where(SiteEventPublication.event_id.in_(event_ids))
+            )
+        ).scalars().all()
+    )
+    categories = await _event_categories(db, event_ids)
+    assets = await _event_assets(db, event_ids)
+    videos = await _video_summaries(db, event_ids)
+    return {
+        "items": [
+            {
+                **_base_event_payload(event),
+                "published": event.id in publication_ids,
+                "categories": categories.get(event.id, []),
+                "assets": _site_assets_payload(assets.get(event.id, {})),
+                "video_sessions": len(videos.get(event.id, [])),
+                "ready_parts": sum(item["ready_parts"] for item in videos.get(event.id, [])),
+                "linked_parts": sum(item["linked_parts"] for item in videos.get(event.id, [])),
+            }
+            for event in events
+        ]
+    }
+
+
 @router.get("/admin/available-events")
 async def site_available_events(db: AsyncSession = Depends(get_db)) -> dict:
     storage_ids = await _storage_event_ids(db)
@@ -1020,19 +1145,99 @@ async def site_available_events(db: AsyncSession = Depends(get_db)) -> dict:
             .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
         )
     ).scalars().all()
-    videos = await _video_summaries(db, [event.id for event in events])
+    event_ids = [event.id for event in events]
+    videos = await _video_summaries(db, event_ids)
+    assets = await _event_assets(db, event_ids)
     items = []
     for event in events:
         sessions = videos.get(event.id, [])
         items.append(
             {
                 **_base_event_payload(event),
+                "assets": _site_assets_payload(assets.get(event.id, {})),
                 "video_sessions": len(sessions),
                 "ready_parts": sum(item["ready_parts"] for item in sessions),
                 "linked_parts": sum(item["linked_parts"] for item in sessions),
             }
         )
     return {"items": items}
+
+
+@router.put("/admin/events/{event_id}")
+async def update_site_event(
+    event_id: uuid.UUID,
+    payload: SiteEventAdminUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    event = await db.get(MediaEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "event not found")
+    display_title = payload.display_title.strip()
+    if not display_title:
+        raise HTTPException(400, "display_title must not be empty")
+    event.display_title = display_title
+    db.add(
+        AuditLog(
+            event_id=event_id,
+            action="site_display_title_update",
+            payload_json={"display_title": display_title},
+        )
+    )
+    await db.commit()
+    return _base_event_payload(event)
+
+
+@router.put("/admin/events/{event_id}/assets/{slot}")
+async def upload_site_event_asset(
+    event_id: uuid.UUID,
+    slot: str,
+    image: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    validate_site_asset_slot(slot)
+    event = await db.get(MediaEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "event not found")
+
+    prepared = await prepare_and_store_site_asset(
+        image, event_id=event_id, slot=slot, settings=settings
+    )
+    asset = await db.get(SiteEventAsset, (event_id, slot))
+    old_storage_key = asset.storage_key if asset else None
+    if asset is None:
+        asset = SiteEventAsset(event_id=event_id, slot=slot, storage_key=prepared.storage_key)
+        db.add(asset)
+    asset.storage_key = prepared.storage_key
+    asset.content_type = prepared.content_type
+    asset.size_bytes = prepared.size_bytes
+    asset.width = prepared.width
+    asset.height = prepared.height
+    asset.sha256 = prepared.sha256
+    asset.original_filename = prepared.original_filename
+    db.add(
+        AuditLog(
+            event_id=event_id,
+            action="site_asset_upload",
+            payload_json={
+                "slot": slot,
+                "sha256": prepared.sha256,
+                "width": prepared.width,
+                "height": prepared.height,
+                "size_bytes": prepared.size_bytes,
+            },
+        )
+    )
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        if prepared.storage_key != old_storage_key:
+            remove_site_asset_file(settings, prepared.storage_key)
+        raise
+    await db.refresh(asset)
+    if old_storage_key and old_storage_key != asset.storage_key:
+        remove_site_asset_file(settings, old_storage_key)
+    return _site_asset_payload(asset)
 
 
 @router.post("/admin/events", status_code=status.HTTP_201_CREATED)
@@ -1044,6 +1249,9 @@ async def publish_site_event(payload: SitePublishRequest, db: AsyncSession = Dep
         raise HTTPException(409, "event is already published on the site")
     if payload.event_id not in await _storage_event_ids(db):
         raise HTTPException(409, "event has no Telegram-linked ready video parts")
+    assets = await _event_assets(db, [event.id])
+    if not _site_assets_payload(assets.get(event.id, {}))["complete"]:
+        raise HTTPException(409, "event requires one cover and exactly four preview frames before publishing")
 
     publication = SiteEventPublication(
         event_id=event.id,

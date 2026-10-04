@@ -35,6 +35,7 @@ class MediaEvent(Base):
     stream_external_id: Mapped[str | None] = mapped_column(String(64), index=True)
     video_external_id: Mapped[str | None] = mapped_column(String(64), index=True)
     title: Mapped[str | None] = mapped_column(String(1024))
+    display_title: Mapped[str | None] = mapped_column(String(1024))
     category_id: Mapped[str | None] = mapped_column(String(64))
     category_name: Mapped[str | None] = mapped_column(String(255))
     source_started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
@@ -71,6 +72,26 @@ class SiteEventPublication(Base):
     published_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SiteEventAsset(Base):
+    __tablename__ = "site_event_assets"
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), primary_key=True
+    )
+    slot: Mapped[str] = mapped_column(String(32), primary_key=True)
+    storage_key: Mapped[str] = mapped_column(String(512), unique=True)
+    content_type: Mapped[str] = mapped_column(String(64), default="image/webp")
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    original_filename: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow
+    )
 
 
 class EventCategory(Base):

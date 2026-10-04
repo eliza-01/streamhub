@@ -50,6 +50,7 @@ async def resolve_or_create_media_event(
             stream_external_id=stream_external_id,
             video_external_id=video_external_id,
             title=title,
+            display_title=title,
             category_id=category_id,
             category_name=category_name,
             source_started_at_utc=source_started_at_utc,
@@ -80,6 +81,8 @@ async def resolve_or_create_media_event(
     event.stream_external_id = stream_external_id or event.stream_external_id
     event.video_external_id = video_external_id or event.video_external_id
     event.title = title or event.title
+    if not event.display_title and event.title:
+        event.display_title = event.title
     event.category_id = category_id or event.category_id
     event.category_name = category_name or event.category_name
     event.source_started_at_utc = source_started_at_utc or event.source_started_at_utc
