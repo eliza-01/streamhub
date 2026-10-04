@@ -9,7 +9,7 @@ import subprocess
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -19,7 +19,17 @@ from sqlalchemy import func, select, update
 
 from streamhub_common.db import SessionLocal
 from streamhub_common.logging import configure_logging
-from streamhub_common.models import StorageMigrationJob, StorageOutputSetting, VideoGap, VideoPart, VideoPartBuildJob, VideoRun, VideoSegment, VideoSession
+from streamhub_common.models import (
+    MediaEvent,
+    StorageMigrationJob,
+    StorageOutputSetting,
+    VideoGap,
+    VideoPart,
+    VideoPartBuildJob,
+    VideoRun,
+    VideoSegment,
+    VideoSession,
+)
 from streamhub_common.security import require_internal_token
 from streamhub_common.settings import get_settings
 
@@ -221,50 +231,144 @@ async def build_spool_playlist(session_id: uuid.UUID, *, finished: bool = False)
     os.replace(tmp, final)
 
 
-def playlist_segment_numbers(session_id: uuid.UUID, run_no: int) -> set[int]:
+def parse_hls_program_date_time(value: str) -> datetime | None:
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def playlist_segment_program_times(session_id: uuid.UUID, run_no: int) -> dict[int, datetime | None]:
+    """Return closed segment numbers and their wall-clock HLS PROGRAM-DATE-TIME.
+
+    ffmpeg writes PROGRAM-DATE-TIME for LIVE captures. Keep carrying the last
+    timestamp forward by EXTINF duration as a defensive fallback in case a
+    muxer emits the tag only at a discontinuity boundary.
+    """
     _segments_dir, runs_dir, _logs_dir = ensure_spool_dirs(session_id)
     playlist = runs_dir / f"run_{run_no:06d}.m3u8"
     if not playlist.exists():
-        return set()
-    result: set[int] = set()
+        return {}
     try:
         lines = playlist.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return set()
+        return {}
+
+    result: dict[int, datetime | None] = {}
+    program_time: datetime | None = None
+    duration_ms: int | None = None
     for line in lines:
         value = line.strip()
-        if not value or value.startswith("#"):
+        if not value:
             continue
+        if value.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            program_time = parse_hls_program_date_time(value.split(":", 1)[1])
+            continue
+        if value.startswith("#EXTINF:"):
+            raw = value.split(":", 1)[1].split(",", 1)[0].strip()
+            try:
+                duration_ms = max(0, int(round(float(raw) * 1000)))
+            except ValueError:
+                duration_ms = None
+            continue
+        if value.startswith("#"):
+            continue
+
         name = Path(value).name
         if not name.startswith("seg_") or not name.endswith(".ts"):
             continue
         try:
-            result.add(int(name[4:-3]))
+            segment_no = int(name[4:-3])
         except ValueError:
             continue
+        result[segment_no] = program_time
+        if program_time is not None and duration_ms is not None:
+            program_time = program_time + timedelta(milliseconds=duration_ms)
+        duration_ms = None
     return result
+
+
+def utc_naive(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def source_offset_ms(value: datetime | None, origin: datetime | None) -> int | None:
+    value_naive = utc_naive(value)
+    origin_naive = utc_naive(origin)
+    if value_naive is None or origin_naive is None:
+        return None
+    return max(0, int(round((value_naive - origin_naive).total_seconds() * 1000)))
 
 
 async def index_closed_segments(session_id: uuid.UUID, run_id: int, run_no: int) -> int:
     segments_dir, _runs_dir, _logs_dir = ensure_spool_dirs(session_id)
-    allowed_segment_numbers = playlist_segment_numbers(session_id, run_no)
+    segment_program_times = playlist_segment_program_times(session_id, run_no)
+    allowed_segment_numbers = set(segment_program_times)
     if not allowed_segment_numbers:
         return 0
     async with SessionLocal() as db:
-        existing = set(
-            (
-                await db.execute(
-                    select(VideoSegment.segment_no).where(VideoSegment.video_session_id == session_id)
-                )
-            ).scalars().all()
-        )
+        existing_rows = (
+            await db.execute(
+                select(VideoSegment).where(VideoSegment.video_session_id == session_id)
+            )
+        ).scalars().all()
+        existing = {row.segment_no: row for row in existing_rows}
         session = await db.get(VideoSession, session_id)
         run = await db.get(VideoRun, run_id)
         if session is None or run is None:
             return 0
+        event = await db.get(MediaEvent, session.event_id)
+
+        media_type = str((session.metadata_json or {}).get("media_type") or "")
+        source_origin = event.source_started_at_utc if event is not None else None
+        run_rows = [row for row in existing_rows if row.video_run_id == run_id]
+        timeline_cursor = int(session.coverage_end_ms or 0)
+        run_timeline_start = min((int(row.timeline_start_ms) for row in run_rows), default=timeline_cursor)
+        run_source_start = source_offset_ms(run.started_at_utc, source_origin) if media_type == "live" else None
+
+        def mapped_source_start(segment_no: int, timeline_start_ms: int) -> int | None:
+            if media_type == "vod":
+                return timeline_start_ms
+            if media_type != "live" or source_origin is None:
+                return None
+            program_time = segment_program_times.get(segment_no)
+            exact = source_offset_ms(program_time, source_origin)
+            if exact is not None:
+                return exact
+            if run_source_start is None:
+                return None
+            return max(0, run_source_start + timeline_start_ms - run_timeline_start)
+
+        updated_source = 0
+        # Reconciliation may revisit already indexed rows. Backfill/upgrade their
+        # source timeline from PROGRAM-DATE-TIME instead of leaving a historical
+        # LIVE capture permanently unsynchronised.
+        for segment_no in sorted(allowed_segment_numbers):
+            row = existing.get(segment_no)
+            if row is None or row.video_run_id != run_id:
+                continue
+            source_start = mapped_source_start(segment_no, int(row.timeline_start_ms))
+            if source_start is None:
+                continue
+            source_end = source_start + int(row.duration_ms)
+            if row.source_media_start_ms != source_start or row.source_media_end_ms != source_end:
+                row.source_media_start_ms = source_start
+                row.source_media_end_ms = source_end
+                updated_source += 1
 
         created = 0
-        timeline_cursor = int(session.coverage_end_ms or 0)
         for path in sorted(segments_dir.glob("seg_*.ts")):
             try:
                 segment_no = int(path.stem.split("_")[-1])
@@ -281,8 +385,8 @@ async def index_closed_segments(session_id: uuid.UUID, run_id: int, run_no: int)
             if size <= 0:
                 continue
             duration_ms = await probe_duration_ms(path)
-            source_start = timeline_cursor if session.metadata_json and session.metadata_json.get("media_type") == "vod" else None
-            source_end = timeline_cursor + duration_ms if source_start is not None else None
+            source_start = mapped_source_start(segment_no, timeline_cursor)
+            source_end = source_start + duration_ms if source_start is not None else None
             row = VideoSegment(
                 video_session_id=session_id,
                 video_run_id=run_id,
@@ -301,7 +405,7 @@ async def index_closed_segments(session_id: uuid.UUID, run_id: int, run_no: int)
             )
             db.add(row)
             timeline_cursor += duration_ms
-            existing.add(segment_no)
+            existing[segment_no] = row
             created += 1
             run.first_segment_no = segment_no if run.first_segment_no is None else min(run.first_segment_no, segment_no)
             run.last_segment_no = segment_no if run.last_segment_no is None else max(run.last_segment_no, segment_no)
@@ -311,6 +415,7 @@ async def index_closed_segments(session_id: uuid.UUID, run_id: int, run_no: int)
             session.coverage_start_ms = 0 if session.coverage_start_ms is None else session.coverage_start_ms
             session.coverage_end_ms = timeline_cursor
             session.last_activity_at_utc = utcnow_naive()
+        if created or updated_source:
             await db.commit()
         else:
             await db.rollback()

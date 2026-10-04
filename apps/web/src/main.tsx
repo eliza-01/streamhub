@@ -62,6 +62,7 @@ type VideoSession = {
     channel_display_name?: string | null;
     title?: string | null;
     external_key: string;
+    source_started_at_utc?: string | null;
   };
 };
 
@@ -268,6 +269,7 @@ type SiteChatSession = {
 type SiteChatMessage = {
   id: number;
   timeline_offset_ms: number;
+  player_offset_ms?: number | null;
   chatter_external_id?: string | null;
   chatter_login?: string | null;
   chatter_name?: string | null;
@@ -284,15 +286,32 @@ type SiteChatMessage = {
   channel_points_reward_id?: string | null;
 };
 
-type SiteChatUserSummary = {
-  event_id: string;
-  chat_session_id?: string | null;
+type SiteChatUserIdentity = {
   chatter_external_id?: string | null;
   chatter_login?: string | null;
+  chatter_name?: string | null;
+  color?: string | null;
+  badges?: unknown;
+};
+
+type SiteChatUserSummary = SiteChatUserIdentity & {
+  event_id: string;
+  chat_session_id?: string | null;
   message_count: number;
   first_message_ms?: number | null;
   last_message_ms?: number | null;
 };
+
+type SiteChatUserEvent = {
+  event_id: string;
+  title: string;
+  channel_login?: string | null;
+  channel_display_name?: string | null;
+  source_started_at_utc?: string | null;
+  message_count: number;
+};
+
+const siteChatOtherEventsCache = new Map<string, SiteChatUserEvent[]>();
 
 type SiteChatStatsUser = {
   chatter_external_id?: string | null;
@@ -319,6 +338,25 @@ type SiteChatBadgeAsset = {
   image_url_4x?: string | null;
   title?: string | null;
   description?: string | null;
+};
+
+type SitePlaybackTimelineRange = {
+  run_no: number;
+  first_segment_no: number;
+  last_segment_no: number;
+  timeline_start_ms: number;
+  timeline_end_ms: number;
+  source_start_ms: number;
+  source_end_ms: number;
+  mapping_source: string;
+};
+
+type SitePlaybackTimeline = {
+  event_id: string;
+  video_session_id?: string | null;
+  synchronized: boolean;
+  mapping_quality: "exact" | "mixed" | "approximate" | "unavailable" | string;
+  ranges: SitePlaybackTimelineRange[];
 };
 
 type SiteEvent = {
@@ -578,7 +616,8 @@ function TelegramVideoPlayer({
 }
 
 function safeChatColor(value?: string | null) {
-  return value && /^#[0-9a-f]{6}$/i.test(value) ? value : undefined;
+  if (!value || !/^#[0-9a-f]{6}$/i.test(value)) return undefined;
+  return value.toLowerCase() === "#000000" ? "#8b949e" : value;
 }
 
 type ChatBadgeView = {
@@ -633,7 +672,9 @@ function chatBadges(value: unknown, assets: Record<string, SiteChatBadgeAsset> =
       }
       const record = asChatRecord(item);
       if (!record) return;
-      push(record.setID ?? record.setId ?? record.set_id ?? record.name, record.version ?? record.id, record.id ?? index);
+      const setId = record.setID ?? record.setId ?? record.set_id ?? record.name;
+      const version = record.version ?? record.id;
+      push(setId, version, `${String(setId || "badge")}/${String(version || "")}:${index}`);
     });
   } else {
     const record = asChatRecord(value);
@@ -673,7 +714,7 @@ function chatReplySummary(value: unknown) {
   return `${author ? `↪ ${author}` : "↪"}${body ? `${author ? ": " : " "}${body}` : ""}`;
 }
 
-function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
+function ChatMessageFragments({ message, onAssetLoad }: { message: SiteChatMessage; onAssetLoad?: () => void }) {
   const fragments = Array.isArray(message.fragments) ? message.fragments : [];
   if (!fragments.length) return <>{message.message_text}</>;
   return <>
@@ -687,6 +728,7 @@ function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
           alt={text}
           title={text}
           loading="lazy"
+          onLoad={onAssetLoad}
           key={`${emoteId}:${index}`}
         />;
       }
@@ -695,12 +737,385 @@ function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
   </>;
 }
 
-function SiteChatStats({ eventId, hasChat, totalMessages }: { eventId: string; hasChat: boolean; totalMessages: number }) {
+function chatUserQuery(user: SiteChatUserIdentity) {
+  const params = new URLSearchParams();
+  if (user.chatter_external_id) params.set("chatter_external_id", user.chatter_external_id);
+  else if (user.chatter_login) params.set("chatter_login", user.chatter_login);
+  return params;
+}
+
+function chatUserMenuPosition(clientX: number, clientY: number) {
+  const width = 286;
+  const height = 250;
+  return {
+    x: Math.max(10, Math.min(clientX + 10, window.innerWidth - width - 10)),
+    y: Math.max(10, Math.min(clientY + 10, window.innerHeight - height - 10)),
+  };
+}
+
+function TwitchIcon() {
+  return (
+    <svg className="site-twitch-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path fill="currentColor" d="M4 2h18v13l-5 5h-4l-3 3v-3H5V17H2V5l2-3Zm2 3v11h5v3l3-3h4l2-2V5H6Zm5 3h2v5h-2V8Zm5 0h2v5h-2V8Z" />
+    </svg>
+  );
+}
+
+function SiteChatUserContext({
+  eventId,
+  user,
+  x,
+  y,
+  onClose,
+  onMention,
+  videoRef,
+}: {
+  eventId: string;
+  user: SiteChatUserIdentity;
+  x: number;
+  y: number;
+  onClose: () => void;
+  onMention?: (mention: string) => void;
+  videoRef?: { current: HTMLVideoElement | null };
+}) {
+  const identityParams = chatUserQuery(user);
+  const identityQuery = identityParams.toString();
+  const otherEventsCacheKey = `${eventId}?${identityQuery}`;
+  const cachedOtherEvents = siteChatOtherEventsCache.get(otherEventsCacheKey);
+  const [summary, setSummary] = useState<SiteChatUserSummary | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(true);
+  const [badgeAssets, setBadgeAssets] = useState<Record<string, SiteChatBadgeAsset>>({});
+  const [messagesOpen, setMessagesOpen] = useState(false);
+  const [historyTab, setHistoryTab] = useState<"current" | "other">("current");
+  const [otherEvents, setOtherEvents] = useState<SiteChatUserEvent[]>(() => cachedOtherEvents || []);
+  const [otherEventsLoading, setOtherEventsLoading] = useState(false);
+  const [otherEventsLoaded, setOtherEventsLoaded] = useState(() => cachedOtherEvents !== undefined);
+  const [selectedOther, setSelectedOther] = useState<SiteChatUserEvent | null>(null);
+  const [historyMessages, setHistoryMessages] = useState<SiteChatMessage[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const modalRef = useRef<HTMLDivElement | null>(null);
+  const historyRequestRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setSummary(null);
+    setSummaryLoading(true);
+    if (!identityQuery) {
+      setSummaryLoading(false);
+      return () => controller.abort();
+    }
+    void (async () => {
+      try {
+        const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/user-summary?${identityQuery}`), {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(await response.text());
+        setSummary(await response.json() as SiteChatUserSummary);
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("chat user summary unavailable", e);
+      } finally {
+        if (!controller.signal.aborted) setSummaryLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [eventId, identityQuery]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/badges`), {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) return;
+        const payload = await response.json();
+        const next: Record<string, SiteChatBadgeAsset> = {};
+        ((payload.badges || []) as SiteChatBadgeAsset[]).forEach((badge) => {
+          const setId = String(badge.set_id || "").trim();
+          const version = String(badge.version || "").trim();
+          if (setId && version) next[chatBadgeAssetKey(setId, version)] = badge;
+        });
+        setBadgeAssets(next);
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("chat user badges unavailable", e);
+      }
+    })();
+    return () => controller.abort();
+  }, [eventId]);
+
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent) => {
+      if (messagesOpen) return;
+      if (menuRef.current?.contains(event.target as Node)) return;
+      onClose();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    const onResize = () => onClose();
+    document.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", onResize);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [messagesOpen, onClose]);
+
+  async function loadHistoryMessages(targetEventId: string) {
+    historyRequestRef.current?.abort();
+    const controller = new AbortController();
+    historyRequestRef.current = controller;
+    setHistoryMessages([]);
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      const timelinePromise = fetch(apiUrl(`/api/v1/site/events/${targetEventId}/playback-timeline`), {
+        cache: "no-store",
+        signal: controller.signal,
+      }).then(async (response) => response.ok ? await response.json() as SitePlaybackTimeline : null).catch(() => null);
+
+      const loaded: SiteChatMessage[] = [];
+      let cursor: { time_ms: number; id: number } | null = null;
+      do {
+        const params = new URLSearchParams(identityQuery);
+        params.set("page_size", "1000");
+        if (cursor) {
+          params.set("after_ms", String(cursor.time_ms));
+          params.set("after_id", String(cursor.id));
+        }
+        const response = await fetch(apiUrl(`/api/v1/site/events/${targetEventId}/chat/user-messages?${params.toString()}`), {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const payload = await response.json();
+        loaded.push(...((payload.messages || []) as SiteChatMessage[]));
+        cursor = payload.next_cursor || null;
+      } while (cursor && !controller.signal.aborted);
+
+      const timeline = await timelinePromise;
+      const ranges = timeline?.synchronized ? timeline.ranges : [];
+      setHistoryMessages(loaded.map((message) => ({
+        ...message,
+        player_offset_ms: ranges.length ? sourceToPlayerMs(message.timeline_offset_ms, ranges) : null,
+      })));
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === "AbortError")) setHistoryError(`Не удалось загрузить сообщения: ${String(e)}`);
+    } finally {
+      if (!controller.signal.aborted) setHistoryLoading(false);
+    }
+  }
+
+  async function loadOtherEvents() {
+    if (otherEventsLoaded || otherEventsLoading) return;
+    setOtherEventsLoading(true);
+    setHistoryError("");
+    try {
+      const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/user-events?${identityQuery}`), { cache: "no-store" });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      const items = (payload.items || []) as SiteChatUserEvent[];
+      siteChatOtherEventsCache.set(otherEventsCacheKey, items);
+      setOtherEvents(items);
+      setOtherEventsLoaded(true);
+    } catch (e) {
+      setHistoryError(`Не удалось загрузить другие стримы: ${String(e)}`);
+    } finally {
+      setOtherEventsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!messagesOpen) return;
+    if (historyTab === "current") {
+      setSelectedOther(null);
+      void loadHistoryMessages(eventId);
+      return;
+    }
+    setHistoryMessages([]);
+    if (selectedOther) {
+      void loadHistoryMessages(selectedOther.event_id);
+    } else if (!otherEventsLoaded) {
+      void loadOtherEvents();
+    }
+    return () => historyRequestRef.current?.abort();
+  // identityQuery is stable for the lifetime of the menu target.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messagesOpen, historyTab, selectedOther?.event_id, eventId, identityQuery, otherEventsLoaded, otherEventsLoading]);
+
+  useEffect(() => () => historyRequestRef.current?.abort(), []);
+
+  const name = summary?.chatter_name || user.chatter_name || summary?.chatter_login || user.chatter_login || "Гость";
+  const login = summary?.chatter_login || user.chatter_login || "";
+  const color = safeChatColor(summary?.color || user.color) || "#ff8a32";
+  const badges = chatBadges(summary?.badges ?? user.badges, badgeAssets).slice(0, 4);
+  const targetEventId = historyTab === "current" ? eventId : selectedOther?.event_id;
+  const targetTitle = historyTab === "current" ? "Этот стрим" : selectedOther?.title || "Другие стримы";
+
+  function seekHistoryMessage(message: SiteChatMessage) {
+    if (targetEventId !== eventId || message.player_offset_ms == null || !videoRef?.current) return;
+    videoRef.current.currentTime = Math.max(0, message.player_offset_ms / 1000);
+    void videoRef.current.play().catch(() => {});
+  }
+
+  return <>
+    {!messagesOpen ? (
+      <div
+        className="site-chat-user-menu"
+        ref={menuRef}
+        style={{ left: x, top: y }}
+        role="dialog"
+        aria-label={`Профиль ${name}`}
+      >
+        <div className="site-chat-user-head">
+          <div className="site-chat-user-avatar" style={{ background: color }}>{name.slice(0, 1).toUpperCase()}</div>
+          <div className="site-chat-user-identity">
+            <strong style={{ color }}>{name}</strong>
+            {login ? <span>@{login}</span> : <span>пользователь чата</span>}
+            {badges.length > 0 ? (
+              <div className="site-chat-user-badges">
+                {badges.map((badge) => badge.imageUrl ? (
+                  <img key={badge.key} src={badge.imageUrl} alt={badge.title} title={badge.title} />
+                ) : <span key={badge.key} title={badge.title}>{badge.label}</span>)}
+              </div>
+            ) : null}
+          </div>
+        </div>
+        <button className="site-chat-user-action site-chat-user-stat is-button" type="button" onClick={() => setMessagesOpen(true)}>
+          <span className="site-chat-user-action-label">Все сообщения</span>
+          <strong aria-label={summaryLoading ? "Загружается количество сообщений" : undefined}>
+            {summaryLoading ? <i className="site-inline-spinner" /> : (summary?.message_count ?? 0).toLocaleString("ru-RU")}
+          </strong>
+        </button>
+        {login ? (
+          <a className="site-chat-user-action" href={`https://www.twitch.tv/${encodeURIComponent(login)}`} target="_blank" rel="noreferrer">
+            <span className="site-chat-user-action-label"><TwitchIcon />Посмотреть профиль Twitch</span>
+          </a>
+        ) : (
+          <div className="site-chat-user-action is-disabled"><span className="site-chat-user-action-label"><TwitchIcon />Посмотреть профиль Twitch</span></div>
+        )}
+        <button
+          className="site-chat-user-action"
+          type="button"
+          onClick={() => {
+            onMention?.(`@${login || name}`);
+            onClose();
+          }}
+        >
+          <span>Отметить в комментарии</span>
+        </button>
+      </div>
+    ) : null}
+
+    {messagesOpen ? (
+      <div className="site-chat-history-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+        <section className="site-chat-history-modal" ref={modalRef} role="dialog" aria-modal="true" aria-label={`Сообщения ${name}`}>
+          <header className="site-chat-history-head">
+            <div>
+              <span>ИСТОРИЯ ЧАТА</span>
+              <strong>{name}</strong>
+              {login ? <small>@{login}</small> : null}
+            </div>
+            <button type="button" onClick={onClose} aria-label="Закрыть"><span className="site-chat-history-close-icon" aria-hidden="true" /></button>
+          </header>
+          <div className="site-chat-history-tabs" role="tablist">
+            <button className={historyTab === "current" ? "active" : ""} type="button" onClick={() => setHistoryTab("current")}>Этот стрим</button>
+            <button className={historyTab === "other" ? "active" : ""} type="button" onClick={() => { setHistoryTab("other"); setSelectedOther(null); }}>
+              <span>Другие</span>
+              {otherEventsLoaded ? <b className="site-chat-history-tab-count">{otherEvents.length.toLocaleString("ru-RU")}</b> : null}
+            </button>
+          </div>
+          <div className="site-chat-history-content">
+            {historyError ? <div className="site-chat-history-error">{historyError}</div> : null}
+            {historyTab === "other" && !selectedOther ? (
+              <>
+                {otherEventsLoading ? <div className="site-chat-history-loading"><i className="site-inline-spinner" /></div> : null}
+                {!otherEventsLoading && otherEvents.length === 0 ? <div className="site-chat-history-empty">В других опубликованных стримах сообщений нет.</div> : null}
+                <div className="site-chat-history-events">
+                  {otherEvents.map((item) => (
+                    <button type="button" className="site-chat-history-event" key={item.event_id} onClick={() => setSelectedOther(item)}>
+                      <strong>{item.title}</strong>
+                      <span>Сообщений: <b>{item.message_count.toLocaleString("ru-RU")}</b></span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="site-chat-history-stream-context">
+                  {historyTab === "other" ? (
+                    <div className="site-chat-history-back-row">
+                      <button className="site-chat-history-back" type="button" onClick={() => setSelectedOther(null)}>Назад</button>
+                    </div>
+                  ) : null}
+                  <div className="site-chat-history-stream-heading">
+                    <div>
+                      <strong>{targetTitle}</strong>
+                    </div>
+                    <b>{historyLoading ? "…" : `${historyMessages.length.toLocaleString("ru-RU")} сообщений`}</b>
+                  </div>
+                </div>
+                {historyLoading ? <div className="site-chat-history-loading"><i className="site-inline-spinner" /></div> : null}
+                {!historyLoading && historyMessages.length === 0 ? <div className="site-chat-history-empty">Сообщений не найдено.</div> : null}
+                <div className="site-chat-history-messages">
+                  {historyMessages.map((message) => {
+                    const reply = chatReplySummary(message.reply);
+                    const canSeek = targetEventId === eventId && message.player_offset_ms != null && !!videoRef?.current;
+                    return (
+                      <article className="site-chat-history-message" key={message.id}>
+                        <button
+                          type="button"
+                          disabled={!canSeek}
+                          onClick={() => seekHistoryMessage(message)}
+                          title={canSeek
+                            ? `Перейти к ${fmtMs(message.player_offset_ms as number)}`
+                            : `Видео для этого сообщения пока не загружено · таймлайн Twitch ${fmtMs(message.timeline_offset_ms)}`}
+                        >
+                          {message.player_offset_ms != null ? fmtMs(message.player_offset_ms) : "—"}
+                        </button>
+                        <div>
+                          {reply ? <small>{reply}</small> : null}
+                          <p><ChatMessageFragments message={message} /></p>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        </section>
+      </div>
+    ) : null}
+  </>;
+}
+
+function SiteChatStats({
+  eventId,
+  hasChat,
+  totalMessages,
+  videoRef,
+  onMention,
+}: {
+  eventId: string;
+  hasChat: boolean;
+  totalMessages: number;
+  videoRef?: { current: HTMLVideoElement | null };
+  onMention?: (mention: string) => void;
+}) {
   const [stats, setStats] = useState<SiteChatStatsPayload | null>(null);
   const [loading, setLoading] = useState(hasChat);
+  const [userMenu, setUserMenu] = useState<{ user: SiteChatUserIdentity; x: number; y: number } | null>(null);
 
   useEffect(() => {
     setStats(null);
+    setUserMenu(null);
     setLoading(hasChat);
     if (!hasChat) return;
     const controller = new AbortController();
@@ -719,22 +1134,95 @@ function SiteChatStats({ eventId, hasChat, totalMessages }: { eventId: string; h
   }, [eventId, hasChat]);
 
   const userLabel = (user?: SiteChatStatsUser | null) => user?.chatter_name || user?.chatter_login || "—";
-  const value = (text: React.ReactNode) => loading ? <i className="site-inline-spinner" /> : text;
+  const value = (content: React.ReactNode) => loading ? <i className="site-inline-spinner" /> : content;
+
+  function openStatsUser(event: React.MouseEvent<HTMLElement>, user?: SiteChatStatsUser | null) {
+    if (!user) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const position = chatUserMenuPosition(rect.left, rect.bottom);
+    setUserMenu({ user, ...position });
+  }
 
   return (
     <section className="streamvault-chat-stats" aria-label="Статистика чата">
       <div className="streamvault-chat-stats-head">
-        <div><span>СТАТИСТИКА ЧАТА</span><strong>Срез всей записи</strong></div>
-        <small>Детальный просмотр пользователей — из чата по клику на ник</small>
+        <div><span>СТАТИСТИКА ЧАТА</span></div>
       </div>
       <div className="streamvault-chat-stats-grid">
         <div><span>Сообщения</span><strong>{totalMessages.toLocaleString("ru-RU")}</strong></div>
         <div><span>Участники</span><strong>{hasChat ? value((stats?.unique_chatters ?? 0).toLocaleString("ru-RU")) : "—"}</strong></div>
-        <div className="user"><span>Больше всего</span><strong>{hasChat ? value(userLabel(stats?.most_active)) : "—"}</strong>{!loading && stats?.most_active ? <small>{stats.most_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}</div>
-        <div className="user"><span>Меньше всего</span><strong>{hasChat ? value(userLabel(stats?.least_active)) : "—"}</strong>{!loading && stats?.least_active ? <small>{stats.least_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}</div>
+        <button
+          className="user"
+          type="button"
+          disabled={!stats?.most_active || loading}
+          onClick={(event) => openStatsUser(event, stats?.most_active)}
+          title={stats?.most_active ? `Открыть профиль и историю ${userLabel(stats.most_active)}` : undefined}
+        >
+          <span>Больше всего</span>
+          <strong className="streamvault-chat-stat-user-name">
+            {hasChat ? value(userLabel(stats?.most_active)) : "—"}
+          </strong>
+          {!loading && stats?.most_active ? <small>{stats.most_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}
+        </button>
+        <button
+          className="user"
+          type="button"
+          disabled={!stats?.least_active || loading}
+          onClick={(event) => openStatsUser(event, stats?.least_active)}
+          title={stats?.least_active ? `Открыть профиль и историю ${userLabel(stats.least_active)}` : undefined}
+        >
+          <span>Меньше всего</span>
+          <strong className="streamvault-chat-stat-user-name">
+            {hasChat ? value(userLabel(stats?.least_active)) : "—"}
+          </strong>
+          {!loading && stats?.least_active ? <small>{stats.least_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}
+        </button>
       </div>
+      {userMenu ? (
+        <SiteChatUserContext
+          eventId={eventId}
+          user={userMenu.user}
+          x={userMenu.x}
+          y={userMenu.y}
+          onClose={() => setUserMenu(null)}
+          onMention={onMention}
+          videoRef={videoRef}
+        />
+      ) : null}
     </section>
   );
+}
+
+function mapTimelineValue(
+  value: number,
+  ranges: SitePlaybackTimelineRange[],
+  direction: "player-to-source" | "source-to-player"
+) {
+  const matches = ranges.filter((item) => direction === "player-to-source"
+    ? value >= item.timeline_start_ms && value <= item.timeline_end_ms
+    : value >= item.source_start_ms && value <= item.source_end_ms);
+  // At a player discontinuity two ranges share the same boundary timestamp.
+  // Prefer the following range so the first frame after a reconnect maps to the
+  // post-gap Twitch source clock rather than the end of the previous run.
+  const range = direction === "player-to-source" ? matches[matches.length - 1] : matches[0];
+  if (!range) return null;
+
+  const inputStart = direction === "player-to-source" ? range.timeline_start_ms : range.source_start_ms;
+  const inputEnd = direction === "player-to-source" ? range.timeline_end_ms : range.source_end_ms;
+  const outputStart = direction === "player-to-source" ? range.source_start_ms : range.timeline_start_ms;
+  const outputEnd = direction === "player-to-source" ? range.source_end_ms : range.timeline_end_ms;
+  const inputSpan = Math.max(1, inputEnd - inputStart);
+  const outputSpan = Math.max(0, outputEnd - outputStart);
+  const ratio = Math.max(0, Math.min(1, (value - inputStart) / inputSpan));
+  return Math.max(0, Math.round(outputStart + outputSpan * ratio));
+}
+
+function playerToSourceMs(value: number, ranges: SitePlaybackTimelineRange[]) {
+  return mapTimelineValue(value, ranges, "player-to-source");
+}
+
+function sourceToPlayerMs(value: number, ranges: SitePlaybackTimelineRange[]) {
+  return mapTimelineValue(value, ranges, "source-to-player");
 }
 
 function SiteReplayChat({
@@ -752,16 +1240,15 @@ function SiteReplayChat({
 }) {
   const [messages, setMessages] = useState<SiteChatMessage[]>([]);
   const [badgeAssets, setBadgeAssets] = useState<Record<string, SiteChatBadgeAsset>>({});
+  const [playbackTimeline, setPlaybackTimeline] = useState<SitePlaybackTimeline | null>(null);
   const [currentMs, setCurrentMs] = useState(0);
   const [chatStatus, setChatStatus] = useState(hasChat ? "Загрузка…" : "Чат не записан");
   const [following, setFollowing] = useState(true);
-  const [userMenu, setUserMenu] = useState<{ message: SiteChatMessage; x: number; y: number } | null>(null);
-  const [userSummary, setUserSummary] = useState<SiteChatUserSummary | null>(null);
-  const [userSummaryLoading, setUserSummaryLoading] = useState(false);
+  const [userMenu, setUserMenu] = useState<{ user: SiteChatUserIdentity; x: number; y: number } | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
   const loadedRangeRef = useRef<{ from: number; to: number } | null>(null);
-  const summaryRequestRef = useRef<AbortController | null>(null);
+  const smoothFollowRef = useRef(false);
+  const smoothFollowTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     setBadgeAssets({});
@@ -797,6 +1284,34 @@ function SiteReplayChat({
   }, [eventId, hasChat]);
 
   useEffect(() => {
+    setPlaybackTimeline(null);
+    if (!hasChat) return;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/playback-timeline`), {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(await response.text());
+        setPlaybackTimeline(await response.json() as SitePlaybackTimeline);
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) {
+          console.warn("playback timeline unavailable", e);
+          setPlaybackTimeline({
+            event_id: eventId,
+            video_session_id: null,
+            synchronized: false,
+            mapping_quality: "unavailable",
+            ranges: [],
+          });
+        }
+      }
+    })();
+    return () => controller.abort();
+  }, [eventId, hasChat]);
+
+  useEffect(() => {
     setMessages([]);
     setFollowing(true);
     loadedRangeRef.current = null;
@@ -804,7 +1319,16 @@ function SiteReplayChat({
       setChatStatus("Чат не записан");
       return;
     }
+    if (!playbackTimeline) {
+      setChatStatus("Синхронизация…");
+      return;
+    }
+    if (!playbackTimeline.synchronized || playbackTimeline.ranges.length === 0) {
+      setChatStatus("Таймлайн видео недоступен");
+      return;
+    }
 
+    const ranges = playbackTimeline.ranges;
     let stopped = false;
     let controller: AbortController | null = null;
     let loading = false;
@@ -814,14 +1338,47 @@ function SiteReplayChat({
       setCurrentMs(Math.max(0, Math.round((video?.currentTime || 0) * 1000)));
     };
 
+    const fetchFirstFutureMessage = async (currentPlayer: number, signal: AbortSignal): Promise<(SiteChatMessage & { player_offset_ms: number }) | null> => {
+      for (const range of ranges) {
+        if (range.timeline_end_ms <= currentPlayer + 100) continue;
+        const playerStart = Math.max(currentPlayer + 101, range.timeline_start_ms);
+        const sourceStart = playerToSourceMs(playerStart, [range]);
+        if (sourceStart == null || sourceStart > range.source_end_ms) continue;
+
+        const params = new URLSearchParams({
+          from_ms: String(Math.max(0, sourceStart)),
+          to_ms: String(Math.max(sourceStart, range.source_end_ms)),
+          page_size: "1",
+        });
+        const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/messages?${params.toString()}`), {
+          cache: "no-store",
+          signal,
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const payload = await response.json();
+        const candidate = ((payload.messages || []) as SiteChatMessage[])[0];
+        if (!candidate) continue;
+        const playerOffset = sourceToPlayerMs(candidate.timeline_offset_ms, ranges);
+        if (playerOffset == null || playerOffset <= currentPlayer + 100) continue;
+        return { ...candidate, player_offset_ms: playerOffset };
+      }
+      return null;
+    };
+
     const loadWindow = async (force = false) => {
       if (loading || stopped) return;
-      const current = Math.max(0, Math.round((videoRef.current?.currentTime || 0) * 1000));
+      const currentPlayer = Math.max(0, Math.round((videoRef.current?.currentTime || 0) * 1000));
+      const currentSource = playerToSourceMs(currentPlayer, ranges);
+      if (currentSource == null) {
+        setMessages([]);
+        setChatStatus("В этой точке нет source timeline");
+        return;
+      }
       const loaded = loadedRangeRef.current;
-      if (!force && loaded && current >= loaded.from + 12_000 && current <= loaded.to - 12_000) return;
+      if (!force && loaded && currentSource >= loaded.from + 12_000 && currentSource <= loaded.to - 12_000) return;
 
-      const from = Math.max(0, current - 60_000);
-      const to = current + 45_000;
+      const from = Math.max(0, currentSource - 60_000);
+      const to = currentSource + 45_000;
       loading = true;
       controller?.abort();
       controller = new AbortController();
@@ -850,8 +1407,21 @@ function SiteReplayChat({
         } while (cursor && !stopped);
 
         if (stopped) return;
-        loadedMessages.sort((a, b) => (a.timeline_offset_ms - b.timeline_offset_ms) || (a.id - b.id));
-        setMessages(loadedMessages);
+        const mapped = loadedMessages
+          .map((message) => ({
+            ...message,
+            player_offset_ms: sourceToPlayerMs(message.timeline_offset_ms, ranges),
+          }))
+          .filter((message) => message.player_offset_ms != null);
+        const hasPastOrCurrent = mapped.some((message) => (message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentPlayer + 100);
+        const hasFuture = mapped.some((message) => (message.player_offset_ms ?? Number.NEGATIVE_INFINITY) > currentPlayer + 100);
+        if (!hasPastOrCurrent && !hasFuture) {
+          const nextMessage = await fetchFirstFutureMessage(currentPlayer, controller.signal);
+          if (stopped) return;
+          if (nextMessage && !mapped.some((message) => message.id === nextMessage.id)) mapped.push(nextMessage);
+        }
+        mapped.sort((a, b) => ((a.player_offset_ms || 0) - (b.player_offset_ms || 0)) || (a.id - b.id));
+        setMessages(mapped);
         loadedRangeRef.current = { from, to };
         setChatStatus(`${messageCount.toLocaleString("ru-RU")} сообщений`);
       } catch (e) {
@@ -890,121 +1460,143 @@ function SiteReplayChat({
       window.clearInterval(timer);
       detach();
     };
-  }, [eventId, hasChat, messageCount, videoRef]);
-
-  useEffect(() => () => summaryRequestRef.current?.abort(), []);
-
-  useEffect(() => {
-    if (!userMenu) return;
-    const onPointerDown = (event: PointerEvent) => {
-      if (menuRef.current?.contains(event.target as Node)) return;
-      setUserMenu(null);
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setUserMenu(null);
-    };
-    const close = () => setUserMenu(null);
-    document.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("resize", close);
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("resize", close);
-    };
-  }, [userMenu]);
+  }, [eventId, hasChat, messageCount, playbackTimeline, videoRef]);
 
   const visible = useMemo(
-    () => messages.filter((message) => message.timeline_offset_ms <= currentMs + 100).slice(-500),
+    () => messages.filter((message) => (message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentMs + 100).slice(-500),
     [messages, currentMs]
   );
+  const nextMessagePlayerMs = useMemo(() => {
+    const next = messages.find((message) => (message.player_offset_ms ?? Number.NEGATIVE_INFINITY) > currentMs + 100);
+    return next?.player_offset_ms ?? null;
+  }, [messages, currentMs]);
+  const nextMessageCountdown = nextMessagePlayerMs == null
+    ? null
+    : fmtMs(Math.ceil(Math.max(0, nextMessagePlayerMs - currentMs) / 1000) * 1000);
 
   useEffect(() => {
-    if (!following || !listRef.current) return;
-    listRef.current.scrollTop = listRef.current.scrollHeight;
-  }, [visible.length, following]);
-
-  function seekTo(message: SiteChatMessage) {
-    const video = videoRef.current;
-    if (!video) return;
-    video.currentTime = Math.max(0, message.timeline_offset_ms / 1000);
-    void video.play().catch(() => {});
-  }
-
-  function followCurrent() {
-    setFollowing(true);
-    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
-  }
-
-  function handleChatScroll() {
+    if (!following || smoothFollowRef.current) return;
     const node = listRef.current;
     if (!node) return;
-    const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
-    setFollowing(distance < 56);
-  }
-
-  async function openUserMenu(event: React.MouseEvent<HTMLElement>, message: SiteChatMessage) {
-    event.stopPropagation();
-    const width = 286;
-    const height = 230;
-    const x = Math.max(10, Math.min(event.clientX + 10, window.innerWidth - width - 10));
-    const y = Math.max(10, Math.min(event.clientY + 10, window.innerHeight - height - 10));
-    setUserMenu({ message, x, y });
-    setUserSummary(null);
-    setUserSummaryLoading(true);
-    summaryRequestRef.current?.abort();
-    const controller = new AbortController();
-    summaryRequestRef.current = controller;
-    try {
-      const params = new URLSearchParams();
-      if (message.chatter_external_id) params.set("chatter_external_id", message.chatter_external_id);
-      else if (message.chatter_login) params.set("chatter_login", message.chatter_login);
-      else {
-        setUserSummary({ event_id: eventId, message_count: 0 });
-        return;
-      }
-      const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/user-summary?${params.toString()}`), {
-        cache: "no-store",
-        signal: controller.signal,
+    let frame2 = 0;
+    const frame1 = window.requestAnimationFrame(() => {
+      node.scrollTop = node.scrollHeight;
+      frame2 = window.requestAnimationFrame(() => {
+        node.scrollTop = node.scrollHeight;
       });
-      if (!response.ok) throw new Error(await response.text());
-      setUserSummary(await response.json() as SiteChatUserSummary);
-    } catch (e) {
-      if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("chat user summary unavailable", e);
-    } finally {
-      if (!controller.signal.aborted) setUserSummaryLoading(false);
+    });
+    return () => {
+      window.cancelAnimationFrame(frame1);
+      if (frame2) window.cancelAnimationFrame(frame2);
+    };
+  }, [visible.length, messages, following]);
+
+  useEffect(() => () => {
+    if (smoothFollowTimerRef.current != null) window.clearTimeout(smoothFollowTimerRef.current);
+  }, []);
+
+  function cancelSmoothFollow() {
+    smoothFollowRef.current = false;
+    if (smoothFollowTimerRef.current != null) {
+      window.clearTimeout(smoothFollowTimerRef.current);
+      smoothFollowTimerRef.current = null;
     }
   }
 
-  const menuMessage = userMenu?.message;
-  const menuName = menuMessage?.chatter_name || menuMessage?.chatter_login || "Гость";
-  const menuLogin = menuMessage?.chatter_login || "";
-  const menuColor = safeChatColor(menuMessage?.color) || "#ff8a32";
-  const menuBadges = menuMessage ? chatBadges(menuMessage.badges, badgeAssets).slice(0, 4) : [];
+  function followCurrent() {
+    const node = listRef.current;
+    if (!node) return;
+    cancelSmoothFollow();
+    smoothFollowRef.current = true;
+    setFollowing(true);
+    node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
+    smoothFollowTimerRef.current = window.setTimeout(() => {
+      smoothFollowRef.current = false;
+      smoothFollowTimerRef.current = null;
+      const current = listRef.current;
+      if (current) current.scrollTop = current.scrollHeight;
+      setFollowing(true);
+    }, 450);
+  }
+
+  function handleChatScroll() {
+    if (smoothFollowRef.current) return;
+    if (visible.length === 0) {
+      setFollowing(true);
+      return;
+    }
+    const node = listRef.current;
+    if (!node) return;
+    const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+    setFollowing(distance <= 2);
+  }
+
+  function handleChatWheel(event: React.WheelEvent<HTMLDivElement>) {
+    if (event.deltaY < 0 && visible.length > 0) {
+      cancelSmoothFollow();
+      setFollowing(false);
+    }
+  }
+
+  function handleChatTouchMove() {
+    if (visible.length === 0) return;
+    cancelSmoothFollow();
+    setFollowing(false);
+  }
+
+  function handleChatKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (visible.length > 0 && ["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+      cancelSmoothFollow();
+      setFollowing(false);
+    }
+  }
+
+  function seekToNextMessage() {
+    if (nextMessagePlayerMs == null) return;
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = Math.max(0, nextMessagePlayerMs / 1000);
+    setCurrentMs(nextMessagePlayerMs);
+    setFollowing(true);
+  }
+
+  function openUserMenu(event: React.MouseEvent<HTMLElement>, message: SiteChatMessage) {
+    event.stopPropagation();
+    const position = chatUserMenuPosition(event.clientX, event.clientY);
+    setUserMenu({ user: message, ...position });
+  }
 
   return (
     <aside className="site-replay-chat">
       <div className="site-replay-chat-head">
-        <div>
-          <strong>Чат записи</strong>
-          <span>Синхронно с видео</span>
-        </div>
+        <div><strong>Чат записи</strong></div>
         <span>{chatStatus}</span>
       </div>
-      <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll}>
+      <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onTouchMove={handleChatTouchMove} onKeyDown={handleChatKeyDown} tabIndex={0}>
         {visible.length === 0 ? (
-          <div className="site-replay-chat-empty">{hasChat ? "В этой точке таймлайна сообщений пока нет." : "Для этого события чат не записан."}</div>
+          hasChat && nextMessagePlayerMs != null ? (
+            <button
+              className="site-replay-chat-empty is-seekable"
+              type="button"
+              onClick={seekToNextMessage}
+              title="Перейти к следующему сообщению"
+            >
+              Сообщения появятся через <strong>{nextMessageCountdown}</strong>
+            </button>
+          ) : (
+            <div className="site-replay-chat-empty">
+              {hasChat
+                ? (chatStatus === "Загрузка…" || chatStatus === "Синхронизация…" ? "Загрузка сообщений…" : "В доступной части записи сообщений больше нет.")
+                : "Для этого события чат не записан."}
+            </div>
+          )
         ) : visible.map((message) => {
           const badges = chatBadges(message.badges, badgeAssets);
           const reply = chatReplySummary(message.reply);
           const authorColor = safeChatColor(message.color);
-          const specialType = message.message_type && !["message", "action"].includes(message.message_type)
-            ? message.message_type
-            : null;
           const author = message.chatter_name || message.chatter_login || "Гость";
           return (
             <div className={`site-replay-chat-message${message.is_action ? " is-action" : ""}`} key={message.id}>
-              <button type="button" className="site-replay-chat-time" onClick={() => seekTo(message)}>{fmtMs(message.timeline_offset_ms)}</button>
               <div className="site-replay-chat-body">
                 {reply ? <div className="site-chat-reply" title={reply}>{reply}</div> : null}
                 <div className="site-chat-line">
@@ -1019,6 +1611,9 @@ function SiteReplayChat({
                       alt={badge.title}
                       title={badge.title}
                       loading="lazy"
+                      onLoad={() => {
+                        if (following && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+                      }}
                       key={badge.key}
                     />
                   ) : (
@@ -1031,13 +1626,12 @@ function SiteReplayChat({
                     type="button"
                     className="site-chat-author"
                     style={{ color: authorColor }}
-                    onClick={(event) => void openUserMenu(event, message)}
+                    onClick={(event) => openUserMenu(event, message)}
                     title={`Открыть профиль ${author}`}
                   >{author}</button>
                   {message.bits ? <span className="site-chat-bits">{message.bits.toLocaleString("ru-RU")} bits</span> : null}
-                  {specialType ? <span className="site-chat-type">{specialType}</span> : null}
                   <span className="site-chat-text" style={message.is_action && authorColor ? { color: authorColor } : undefined}>
-                    <ChatMessageFragments message={message} />
+                    <ChatMessageFragments message={message} onAssetLoad={() => { if (following && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }} />
                   </span>
                 </div>
               </div>
@@ -1045,57 +1639,19 @@ function SiteReplayChat({
           );
         })}
       </div>
-      {!following && hasChat ? (
+      {!following && visible.length > 0 ? (
         <button className="site-chat-follow" type="button" onClick={followCurrent}>↓ К текущему моменту</button>
       ) : null}
-      <div className="site-replay-chat-foot">Клик по времени — перемотка · клик по нику — профиль и статистика</div>
-
-      {userMenu && menuMessage ? (
-        <div
-          className="site-chat-user-menu"
-          ref={menuRef}
-          style={{ left: userMenu.x, top: userMenu.y }}
-          role="dialog"
-          aria-label={`Профиль ${menuName}`}
-        >
-          <div className="site-chat-user-head">
-            <div className="site-chat-user-avatar" style={{ background: menuColor }}>{menuName.slice(0, 1).toUpperCase()}</div>
-            <div className="site-chat-user-identity">
-              <strong style={{ color: menuColor }}>{menuName}</strong>
-              {menuLogin ? <span>@{menuLogin}</span> : <span>пользователь чата</span>}
-              {menuBadges.length > 0 ? (
-                <div className="site-chat-user-badges">
-                  {menuBadges.map((badge) => badge.imageUrl ? (
-                    <img key={badge.key} src={badge.imageUrl} alt={badge.title} title={badge.title} />
-                  ) : <span key={badge.key} title={badge.title}>{badge.label}</span>)}
-                </div>
-              ) : null}
-            </div>
-          </div>
-          <div className="site-chat-user-stat">
-            <span>Все сообщения</span>
-            <strong aria-label={userSummaryLoading ? "Загружается количество сообщений" : undefined}>
-              {userSummaryLoading ? <i className="site-inline-spinner" /> : (userSummary?.message_count ?? "—").toLocaleString("ru-RU")}
-            </strong>
-          </div>
-          {menuLogin ? (
-            <a className="site-chat-user-action" href={`https://www.twitch.tv/${encodeURIComponent(menuLogin)}`} target="_blank" rel="noreferrer">
-              <span>Посмотреть профиль</span><b>↗</b>
-            </a>
-          ) : (
-            <div className="site-chat-user-action is-disabled"><span>Посмотреть профиль</span><b>↗</b></div>
-          )}
-          <button
-            className="site-chat-user-action"
-            type="button"
-            onClick={() => {
-              onMention?.(`@${menuLogin || menuName}`);
-              setUserMenu(null);
-            }}
-          >
-            <span>Отметить в комментарии</span><b>@</b>
-          </button>
-        </div>
+      {userMenu ? (
+        <SiteChatUserContext
+          eventId={eventId}
+          user={userMenu.user}
+          x={userMenu.x}
+          y={userMenu.y}
+          onClose={() => setUserMenu(null)}
+          onMention={onMention}
+          videoRef={videoRef}
+        />
       ) : null}
     </aside>
   );
@@ -2087,6 +2643,8 @@ function App() {
                   eventId={selectedSiteEvent.id}
                   hasChat={selectedSiteEvent.has_chat}
                   totalMessages={selectedSiteEvent.chat_message_count || 0}
+                  videoRef={siteVideoRef}
+                  onMention={mentionSiteComment}
                 />
               </section>
 
@@ -2261,9 +2819,14 @@ function App() {
     const progress = videoProgressBySession[selectedVideo.id];
     const archiveReady = selectedVideo.storage_summary?.archive_ready?.segments || 0;
     const spoolPending = (selectedVideo.storage_summary?.spool?.segments || 0) + (selectedVideo.storage_summary?.copying?.segments || 0);
+    const eventDate = selectedVideo.event?.source_started_at_utc || selectedVideo.recording_started_at_utc || selectedVideo.created_at;
     return (
       <main>
-        <button className="link" onClick={() => setSelectedVideo(null)}>← {view === "video-manager" ? "Video Manager" : "Events"}</button>
+        <div className="video-manager-event-date">
+          <span>Дата проведения события</span>
+          <strong>{new Date(eventDate).toLocaleString("ru-RU")}</strong>
+        </div>
+        <button className="video-manager-back" onClick={() => setSelectedVideo(null)}>Назад</button>
         <header className="detail-header">
           <div>
             <h1>Video Manager · output</h1>
@@ -2489,7 +3052,9 @@ function App() {
       <header>
         <div>
           <h1>StreamHub</h1>
-          <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "video-manager" ? "Video sessions · Segments · Parts · Build Queue" : view === "site" ? "Публичный каталог · категории · опубликованные Events" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
+          {view !== "video-manager" && (
+            <p className="muted">{view === "trash" ? "Корзина sessions · сгруппировано по уникальному Event" : view === "site" ? "Публичный каталог · категории · опубликованные Events" : view === "storage" ? "Video output · spool batches · migration" : "Twitch Events · Chat + Video sessions"}</p>
+          )}
         </div>
         <div className="actions">
           <button className={view === "events" ? "active-tab" : ""} onClick={() => setView("events")}>Events</button>
@@ -2513,7 +3078,6 @@ function App() {
               return (
                 <article className="event-card" key={event.id}>
                   <button className="event-summary" onClick={() => toggleEvent(event.id)} aria-expanded={expanded}>
-                    <div className="event-chevron">{expanded ? "▼" : "▶"}</div>
                     <div className="event-main">
                       <div className="row"><strong>{event.channel_display_name || event.channel_login || "Twitch"}</strong><span className="event-type">{event.media_type.toUpperCase()}</span></div>
                       <div className="event-title">{event.title || (event.media_type === "vod" ? `VOD ${event.external_key.split(":").pop()}` : "LIVE stream")}</div>
@@ -2586,18 +3150,33 @@ function App() {
        ) : view === "site" ? null : view === "video-manager" ? (
         <section className="storage-panel video-manager-index">
           <div className="section-label">VIDEO SESSIONS</div>
-          <p className="muted">Открой session для Overview, Runs, Segments, Parts и durable Build Queue.</p>
           {videoSessions.length === 0 ? <div className="empty-child">Video sessions пока нет</div> : (
             <div className="video-manager-list">
               {videoSessions.map((session) => (
-                <div className="video-manager-session" key={session.id}>
+                <div
+                  className="video-manager-session is-clickable"
+                  key={session.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => void openVideoSession(session)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      void openVideoSession(session);
+                    }
+                  }}
+                >
                   <div className="video-manager-session-main">
+                    <div className="video-manager-index-event-date">
+                      <span>Дата проведения события</span>
+                      <strong>{new Date(session.event?.source_started_at_utc || session.recording_started_at_utc || session.created_at).toLocaleString("ru-RU")}</strong>
+                    </div>
                     <div className="row"><strong>{session.event?.channel_display_name || session.event?.channel_login || session.metadata?.channel_login || "Twitch"}</strong><span>{session.event?.media_type?.toUpperCase() || session.metadata?.media_type?.toUpperCase() || "VIDEO"}</span></div>
                     <div className="event-title">{session.event?.title || session.event?.external_key || session.id}</div>
                     <div className="session-status-line"><strong>{session.status}</strong><span>{session.completeness_status}</span><span>{session.segment_count || 0} seg</span><span>{fmtBytes(session.bytes || 0)}</span><span>{fmtMs(session.duration_recorded_ms)}</span></div>
                     <div className="muted small"><code>{session.id}</code></div>
                   </div>
-                  <div className="actions"><button onClick={() => openVideoSession(session)}>Открыть</button></div>
+                  <div className="actions"><button onClick={(event) => { event.stopPropagation(); void openVideoSession(session); }}>Открыть</button></div>
                 </div>
               ))}
             </div>

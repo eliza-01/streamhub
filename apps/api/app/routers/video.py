@@ -353,6 +353,18 @@ def video_progress_percent(row: VideoSession) -> float | None:
     return min(99.9, round((covered / row.required_end_ms) * 100.0, 1))
 
 
+def video_event_dict(event: MediaEvent) -> dict:
+    return {
+        "id": str(event.id),
+        "media_type": event.media_type,
+        "channel_login": event.channel_login,
+        "channel_display_name": event.channel_display_name,
+        "title": event.title,
+        "external_key": event.external_key,
+        "source_started_at_utc": event.source_started_at_utc,
+    }
+
+
 def video_session_dict(row: VideoSession) -> dict:
     return {
         "id": str(row.id),
@@ -587,6 +599,7 @@ async def get_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(ge
     row = await db.get(VideoSession, session_id)
     if row is None or row.deleted_at_utc is not None:
         raise HTTPException(404, "video session not found")
+    event = await db.get(MediaEvent, row.event_id)
     segment_count, total_bytes = (
         await db.execute(
             select(func.count(VideoSegment.id), func.coalesce(func.sum(VideoSegment.bytes), 0)).where(
@@ -620,6 +633,7 @@ async def get_video_session(session_id: uuid.UUID, db: AsyncSession = Depends(ge
         "output_subdir": output_subdir,
         "archive_relative_root": relative_root,
         "storage_summary": storage_summary,
+        "event": video_event_dict(event) if event is not None else None,
     }
 
 
@@ -740,14 +754,7 @@ async def list_video_sessions(
         data.update({
             "segment_count": segment_count,
             "bytes": total_bytes,
-            "event": {
-                "id": str(event.id),
-                "media_type": event.media_type,
-                "channel_login": event.channel_login,
-                "channel_display_name": event.channel_display_name,
-                "title": event.title,
-                "external_key": event.external_key,
-            },
+            "event": video_event_dict(event),
         })
         items.append(data)
     return {"items": items}

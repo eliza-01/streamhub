@@ -64,18 +64,28 @@ def test_site_feed_reuses_telegram_hls_playback_without_double_api_prefix():
     assert 'playlistUrl={`${API}${selectedSiteEvent.playback_url}`}' not in web
 
 
-def test_site_watch_exposes_persisted_chat_and_syncs_it_to_video_timeline():
+def test_site_watch_exposes_persisted_chat_and_syncs_it_through_source_timeline():
     route = _read("apps/api/app/routers/site.py")
     web = _read("apps/web/src/main.tsx")
 
     assert 'ChatMessage.timeline_offset_ms >= start' in route
     assert 'ChatMessage.timeline_offset_ms <= end' in route
+    assert '@router.get("/events/{event_id}/playback-timeline")' in route
+    assert '"source_start_ms"' in route
+    assert '"timeline_start_ms"' in route
+    assert '"mapping_quality"' in route
     assert '"primary_chat_session_id"' in route
     assert '"chat_message_count"' in route
     assert 'function SiteReplayChat(' in web
     assert '/chat/messages?' in web
-    assert 'message.timeline_offset_ms <= currentMs + 100' in web
-    assert 'video.currentTime = Math.max(0, message.timeline_offset_ms / 1000);' in web
+    assert '/playback-timeline' in web
+    assert 'playerToSourceMs(currentPlayer, ranges)' in web
+    assert 'sourceToPlayerMs(message.timeline_offset_ms, ranges)' in web
+    assert '(message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentMs + 100' in web
+    assert 'className="site-replay-chat-time"' not in web
+    assert '{message.player_offset_ms != null ? fmtMs(message.player_offset_ms) : "—"}' in web
+    assert 'message.player_offset_ms ?? message.timeline_offset_ms' not in web
+    assert 'video.currentTime = Math.max(0, message.timeline_offset_ms / 1000);' not in web
 
 
 def test_site_chat_reconstructs_vod_text_and_exposes_rich_presentation_fields():
@@ -146,6 +156,7 @@ def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
     assert 'Все сообщения' in web
     assert 'Посмотреть профиль' in web
     assert 'Отметить в комментарии' in web
+    assert '<span>Отметить в комментарии</span><b>@</b>' not in web
     assert '/chat/user-summary?' in web
     assert 'site-inline-spinner' in web
     assert 'className="site-chat-author"' in web
@@ -154,3 +165,62 @@ def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
     assert 'position: fixed;' in css
     assert '.streamvault-watch-layout' in css
     assert '.streamvault-recording-grid' in css
+
+
+def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
+    route = _read("apps/api/app/routers/site.py")
+    web = _read("apps/web/src/main.tsx")
+    css = _read("apps/web/src/styles.css")
+
+    assert '@router.get("/events/{event_id}/chat/user-messages")' in route
+    assert '@router.get("/events/{event_id}/chat/user-events")' in route
+    assert '"messages": [_chat_message_payload(row) for row in page]' in route
+    assert 'SiteEventPublication.event_id == MediaEvent.id' in route
+    assert 'ChatMessage.session_id.in_(session_ids)' in route
+    assert '"message_count": message_count' in route
+    assert '"badges": _chat_badges(profile_row) if profile_row else []' in route
+    assert 'ChatMessage.chatter_external_id.is_(None)' in route
+
+    assert 'function SiteChatUserContext(' in web
+    assert '/chat/user-messages?' in web
+    assert '/chat/user-events?' in web
+    assert '>Этот стрим</button>' in web
+    assert '<span>Другие</span>' in web
+    assert 'site-chat-history-tab-count' in web
+    assert 'siteChatOtherEventsCache' in web
+    assert 'siteChatOtherEventsCache.set(otherEventsCacheKey, items)' in web
+    assert 'site-chat-history-other-heading' not in web
+    assert 'value.toLowerCase() === "#000000" ? "#8b949e" : value' in web
+    assert 'Сообщений:' in web
+    assert 'Посмотреть профиль Twitch' in web
+    assert 'function TwitchIcon()' in web
+    assert 'onClick={(event) => openStatsUser(event, stats?.most_active)}' in web
+    assert 'onClick={(event) => openStatsUser(event, stats?.least_active)}' in web
+
+    assert 'onWheel={handleChatWheel}' in web
+    assert 'onTouchMove={handleChatTouchMove}' in web
+    assert 'setFollowing(distance <= 2)' in web
+    assert 'node.scrollTo({ top: node.scrollHeight, behavior: "smooth" })' in web
+    assert 'node.scrollTop = node.scrollHeight' in web
+    assert 'className="site-chat-follow"' in web
+    assert '!following && visible.length > 0' in web
+    assert 'Сообщения появятся через <strong>{nextMessageCountdown}</strong>' in web
+    assert 'fetchFirstFutureMessage' in web
+    assert 'page_size: "1"' in web
+    assert 'video.currentTime = Math.max(0, nextMessagePlayerMs / 1000)' in web
+    assert 'В этой точке таймлайна сообщений пока нет.' not in web
+    assert 'button.site-replay-chat-empty.is-seekable' in css
+    assert 'Клик по нику — профиль и история сообщений' not in web
+    assert 'className="event-chevron"' not in web
+    assert 'grid-template-columns: 24px minmax(0, 1fr) auto' not in css
+    assert '.site-chat-author { display: inline;' in css and 'cursor: pointer;' in css
+    assert 'site-chat-type' not in web
+    assert 'Срез всей записи' not in web
+    assert 'Нажми на пользователя, чтобы открыть профиль и историю сообщений' not in web
+    assert 'streamvault-chat-stat-user-name' in web
+
+    assert '.site-chat-history-modal' in css
+    assert '.site-chat-history-events' in css
+    assert '.site-chat-history-event' in css
+    assert '.site-twitch-icon' in css
+    assert 'left: 50%; bottom: 43px; transform: translateX(-50%)' in css

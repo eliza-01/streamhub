@@ -1,0 +1,137 @@
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index f4bbf8d..17890bb 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -782,6 +782,7 @@ function SiteChatUserContext({
+   const [historyTab, setHistoryTab] = useState<"current" | "other">("current");
+   const [otherEvents, setOtherEvents] = useState<SiteChatUserEvent[]>([]);
+   const [otherEventsLoading, setOtherEventsLoading] = useState(false);
++  const [otherEventsLoaded, setOtherEventsLoaded] = useState(false);
+   const [selectedOther, setSelectedOther] = useState<SiteChatUserEvent | null>(null);
+   const [historyMessages, setHistoryMessages] = useState<SiteChatMessage[]>([]);
+   const [historyLoading, setHistoryLoading] = useState(false);
+@@ -908,6 +909,7 @@ function SiteChatUserContext({
+   }
+ 
+   async function loadOtherEvents() {
++    if (otherEventsLoaded || otherEventsLoading) return;
+     setOtherEventsLoading(true);
+     setHistoryError("");
+     try {
+@@ -915,6 +917,7 @@ function SiteChatUserContext({
+       if (!response.ok) throw new Error(await response.text());
+       const payload = await response.json();
+       setOtherEvents((payload.items || []) as SiteChatUserEvent[]);
++      setOtherEventsLoaded(true);
+     } catch (e) {
+       setHistoryError(`Не удалось загрузить другие стримы: ${String(e)}`);
+     } finally {
+@@ -932,13 +935,13 @@ function SiteChatUserContext({
+     setHistoryMessages([]);
+     if (selectedOther) {
+       void loadHistoryMessages(selectedOther.event_id);
+-    } else {
++    } else if (!otherEventsLoaded) {
+       void loadOtherEvents();
+     }
+     return () => historyRequestRef.current?.abort();
+   // identityQuery is stable for the lifetime of the menu target.
+   // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, [messagesOpen, historyTab, selectedOther?.event_id, eventId, identityQuery]);
++  }, [messagesOpen, historyTab, selectedOther?.event_id, eventId, identityQuery, otherEventsLoaded, otherEventsLoading]);
+ 
+   useEffect(() => () => historyRequestRef.current?.abort(), []);
+ 
+@@ -999,7 +1002,7 @@ function SiteChatUserContext({
+             onClose();
+           }}
+         >
+-          <span>Отметить в комментарии</span><b>@</b>
++          <span>Отметить в комментарии</span>
+         </button>
+       </div>
+     ) : null}
+@@ -1023,9 +1026,11 @@ function SiteChatUserContext({
+             {historyError ? <div className="site-chat-history-error">{historyError}</div> : null}
+             {historyTab === "other" && !selectedOther ? (
+               <>
+-                <div className="site-chat-history-section-title">
+-                  <strong>Другие стримы</strong>
+-                  <span>{otherEvents.length.toLocaleString("ru-RU")}</span>
++                <div className="site-chat-history-stream-heading site-chat-history-other-heading">
++                  <div>
++                    <strong>Другие стримы</strong>
++                  </div>
++                  <b>{otherEventsLoading ? "…" : otherEvents.length.toLocaleString("ru-RU")}</b>
+                 </div>
+                 {otherEventsLoading ? <div className="site-chat-history-loading"><i className="site-inline-spinner" /></div> : null}
+                 {!otherEventsLoading && otherEvents.length === 0 ? <div className="site-chat-history-empty">В других опубликованных стримах сообщений нет.</div> : null}
+@@ -1043,12 +1048,11 @@ function SiteChatUserContext({
+                 <div className="site-chat-history-stream-context">
+                   {historyTab === "other" ? (
+                     <div className="site-chat-history-back-row">
+-                      <button className="site-chat-history-back" type="button" onClick={() => setSelectedOther(null)}><span aria-hidden="true">←</span> Другие стримы</button>
++                      <button className="site-chat-history-back" type="button" onClick={() => setSelectedOther(null)}>Назад</button>
+                     </div>
+                   ) : null}
+                   <div className="site-chat-history-stream-heading">
+                     <div>
+-                      <span>СООБЩЕНИЯ В СТРИМЕ</span>
+                       <strong>{targetTitle}</strong>
+                     </div>
+                     <b>{historyLoading ? "…" : `${historyMessages.length.toLocaleString("ru-RU")} сообщений`}</b>
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 17082bc..9262fa0 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -539,13 +539,8 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-history-tabs button:hover { color: #dce2e7; background: #131a21; }
+ .site-chat-history-tabs button.active { border-color: rgba(255,120,24,.22); background: rgba(255,120,24,.13); color: var(--sv-orange-2, #ff9b37); }
+ .site-chat-history-content { min-height: 0; overflow-y: auto; padding: 14px; scrollbar-width: thin; scrollbar-color: #33404d transparent; }
+-.site-chat-history-section-title { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
+-.site-chat-history-section-title > div { min-width: 0; display: grid; gap: 3px; }
+-.site-chat-history-section-title strong { font-size: 13px; }
+-.site-chat-history-section-title > span { color: #6f7a84; font-size: 10px; white-space: nowrap; }
+ .site-chat-history-back { width: max-content; min-height: 29px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid #2a3540; border-radius: 8px; background: #121920; color: #aeb7bf; padding: 0 10px; font-size: 10px; font-weight: 800; cursor: pointer; transition: border-color .12s ease, background .12s ease, color .12s ease, transform .12s ease; }
+ .site-chat-history-back:hover { border-color: rgba(255,120,24,.52); background: rgba(255,120,24,.09); color: var(--sv-orange-2, #ff9b37); transform: translateX(-1px); }
+-.site-chat-history-back span { font-size: 13px; line-height: 1; }
+ .site-chat-history-stream-context { display: grid; gap: 14px; margin-bottom: 14px; }
+ .site-chat-history-back-row { display: flex; align-items: center; min-height: 30px; }
+ .site-chat-history-stream-heading { min-width: 0; display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; padding: 13px 14px; border: 1px solid #202a33; border-radius: 11px; background: #11181f; }
+@@ -553,6 +548,7 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-history-stream-heading span { color: #697681; font-size: 8px; font-weight: 900; letter-spacing: .09em; }
+ .site-chat-history-stream-heading strong { overflow: hidden; color: #edf1f4; font-size: 13px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+ .site-chat-history-stream-heading > b { flex: 0 0 auto; min-height: 24px; display: inline-flex; align-items: center; border: 1px solid rgba(255,120,24,.22); border-radius: 999px; background: rgba(255,120,24,.08); color: var(--sv-orange-2, #ff9b37); padding: 0 9px; font-size: 9px; font-weight: 850; font-variant-numeric: tabular-nums; white-space: nowrap; }
++.site-chat-history-other-heading { margin-bottom: 10px; }
+ .site-chat-history-events { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+ .site-chat-history-event { min-height: 104px; display: grid; grid-template-rows: 1fr auto; overflow: hidden; border: 1px solid #202a33; border-radius: 12px; background: #11181f; color: #edf1f4; padding: 0; text-align: left; cursor: pointer; }
+ .site-chat-history-event:hover { border-color: rgba(255,120,24,.58); transform: translateY(-1px); }
+diff --git a/tests/test_repo_guards.py b/tests/test_repo_guards.py
+index cf0bac8..3f28d93 100644
+--- a/tests/test_repo_guards.py
++++ b/tests/test_repo_guards.py
+@@ -200,7 +200,11 @@ def test_chat_ui_has_flat_context_actions_and_clean_history_header():
+     assert "Посмотреть профиль Twitch</span><b>↗</b>" not in web
+     assert '<i aria-hidden="true">↗</i>' not in web
+     assert "site-chat-history-stream-context" in web
+-    assert "СООБЩЕНИЯ В СТРИМЕ" in web
++    assert "otherEventsLoaded" in web
++    assert "else if (!otherEventsLoaded)" in web
++    assert "site-chat-history-section-title" not in web
++    assert ">Назад</button>" in web
++    assert "СООБЩЕНИЯ В СТРИМЕ" not in web
+     assert "border-radius: 0; box-shadow: inset 0 -1px #1b242c" in css
+     assert "border-right-color: var(--sv-line-soft)" in css
+ 
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+index b2f5961..2b5e77a 100644
+--- a/tests/test_site_catalog.py
++++ b/tests/test_site_catalog.py
+@@ -156,6 +156,7 @@ def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
+     assert 'Все сообщения' in web
+     assert 'Посмотреть профиль' in web
+     assert 'Отметить в комментарии' in web
++    assert '<span>Отметить в комментарии</span><b>@</b>' not in web
+     assert '/chat/user-summary?' in web
+     assert 'site-inline-spinner' in web
+     assert 'className="site-chat-author"' in web

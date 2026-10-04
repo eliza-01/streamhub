@@ -1,0 +1,13 @@
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -653,7 +653,9 @@
+       }
+       const record = asChatRecord(item);
+       if (!record) return;
+-      push(record.setID ?? record.setId ?? record.set_id ?? record.name, record.version ?? record.id, record.id ?? index);
++      const setId = record.setID ?? record.setId ?? record.set_id ?? record.name;
++      const version = record.version ?? record.id;
++      push(setId, version, `${String(setId || "badge")}/${String(version || "")}:${index}`);
+     });
+   } else {
+     const record = asChatRecord(value);

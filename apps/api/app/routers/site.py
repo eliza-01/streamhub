@@ -23,6 +23,9 @@ from streamhub_common.models import (
     SiteEventPublication,
     TelegramVideoPartBinding,
     VideoPart,
+    VideoPartSegment,
+    VideoRun,
+    VideoSegment,
     VideoSession,
 )
 
@@ -348,6 +351,176 @@ async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
     return (await _site_payloads(db, [row]))[0]
 
 
+def _naive_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _clock_offset_ms(value: datetime | None, origin: datetime | None) -> int | None:
+    value_naive = _naive_utc(value)
+    origin_naive = _naive_utc(origin)
+    if value_naive is None or origin_naive is None:
+        return None
+    return max(0, int(round((value_naive - origin_naive).total_seconds() * 1000)))
+
+
+def _merge_timeline_range(
+    ranges: list[dict],
+    *,
+    run_no: int,
+    segment_no: int,
+    timeline_start_ms: int,
+    timeline_end_ms: int,
+    source_start_ms: int,
+    source_end_ms: int,
+    mapping_source: str,
+) -> None:
+    previous = ranges[-1] if ranges else None
+    contiguous = bool(
+        previous
+        and previous["run_no"] == run_no
+        and previous["mapping_source"] == mapping_source
+        and abs(timeline_start_ms - previous["timeline_end_ms"]) <= 2500
+        and abs(source_start_ms - previous["source_end_ms"]) <= 2500
+    )
+    if contiguous:
+        previous["timeline_end_ms"] = timeline_end_ms
+        previous["source_end_ms"] = source_end_ms
+        previous["last_segment_no"] = segment_no
+        return
+    ranges.append(
+        {
+            "run_no": run_no,
+            "first_segment_no": segment_no,
+            "last_segment_no": segment_no,
+            "timeline_start_ms": timeline_start_ms,
+            "timeline_end_ms": timeline_end_ms,
+            "source_start_ms": source_start_ms,
+            "source_end_ms": source_end_ms,
+            "mapping_source": mapping_source,
+        }
+    )
+
+
+@router.get("/events/{event_id}/playback-timeline")
+async def site_event_playback_timeline(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    publication_row = await _published_event_row(db, event_id)
+    if publication_row is None:
+        raise HTTPException(404, "site event not found")
+    _publication, event = publication_row
+
+    video_summaries = (await _video_summaries(db, [event_id])).get(event_id, [])
+    primary = next((item for item in video_summaries if item["playable"]), None)
+    if primary is None:
+        return {
+            "event_id": str(event_id),
+            "video_session_id": None,
+            "synchronized": False,
+            "mapping_quality": "unavailable",
+            "ranges": [],
+        }
+
+    session_id = uuid.UUID(primary["id"])
+    # Playback is built only from Telegram-linked ready part segments. Its
+    # browser currentTime starts at zero for the first linked segment, which is
+    # not necessarily the same as VideoSegment.timeline_start_ms when only a
+    # slice of a recording has been uploaded. Build the map against the exact
+    # same segment set and cumulative durations as the Telegram HLS playlist.
+    rows = (
+        await db.execute(
+            select(VideoSegment, VideoRun)
+            .join(VideoRun, VideoRun.id == VideoSegment.video_run_id)
+            .join(VideoPartSegment, VideoPartSegment.segment_id == VideoSegment.id)
+            .join(VideoPart, VideoPart.id == VideoPartSegment.part_id)
+            .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
+            .where(
+                VideoPart.video_session_id == session_id,
+                VideoPart.status == "ready",
+            )
+            .order_by(VideoSegment.segment_no, VideoPart.part_no)
+        )
+    ).all()
+    if not rows:
+        return {
+            "event_id": str(event_id),
+            "video_session_id": str(session_id),
+            "synchronized": False,
+            "mapping_quality": "unavailable",
+            "ranges": [],
+        }
+
+    run_first_rows = (
+        await db.execute(
+            select(VideoSegment.video_run_id, func.min(VideoSegment.timeline_start_ms))
+            .where(VideoSegment.video_session_id == session_id)
+            .group_by(VideoSegment.video_run_id)
+        )
+    ).all()
+    first_timeline_by_run = {int(run_id): int(first_ms) for run_id, first_ms in run_first_rows}
+
+    ranges: list[dict] = []
+    mapping_sources: set[str] = set()
+    seen_segments: set[int] = set()
+    player_cursor = 0
+    for segment, run in rows:
+        if int(segment.id) in seen_segments:
+            continue
+        seen_segments.add(int(segment.id))
+        original_timeline_start = int(segment.timeline_start_ms)
+        duration = max(0, int(segment.duration_ms))
+        timeline_start = player_cursor
+        timeline_end = timeline_start + duration
+        player_cursor = timeline_end
+        source_start = int(segment.source_media_start_ms) if segment.source_media_start_ms is not None else None
+        source_end = int(segment.source_media_end_ms) if segment.source_media_end_ms is not None else None
+        mapping_source = "segment_source"
+
+        if source_start is None or source_end is None:
+            if event.media_type == "vod":
+                source_start = original_timeline_start
+                source_end = source_start + duration
+                mapping_source = "vod_timeline"
+            else:
+                run_source_start = _clock_offset_ms(run.started_at_utc, event.source_started_at_utc)
+                if run_source_start is None:
+                    continue
+                run_timeline_start = first_timeline_by_run.get(int(run.id), original_timeline_start)
+                source_start = max(0, run_source_start + original_timeline_start - run_timeline_start)
+                source_end = source_start + duration
+                mapping_source = "run_clock_fallback"
+
+        mapping_sources.add(mapping_source)
+        _merge_timeline_range(
+            ranges,
+            run_no=int(run.run_no),
+            segment_no=int(segment.segment_no),
+            timeline_start_ms=timeline_start,
+            timeline_end_ms=timeline_end,
+            source_start_ms=source_start,
+            source_end_ms=source_end,
+            mapping_source=mapping_source,
+        )
+
+    if not ranges:
+        quality = "unavailable"
+    elif mapping_sources == {"run_clock_fallback"}:
+        quality = "approximate"
+    elif "run_clock_fallback" in mapping_sources:
+        quality = "mixed"
+    else:
+        quality = "exact"
+    return {
+        "event_id": str(event_id),
+        "video_session_id": str(session_id),
+        "synchronized": bool(ranges),
+        "mapping_quality": quality,
+        "ranges": ranges,
+    }
+
+
 def _chat_fragments(row: ChatMessage) -> list[dict]:
     value = row.fragments_json
     if isinstance(value, list):
@@ -394,6 +567,50 @@ def _chat_badges(row: ChatMessage):
         return row.badges_json
     raw_message = _chat_raw_message(row)
     return raw_message.get("userBadges") or raw_message.get("badges") or []
+
+
+def _chat_message_payload(row: ChatMessage) -> dict:
+    return {
+        "id": int(row.id),
+        "timeline_offset_ms": int(row.timeline_offset_ms),
+        "chatter_external_id": row.chatter_external_id,
+        "chatter_login": row.chatter_login,
+        "chatter_name": row.chatter_name,
+        "color": _chat_color(row),
+        "badges": _chat_badges(row),
+        "message_text": _chat_message_text(row),
+        "fragments": _chat_fragments(row),
+        "reply": row.reply_json,
+        "bits": row.bits,
+        "message_type": row.message_type,
+        "is_action": bool(row.is_action),
+        "source_kind": row.source_kind,
+        "provider_message_id": row.provider_message_id,
+        "channel_points_reward_id": row.channel_points_reward_id,
+    }
+
+
+def _chat_identity(
+    chatter_external_id: str | None,
+    chatter_login: str | None,
+):
+    external_id = str(chatter_external_id or "").strip()
+    login = str(chatter_login or "").strip()
+    if not external_id and not login:
+        raise HTTPException(400, "chatter_external_id or chatter_login is required")
+    if external_id and login:
+        condition = or_(
+            ChatMessage.chatter_external_id == external_id,
+            and_(
+                ChatMessage.chatter_external_id.is_(None),
+                func.lower(ChatMessage.chatter_login) == login.lower(),
+            ),
+        )
+    elif external_id:
+        condition = ChatMessage.chatter_external_id == external_id
+    else:
+        condition = func.lower(ChatMessage.chatter_login) == login.lower()
+    return external_id, login, condition
 
 
 @router.get("/events/{event_id}/chat/badges")
@@ -505,27 +722,7 @@ async def site_event_chat_messages(
         "chat_session_id": str(session.id),
         "from_ms": start,
         "to_ms": end,
-        "messages": [
-            {
-                "id": int(row.id),
-                "timeline_offset_ms": int(row.timeline_offset_ms),
-                "chatter_external_id": row.chatter_external_id,
-                "chatter_login": row.chatter_login,
-                "chatter_name": row.chatter_name,
-                "color": _chat_color(row),
-                "badges": _chat_badges(row),
-                "message_text": _chat_message_text(row),
-                "fragments": _chat_fragments(row),
-                "reply": row.reply_json,
-                "bits": row.bits,
-                "message_type": row.message_type,
-                "is_action": bool(row.is_action),
-                "source_kind": row.source_kind,
-                "provider_message_id": row.provider_message_id,
-                "channel_points_reward_id": row.channel_points_reward_id,
-            }
-            for row in page
-        ],
+        "messages": [_chat_message_payload(row) for row in page],
         "has_more": has_more,
         "next_cursor": next_cursor,
     }
@@ -615,10 +812,7 @@ async def site_event_chat_user_summary(
     if await db.get(SiteEventPublication, event_id) is None:
         raise HTTPException(404, "site event not found")
 
-    external_id = str(chatter_external_id or "").strip()
-    login = str(chatter_login or "").strip()
-    if not external_id and not login:
-        raise HTTPException(400, "chatter_external_id or chatter_login is required")
+    external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
 
     primary = await _primary_chat_session(db, event_id)
     if primary is None:
@@ -633,11 +827,6 @@ async def site_event_chat_user_summary(
         }
 
     session, _message_count = primary
-    identity = (
-        ChatMessage.chatter_external_id == external_id
-        if external_id
-        else func.lower(ChatMessage.chatter_login) == login.lower()
-    )
     count_row = (
         await db.execute(
             select(
@@ -652,14 +841,166 @@ async def site_event_chat_user_summary(
         )
     ).one()
     count, first_ms, last_ms = count_row
+    profile_row = (
+        await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.session_id == session.id,
+                ChatMessage.is_deleted.is_(False),
+                identity,
+            )
+            .order_by(ChatMessage.timeline_offset_ms.desc(), ChatMessage.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    return {
+        "event_id": str(event_id),
+        "chat_session_id": str(session.id),
+        "chatter_external_id": (profile_row.chatter_external_id if profile_row else None) or external_id or None,
+        "chatter_login": (profile_row.chatter_login if profile_row else None) or login or None,
+        "chatter_name": profile_row.chatter_name if profile_row else None,
+        "color": _chat_color(profile_row) if profile_row else None,
+        "badges": _chat_badges(profile_row) if profile_row else [],
+        "message_count": int(count or 0),
+        "first_message_ms": int(first_ms) if first_ms is not None else None,
+        "last_message_ms": int(last_ms) if last_ms is not None else None,
+    }
+
+
+@router.get("/events/{event_id}/chat/user-messages")
+async def site_event_chat_user_messages(
+    event_id: uuid.UUID,
+    chatter_external_id: str | None = Query(default=None, max_length=64),
+    chatter_login: str | None = Query(default=None, max_length=255),
+    after_ms: int | None = Query(default=None, ge=0),
+    after_id: int = Query(default=0, ge=0),
+    page_size: int = Query(default=500, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if await db.get(SiteEventPublication, event_id) is None:
+        raise HTTPException(404, "site event not found")
+
+    external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
+    primary = await _primary_chat_session(db, event_id)
+    if primary is None:
+        return {
+            "event_id": str(event_id),
+            "chat_session_id": None,
+            "chatter_external_id": external_id or None,
+            "chatter_login": login or None,
+            "messages": [],
+            "has_more": False,
+            "next_cursor": None,
+        }
+
+    session, _message_count = primary
+    conditions = [
+        ChatMessage.session_id == session.id,
+        ChatMessage.is_deleted.is_(False),
+        identity,
+    ]
+    if after_ms is not None:
+        cursor_ms = max(0, int(after_ms))
+        conditions.append(
+            or_(
+                ChatMessage.timeline_offset_ms > cursor_ms,
+                and_(ChatMessage.timeline_offset_ms == cursor_ms, ChatMessage.id > max(0, int(after_id))),
+            )
+        )
+
+    rows = (
+        await db.execute(
+            select(ChatMessage)
+            .where(*conditions)
+            .order_by(ChatMessage.timeline_offset_ms, ChatMessage.id)
+            .limit(page_size + 1)
+        )
+    ).scalars().all()
+    has_more = len(rows) > page_size
+    page = rows[:page_size]
+    next_cursor = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = {"time_ms": int(last.timeline_offset_ms), "id": int(last.id)}
+
     return {
         "event_id": str(event_id),
         "chat_session_id": str(session.id),
         "chatter_external_id": external_id or None,
         "chatter_login": login or None,
-        "message_count": int(count or 0),
-        "first_message_ms": int(first_ms) if first_ms is not None else None,
-        "last_message_ms": int(last_ms) if last_ms is not None else None,
+        "messages": [_chat_message_payload(row) for row in page],
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
+
+
+@router.get("/events/{event_id}/chat/user-events")
+async def site_event_chat_user_events(
+    event_id: uuid.UUID,
+    chatter_external_id: str | None = Query(default=None, max_length=64),
+    chatter_login: str | None = Query(default=None, max_length=255),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if await db.get(SiteEventPublication, event_id) is None:
+        raise HTTPException(404, "site event not found")
+
+    external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
+    events = (
+        await db.execute(
+            select(MediaEvent)
+            .join(SiteEventPublication, SiteEventPublication.event_id == MediaEvent.id)
+            .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
+        )
+    ).scalars().all()
+    event_ids = [event.id for event in events]
+    summaries = await _chat_summaries(db, event_ids)
+
+    primary_session_by_event: dict[uuid.UUID, uuid.UUID] = {}
+    for published_event in events:
+        event_sessions = summaries.get(published_event.id) or []
+        if event_sessions:
+            primary_session_by_event[published_event.id] = uuid.UUID(str(event_sessions[0]["id"]))
+
+    session_ids = list(primary_session_by_event.values())
+    counts_by_session: dict[uuid.UUID, int] = {}
+    if session_ids:
+        count_rows = (
+            await db.execute(
+                select(ChatMessage.session_id, func.count(ChatMessage.id))
+                .where(
+                    ChatMessage.session_id.in_(session_ids),
+                    ChatMessage.is_deleted.is_(False),
+                    identity,
+                )
+                .group_by(ChatMessage.session_id)
+            )
+        ).all()
+        counts_by_session = {session_id: int(count or 0) for session_id, count in count_rows}
+
+    items = []
+    for published_event in events:
+        if published_event.id == event_id:
+            continue
+        session_id = primary_session_by_event.get(published_event.id)
+        message_count = counts_by_session.get(session_id, 0) if session_id else 0
+        if message_count <= 0:
+            continue
+        items.append(
+            {
+                "event_id": str(published_event.id),
+                "title": _event_title(published_event),
+                "channel_login": published_event.channel_login,
+                "channel_display_name": published_event.channel_display_name,
+                "source_started_at_utc": published_event.source_started_at_utc,
+                "message_count": message_count,
+            }
+        )
+
+    return {
+        "event_id": str(event_id),
+        "chatter_external_id": external_id or None,
+        "chatter_login": login or None,
+        "items": items,
     }
 
 

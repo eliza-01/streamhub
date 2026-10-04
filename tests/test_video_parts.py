@@ -147,3 +147,17 @@ def test_video_part_target_default_is_1990_and_builder_workers_survive_claim_err
     assert 'storedPositiveInt(PART_TARGET_MIB_KEY, 1990)' in web
     assert 'part queue claim failed worker=%s; retrying' in builder
     assert '"workers_alive": workers_alive' in builder
+
+
+def test_video_manager_shows_event_date_and_opens_session_from_whole_row():
+    root = Path(__file__).resolve().parents[1]
+    web = (root / "apps/web/src/main.tsx").read_text()
+    styles = (root / "apps/web/src/styles.css").read_text()
+    api = (root / "apps/api/app/routers/video.py").read_text()
+
+    assert '"source_started_at_utc": event.source_started_at_utc' in api
+    assert '"event": video_event_dict(event)' in api
+    assert "Дата проведения события" in web
+    assert 'className="video-manager-session is-clickable"' in web
+    assert 'onClick={() => void openVideoSession(session)}' in web
+    assert "video-manager-event-date" in styles

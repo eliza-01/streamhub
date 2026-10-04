@@ -5,6 +5,8 @@ let activeTabId = null;
 let currentEventId = null;
 let activeChatSession = null;
 let activeVideoSession = null;
+let authRequestActive = false;
+let actionInFlight = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -12,6 +14,20 @@ function showMessage(text) {
   const el = $("message");
   el.textContent = text;
   el.classList.toggle("show", Boolean(text));
+}
+
+function bindAction(id, handler) {
+  $(id).addEventListener("click", async () => {
+    if (actionInFlight || authRequestActive) return;
+    actionInFlight = id;
+    render();
+    try {
+      await handler();
+    } finally {
+      actionInFlight = null;
+      render();
+    }
+  });
 }
 
 async function getState() {
@@ -32,12 +48,31 @@ async function getState() {
   return next;
 }
 
-async function api(path, init = {}) {
+function isTwitchAuthorizationError(value) {
+  const text = String(value || "").toLowerCase();
+  return [
+    "twitch authorization is missing",
+    "twitch authorization expired",
+    "was revoked; authorize twitch again",
+    "authorization lacks user:read:chat",
+    "authorize twitch in the extension first",
+    "authorize twitch again",
+    "twitch irc authentication failed"
+  ].some((needle) => text.includes(needle));
+}
+
+async function api(path, init = {}, options = {}) {
   const response = await fetch(`${state.apiBaseUrl}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init.headers || {}) }
   });
-  if (!response.ok) throw new Error(`${response.status}: ${(await response.text()).slice(0, 500)}`);
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 500);
+    if (options.autoAuthorize !== false && isTwitchAuthorizationError(body)) {
+      void startTwitchAuthorization({ automatic: true });
+    }
+    throw new Error(`${response.status}: ${body}`);
+  }
   return response.json();
 }
 
@@ -54,12 +89,27 @@ async function persistActiveChatSession(activeSession) {
 
 function render() {
   const supported = Boolean(context?.supported && context?.player_open);
-  $("status").textContent = context?.supported
+  const chatWriting = Boolean(activeChatSession && ["arming", "recording", "reconciling"].includes(activeChatSession.status));
+  const videoWriting = Boolean(activeVideoSession && ["arming", "recording", "reconnecting"].includes(activeVideoSession.status));
+  const partialCapture = chatWriting !== videoWriting;
+  const missingCapture = chatWriting ? "Video не пишется" : videoWriting ? "Chat не пишется" : null;
+  const statusText = context?.supported
     ? `${context.mode?.toUpperCase()} · player ${context.player_open ? "open" : "closed"}`
     : "Неподдерживаемая страница Twitch";
+  $("status").textContent = partialCapture && missingCapture
+    ? `${statusText}\n⚠ ${missingCapture}`
+    : statusText;
+  $("status").classList.toggle("capture-warning", partialCapture);
 
-  $("chat-toggle").checked = Boolean(state?.captureChatEnabled);
-  $("video-toggle").checked = Boolean(state?.captureVideoEnabled);
+  const uiBusy = Boolean(actionInFlight || authRequestActive);
+  $("controls").disabled = uiBusy;
+  $("controls").setAttribute("aria-busy", String(uiBusy));
+  document.querySelector("main")?.classList.toggle("is-busy", uiBusy);
+
+  $("chat-toggle").checked = Boolean(activeChatSession || state?.captureChatEnabled);
+  $("video-toggle").checked = Boolean(activeVideoSession || state?.captureVideoEnabled);
+  $("chat-toggle").disabled = Boolean(activeChatSession);
+  $("video-toggle").disabled = Boolean(activeVideoSession);
 
   const parts = [
     context?.channel_login ? `channel: ${context.channel_login}` : null,
@@ -77,8 +127,9 @@ function render() {
     (state?.captureVideoEnabled && !activeVideoSession)
   );
   $("start").disabled = !supported || !selectedAny || !selectedNeedStart;
-  $("pause-chat").disabled = !activeChatSession;
-  $("resume-chat").disabled = !activeChatSession;
+  const chatStatus = activeChatSession?.status || null;
+  $("pause-chat").disabled = !activeChatSession || chatStatus === "paused";
+  $("resume-chat").disabled = !activeChatSession || chatStatus !== "paused";
   $("stop-chat").disabled = !activeChatSession;
   const videoStatus = activeVideoSession?.status || null;
   $("pause-video").disabled = !activeVideoSession || videoStatus === "paused";
@@ -163,7 +214,7 @@ $("video-toggle").addEventListener("change", async (event) => {
   render();
 });
 
-$("start").addEventListener("click", async () => {
+bindAction("start", async () => {
   showMessage("");
   try {
     await syncCurrentCaptureStatus({ silent: true });
@@ -193,13 +244,15 @@ $("start").addEventListener("click", async () => {
     const result = await api("/api/v1/capture/start", { method: "POST", body: JSON.stringify(payload) });
     currentEventId = result.event?.id || currentEventId;
     showMessage(`${modeLine("Chat", result.chat)}\n${modeLine("Video", result.video)}`);
+    const authError = [result.chat?.error, result.video?.error].find(isTwitchAuthorizationError);
+    if (authError) void startTwitchAuthorization({ automatic: true });
     await syncCurrentCaptureStatus({ silent: true });
   } catch (e) {
     showMessage(`Ошибка Start: ${e}`);
   }
 });
 
-$("pause-chat").addEventListener("click", async () => {
+bindAction("pause-chat", async () => {
   try {
     await syncCurrentCaptureStatus({ silent: true });
     if (!activeChatSession) throw new Error("для текущего события активного Chat нет");
@@ -209,7 +262,7 @@ $("pause-chat").addEventListener("click", async () => {
   } catch (e) { showMessage(`Ошибка Chat Pause: ${e}`); }
 });
 
-$("resume-chat").addEventListener("click", async () => {
+bindAction("resume-chat", async () => {
   try {
     await syncCurrentCaptureStatus({ silent: true });
     if (!activeChatSession) throw new Error("для текущего события активного Chat нет");
@@ -227,7 +280,7 @@ $("resume-chat").addEventListener("click", async () => {
   } catch (e) { showMessage(`Ошибка Chat Resume: ${e}`); }
 });
 
-$("stop-chat").addEventListener("click", async () => {
+bindAction("stop-chat", async () => {
   if (!confirm("Остановить только Chat? Video продолжит запись, если он активен.")) return;
   try {
     await syncCurrentCaptureStatus({ silent: true });
@@ -243,7 +296,7 @@ $("stop-chat").addEventListener("click", async () => {
   } catch (e) { showMessage(`Ошибка Stop Chat: ${e}`); }
 });
 
-$("pause-video").addEventListener("click", async () => {
+bindAction("pause-video", async () => {
   try {
     await syncCurrentCaptureStatus({ silent: true });
     if (!activeVideoSession) throw new Error("для текущего события активного Video нет");
@@ -253,7 +306,7 @@ $("pause-video").addEventListener("click", async () => {
   } catch (e) { showMessage(`Ошибка Video Pause: ${e}`); }
 });
 
-$("resume-video").addEventListener("click", async () => {
+bindAction("resume-video", async () => {
   try {
     await syncCurrentCaptureStatus({ silent: true });
     if (!activeVideoSession) throw new Error("для текущего события активного Video нет");
@@ -263,7 +316,7 @@ $("resume-video").addEventListener("click", async () => {
   } catch (e) { showMessage(`Ошибка Video Resume: ${e}`); }
 });
 
-$("stop-video").addEventListener("click", async () => {
+bindAction("stop-video", async () => {
   if (!confirm("Остановить только Video? Chat продолжит сбор, если он активен.")) return;
   try {
     await syncCurrentCaptureStatus({ silent: true });
@@ -277,7 +330,7 @@ $("stop-video").addEventListener("click", async () => {
   } catch (e) { showMessage(`Ошибка Stop Video: ${e}`); }
 });
 
-$("stop-all").addEventListener("click", async () => {
+bindAction("stop-all", async () => {
   if (!confirm("Остановить Chat и Video текущего события?")) return;
   try {
     await syncCurrentCaptureStatus({ silent: true });
@@ -291,27 +344,54 @@ $("stop-all").addEventListener("click", async () => {
   } catch (e) { showMessage(`Ошибка Stop All: ${e}`); }
 });
 
-$("auth").addEventListener("click", async () => {
+async function startTwitchAuthorization({ automatic = false } = {}) {
+  if (authRequestActive || (actionInFlight && !automatic)) return;
+  authRequestActive = true;
+  render();
   try {
-    const result = await api("/api/v1/auth/twitch/device/start", { method: "POST", body: "{}" });
+    const result = await api(
+      "/api/v1/auth/twitch/device/start",
+      { method: "POST", body: "{}" },
+      { autoAuthorize: false }
+    );
     if (result.verification_uri) await chrome.tabs.create({ url: result.verification_uri });
-    showMessage(`Код Twitch: ${result.user_code || "—"}\nОжидаю подтверждение…`);
+    showMessage(`${automatic ? "⚠ Требуется повторная авторизация Twitch.\n" : ""}Код Twitch: ${result.user_code || "—"}\nОжидаю подтверждение…`);
     clearInterval(pollTimer);
     pollTimer = setInterval(async () => {
       try {
-        const status = await api(`/api/v1/auth/twitch/device/${result.auth_request_id}`);
+        const status = await api(
+          `/api/v1/auth/twitch/device/${result.auth_request_id}`,
+          {},
+          { autoAuthorize: false }
+        );
         if (status.status === "authorized") {
           clearInterval(pollTimer);
+          authRequestActive = false;
+          render();
           showMessage(`Twitch авторизован: ${status.identity?.login || "ok"}`);
+          await syncCurrentCaptureStatus({ silent: true });
         } else if (["failed", "expired"].includes(status.status)) {
           clearInterval(pollTimer);
+          authRequestActive = false;
+          render();
           showMessage(`Авторизация: ${status.status}${status.error ? ` — ${status.error}` : ""}`);
         }
       } catch (e) {
+        clearInterval(pollTimer);
+        authRequestActive = false;
+        render();
         showMessage(`Ошибка проверки авторизации: ${e}`);
       }
     }, Math.max(3000, Number(result.interval || 5) * 1000));
-  } catch (e) { showMessage(`Ошибка авторизации: ${e}`); }
+  } catch (e) {
+    authRequestActive = false;
+    render();
+    showMessage(`Ошибка авторизации: ${e}`);
+  }
+}
+
+$("auth").addEventListener("click", () => {
+  void startTwitchAuthorization();
 });
 
 (async function init() {

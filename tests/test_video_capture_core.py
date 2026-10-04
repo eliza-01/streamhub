@@ -77,3 +77,18 @@ def test_stage2_video_schema_is_additive_and_does_not_touch_chat_tables():
     assert 'drop_table("sessions")' not in upgrade
     assert 'drop_table("chat_messages")' not in upgrade
     assert 'alter_column("sessions"' not in upgrade
+
+
+def test_live_video_segments_preserve_original_stream_clock_for_chat_sync():
+    root = Path(__file__).resolve().parents[1]
+    recorder = (root / "apps/video_recorder/app/main.py").read_text(encoding="utf-8")
+    commands = (root / "apps/video_recorder/app/commands.py").read_text(encoding="utf-8")
+
+    assert "program_date_time" in commands
+    assert "def playlist_segment_program_times(" in recorder
+    assert 'value.startswith("#EXT-X-PROGRAM-DATE-TIME:")' in recorder
+    assert "event = await db.get(MediaEvent, session.event_id)" in recorder
+    assert "source_offset_ms(program_time, source_origin)" in recorder
+    assert "source_media_start_ms=source_start" in recorder
+    assert "source_media_end_ms=source_end" in recorder
+    assert "run_source_start + timeline_start_ms - run_timeline_start" in recorder

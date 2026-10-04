@@ -1,0 +1,489 @@
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 11d4456..68274ec 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -614,7 +614,8 @@ function TelegramVideoPlayer({
+ }
+ 
+ function safeChatColor(value?: string | null) {
+-  return value && /^#[0-9a-f]{6}$/i.test(value) ? value : undefined;
++  if (!value || !/^#[0-9a-f]{6}$/i.test(value)) return undefined;
++  return value.toLowerCase() === "#000000" ? "#8b949e" : value;
+ }
+ 
+ type ChatBadgeView = {
+@@ -1020,18 +1021,15 @@ function SiteChatUserContext({
+           </header>
+           <div className="site-chat-history-tabs" role="tablist">
+             <button className={historyTab === "current" ? "active" : ""} type="button" onClick={() => setHistoryTab("current")}>Этот стрим</button>
+-            <button className={historyTab === "other" ? "active" : ""} type="button" onClick={() => { setHistoryTab("other"); setSelectedOther(null); }}>Другие</button>
++            <button className={historyTab === "other" ? "active" : ""} type="button" onClick={() => { setHistoryTab("other"); setSelectedOther(null); }}>
++              <span>Другие</span>
++              {otherEventsLoaded ? <b className="site-chat-history-tab-count">{otherEvents.length.toLocaleString("ru-RU")}</b> : null}
++            </button>
+           </div>
+           <div className="site-chat-history-content">
+             {historyError ? <div className="site-chat-history-error">{historyError}</div> : null}
+             {historyTab === "other" && !selectedOther ? (
+               <>
+-                <div className="site-chat-history-stream-heading site-chat-history-other-heading">
+-                  <div>
+-                    <strong>Другие стримы</strong>
+-                  </div>
+-                  <b>{otherEventsLoading ? "…" : otherEvents.length.toLocaleString("ru-RU")}</b>
+-                </div>
+                 {otherEventsLoading ? <div className="site-chat-history-loading"><i className="site-inline-spinner" /></div> : null}
+                 {!otherEventsLoading && otherEvents.length === 0 ? <div className="site-chat-history-empty">В других опубликованных стримах сообщений нет.</div> : null}
+                 <div className="site-chat-history-events">
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 3eafa95..63a28e5 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -540,9 +540,10 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-history-close-icon::before { transform: translate(-50%, -50%) rotate(45deg); }
+ .site-chat-history-close-icon::after { transform: translate(-50%, -50%) rotate(-45deg); }
+ .site-chat-history-tabs { display: flex; gap: 4px; padding: 9px 12px; border-bottom: 1px solid #1c252d; background: #0b1015; }
+-.site-chat-history-tabs button { min-height: 32px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #7e8993; padding: 0 13px; font-size: 11px; font-weight: 800; cursor: pointer; }
++.site-chat-history-tabs button { min-height: 32px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #7e8993; padding: 0 13px; font-size: 11px; font-weight: 800; cursor: pointer; }
+ .site-chat-history-tabs button:hover { color: #dce2e7; background: #131a21; }
+ .site-chat-history-tabs button.active { border-color: rgba(255,120,24,.22); background: rgba(255,120,24,.13); color: var(--sv-orange-2, #ff9b37); }
++.site-chat-history-tab-count { min-width: 23px; min-height: 20px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(255,120,24,.22); border-radius: 999px; background: rgba(255,120,24,.08); color: var(--sv-orange-2, #ff9b37); padding: 0 7px; font-size: 9px; font-weight: 850; font-variant-numeric: tabular-nums; line-height: 1; }
+ .site-chat-history-content { min-height: 0; overflow-y: auto; padding: 14px; scrollbar-width: thin; scrollbar-color: #33404d transparent; }
+ .site-chat-history-back { width: max-content; min-height: 29px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid #2a3540; border-radius: 8px; background: #121920; color: #aeb7bf; padding: 0 10px; font-size: 10px; font-weight: 800; cursor: pointer; transition: border-color .12s ease, background .12s ease, color .12s ease, transform .12s ease; }
+ .site-chat-history-back:hover { border-color: rgba(255,120,24,.52); background: rgba(255,120,24,.09); color: var(--sv-orange-2, #ff9b37); transform: translateX(-1px); }
+@@ -553,7 +554,6 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-history-stream-heading span { color: #697681; font-size: 8px; font-weight: 900; letter-spacing: .09em; }
+ .site-chat-history-stream-heading strong { overflow: hidden; color: #edf1f4; font-size: 13px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+ .site-chat-history-stream-heading > b { flex: 0 0 auto; min-height: 24px; display: inline-flex; align-items: center; border: 1px solid rgba(255,120,24,.22); border-radius: 999px; background: rgba(255,120,24,.08); color: var(--sv-orange-2, #ff9b37); padding: 0 9px; font-size: 9px; font-weight: 850; font-variant-numeric: tabular-nums; white-space: nowrap; }
+-.site-chat-history-other-heading { margin-bottom: 10px; }
+ .site-chat-history-events { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+ .site-chat-history-event { min-height: 104px; display: grid; grid-template-rows: 1fr auto; overflow: hidden; border: 1px solid #202a33; border-radius: 12px; background: #11181f; color: #edf1f4; padding: 0; text-align: left; cursor: pointer; }
+ .site-chat-history-event:hover { border-color: rgba(255,120,24,.58); transform: translateY(-1px); }
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+index 2b5e77a..f019a57 100644
+--- a/tests/test_site_catalog.py
++++ b/tests/test_site_catalog.py
+@@ -1,210 +1,213 @@
+-from pathlib import Path
+-
+-
+-def _read(path: str) -> str:
+-    root = Path(__file__).resolve().parents[1]
+-    return (root / path).read_text(encoding="utf-8")
+-
+-
+-def test_site_catalog_migration_seeds_normalized_categories_and_explicit_publications():
+-    migration = _read("migrations/versions/0010_site_catalog.py")
+-    models = _read("packages/python_common/streamhub_common/models.py")
+-
+-    assert 'down_revision = "0009_telegram_storage"' in migration
+-    assert '"films", "Фильмы"' in migration
+-    assert '"shows", "Шоу"' in migration
+-    assert '"games", "Игры"' in migration
+-    assert '"fncs", "FNCS"' in migration
+-    assert '"chatroulette", "Чатрулетка"' in migration
+-    assert '"site_event_publications"' in migration
+-    assert '"event_categories"' in migration
+-    assert 'class ContentCategory(Base):' in models
+-    assert 'class SiteEventPublication(Base):' in models
+-    assert 'class EventCategory(Base):' in models
+-
+-
+-def test_site_publish_api_is_event_centric_and_requires_telegram_backed_storage():
+-    route = _read("apps/api/app/routers/site.py")
+-    main = _read("apps/api/app/main.py")
+-
+-    assert 'router = APIRouter(prefix="/api/v1/site"' in route
+-    assert '@router.get("/feed")' in route
+-    assert '@router.get("/events/{event_id}/chat/messages")' in route
+-    assert '@router.get("/admin/available-events")' in route
+-    assert '@router.post("/admin/events"' in route
+-    assert '@router.put("/admin/events/{event_id}/categories")' in route
+-    assert '@router.delete("/admin/events/{event_id}")' in route
+-    assert 'TelegramVideoPartBinding' in route
+-    assert 'VideoPart.status == "ready"' in route
+-    assert 'event has no Telegram-linked ready video parts' in route
+-    assert 'app.include_router(site.router)' in main
+-
+-
+-def test_site_frontend_fetches_categories_and_events_instead_of_hardcoding_content():
+-    web = _read("apps/web/src/main.tsx")
+-
+-    assert '>Сайт</button>' in web
+-    assert '>+ Добавить событие</button>' in web
+-    assert 'fetch(`${API}/api/v1/site/feed?' in web
+-    assert 'fetch(`${API}/api/v1/site/admin/available-events`' in web
+-    assert 'fetch(`${API}/api/v1/site/categories`' in web
+-    assert 'siteCategories.map((category)' in web
+-    assert 'siteAvailableEvents.map((event)' in web
+-    assert 'FNCS' not in web
+-    assert 'Чатрулетка' not in web
+-
+-
+-def test_site_feed_reuses_telegram_hls_playback_without_double_api_prefix():
+-    route = _read("apps/api/app/routers/site.py")
+-    web = _read("apps/web/src/main.tsx")
+-
+-    assert 'f"/api/v1/playback/video-sessions/{session.id}/index.m3u8"' in route
+-    assert 'const source = apiUrl(playlistUrl);' in web
+-    assert 'playlistUrl={selectedSiteEvent.playback_url}' in web
+-    assert 'playlistUrl={`${API}${selectedSiteEvent.playback_url}`}' not in web
+-
+-
+-def test_site_watch_exposes_persisted_chat_and_syncs_it_through_source_timeline():
+-    route = _read("apps/api/app/routers/site.py")
+-    web = _read("apps/web/src/main.tsx")
+-
+-    assert 'ChatMessage.timeline_offset_ms >= start' in route
+-    assert 'ChatMessage.timeline_offset_ms <= end' in route
+-    assert '@router.get("/events/{event_id}/playback-timeline")' in route
+-    assert '"source_start_ms"' in route
+-    assert '"timeline_start_ms"' in route
+-    assert '"mapping_quality"' in route
+-    assert '"primary_chat_session_id"' in route
+-    assert '"chat_message_count"' in route
+-    assert 'function SiteReplayChat(' in web
+-    assert '/chat/messages?' in web
+-    assert '/playback-timeline' in web
+-    assert 'playerToSourceMs(currentPlayer, ranges)' in web
+-    assert 'sourceToPlayerMs(message.timeline_offset_ms, ranges)' in web
+-    assert '(message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentMs + 100' in web
+-    assert 'className="site-replay-chat-time"' not in web
+-    assert '{message.player_offset_ms != null ? fmtMs(message.player_offset_ms) : "—"}' in web
+-    assert 'message.player_offset_ms ?? message.timeline_offset_ms' not in web
+-    assert 'video.currentTime = Math.max(0, message.timeline_offset_ms / 1000);' not in web
+-
+-
+-def test_site_chat_reconstructs_vod_text_and_exposes_rich_presentation_fields():
+-    route = _read("apps/api/app/routers/site.py")
+-    adapter = _read("apps/twitch_adapter/app/main.py")
+-    web = _read("apps/web/src/main.tsx")
+-    css = _read("apps/web/src/styles.css")
+-
+-    assert 'return "".join(str(item.get("text") or "") for item in _chat_fragments(row))' in route
+-    assert '"color": _chat_color(row)' in route
+-    assert '"badges": _chat_badges(row)' in route
+-    assert '"fragments": _chat_fragments(row)' in route
+-    assert '"reply": row.reply_json' in route
+-    assert '"bits": row.bits' in route
+-
+-    assert 'color=message.get("userColor") or message.get("color") or commenter.get("color")' in adapter
+-    assert '"".join(' in adapter
+-    assert 'str(fragment.get("text") or "") for fragment in fragments if isinstance(fragment, dict)' in adapter
+-
+-    assert 'function chatBadges(' in web
+-    assert 'function ChatMessageFragments(' in web
+-    assert 'static-cdn.jtvnw.net/emoticons/v2/' in web
+-    assert 'chatReplySummary(message.reply)' in web
+-    assert 'message.bits.toLocaleString("ru-RU")' in web
+-    assert 'site-chat-badge' in css
+-    assert 'site-chat-emote' in css
+-
+-
+-def test_video_manager_does_not_auto_mount_telegram_player_and_site_badges_use_twitch_assets():
+-    route = _read("apps/api/app/routers/site.py")
+-    adapter = _read("apps/twitch_adapter/app/main.py")
+-    web = _read("apps/web/src/main.tsx")
+-    css = _read("apps/web/src/styles.css")
+-
+-    assert 'Telegram playback ready · segments' in web
+-    assert '<TelegramVideoPlayer playlistUrl={playbackStatus.playlist_url} />' not in web
+-    assert '@router.get("/events/{event_id}/chat/badges")' in route
+-    assert '/internal/v1/chat/badges/{broadcaster_id}' in adapter
+-    assert '"/chat/badges/global"' in adapter
+-    assert '"/chat/badges"' in adapter
+-    assert 'image_url_1x' in adapter
+-    assert 'fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/badges`)' in web
+-    assert 'site-chat-badge-image' in web
+-    assert 'site-chat-badge-image' in css
+-    assert 'badge.imageUrl ? (' in web
+-    assert '<span className="site-chat-badge"' in web
+-
+-
+-def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
+-    route = _read("apps/api/app/routers/site.py")
+-    web = _read("apps/web/src/main.tsx")
+-    css = _read("apps/web/src/styles.css")
+-
+-    assert '@router.get("/events/{event_id}/chat/stats")' in route
+-    assert '@router.get("/events/{event_id}/chat/user-summary")' in route
+-    assert 'ChatMessage.chatter_external_id == external_id' in route
+-    assert 'func.count(ChatMessage.id)' in route
+-    assert '"most_active": _chat_user_payload(most_active)' in route
+-    assert '"least_active": _chat_user_payload(least_active)' in route
+-    assert '"chatter_external_id": row.chatter_external_id' in route
+-
+-    assert 'function StreamVaultHeader(' in web
+-    assert 'function SiteChatStats(' in web
+-    assert '/chat/stats`' in web
+-    assert 'Последний стрим' in web
+-    assert 'PREVIEW ${siteHeroFrame + 1}' in web
+-    assert 'Чат записи' in web
+-    assert 'Все сообщения' in web
+-    assert 'Посмотреть профиль' in web
+-    assert 'Отметить в комментарии' in web
+-    assert '<span>Отметить в комментарии</span><b>@</b>' not in web
+-    assert '/chat/user-summary?' in web
+-    assert 'site-inline-spinner' in web
+-    assert 'className="site-chat-author"' in web
+-
+-    assert '.site-chat-user-menu' in css
+-    assert 'position: fixed;' in css
+-    assert '.streamvault-watch-layout' in css
+-    assert '.streamvault-recording-grid' in css
+-
+-
+-def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
+-    route = _read("apps/api/app/routers/site.py")
+-    web = _read("apps/web/src/main.tsx")
+-    css = _read("apps/web/src/styles.css")
+-
+-    assert '@router.get("/events/{event_id}/chat/user-messages")' in route
+-    assert '@router.get("/events/{event_id}/chat/user-events")' in route
+-    assert '"messages": [_chat_message_payload(row) for row in page]' in route
+-    assert 'SiteEventPublication.event_id == MediaEvent.id' in route
+-    assert 'ChatMessage.session_id.in_(session_ids)' in route
+-    assert '"message_count": message_count' in route
+-    assert '"badges": _chat_badges(profile_row) if profile_row else []' in route
+-    assert 'ChatMessage.chatter_external_id.is_(None)' in route
+-
+-    assert 'function SiteChatUserContext(' in web
+-    assert '/chat/user-messages?' in web
+-    assert '/chat/user-events?' in web
+-    assert '>Этот стрим</button>' in web
+-    assert '>Другие</button>' in web
+-    assert 'Сообщений:' in web
+-    assert 'Посмотреть профиль Twitch' in web
+-    assert 'function TwitchIcon()' in web
+-    assert 'onClick={(event) => openStatsUser(event, stats?.most_active)}' in web
+-    assert 'onClick={(event) => openStatsUser(event, stats?.least_active)}' in web
+-
+-    assert 'onWheel={handleChatWheel}' in web
+-    assert 'onTouchMove={handleChatTouchMove}' in web
+-    assert 'setFollowing(distance <= 2)' in web
+-    assert 'node.scrollTo({ top: node.scrollHeight, behavior: "smooth" })' in web
+-    assert 'node.scrollTop = node.scrollHeight' in web
+-    assert 'className="site-chat-follow"' in web
+-    assert 'site-chat-type' not in web
+-    assert 'Срез всей записи' not in web
+-    assert 'Нажми на пользователя, чтобы открыть профиль и историю сообщений' not in web
+-    assert 'streamvault-chat-stat-user-name' in web
+-
+-    assert '.site-chat-history-modal' in css
+-    assert '.site-chat-history-events' in css
+-    assert '.site-chat-history-event' in css
+-    assert '.site-twitch-icon' in css
+-    assert 'left: 50%; bottom: 43px; transform: translateX(-50%)' in css
++from pathlib import Path
++
++
++def _read(path: str) -> str:
++    root = Path(__file__).resolve().parents[1]
++    return (root / path).read_text(encoding="utf-8")
++
++
++def test_site_catalog_migration_seeds_normalized_categories_and_explicit_publications():
++    migration = _read("migrations/versions/0010_site_catalog.py")
++    models = _read("packages/python_common/streamhub_common/models.py")
++
++    assert 'down_revision = "0009_telegram_storage"' in migration
++    assert '"films", "Фильмы"' in migration
++    assert '"shows", "Шоу"' in migration
++    assert '"games", "Игры"' in migration
++    assert '"fncs", "FNCS"' in migration
++    assert '"chatroulette", "Чатрулетка"' in migration
++    assert '"site_event_publications"' in migration
++    assert '"event_categories"' in migration
++    assert 'class ContentCategory(Base):' in models
++    assert 'class SiteEventPublication(Base):' in models
++    assert 'class EventCategory(Base):' in models
++
++
++def test_site_publish_api_is_event_centric_and_requires_telegram_backed_storage():
++    route = _read("apps/api/app/routers/site.py")
++    main = _read("apps/api/app/main.py")
++
++    assert 'router = APIRouter(prefix="/api/v1/site"' in route
++    assert '@router.get("/feed")' in route
++    assert '@router.get("/events/{event_id}/chat/messages")' in route
++    assert '@router.get("/admin/available-events")' in route
++    assert '@router.post("/admin/events"' in route
++    assert '@router.put("/admin/events/{event_id}/categories")' in route
++    assert '@router.delete("/admin/events/{event_id}")' in route
++    assert 'TelegramVideoPartBinding' in route
++    assert 'VideoPart.status == "ready"' in route
++    assert 'event has no Telegram-linked ready video parts' in route
++    assert 'app.include_router(site.router)' in main
++
++
++def test_site_frontend_fetches_categories_and_events_instead_of_hardcoding_content():
++    web = _read("apps/web/src/main.tsx")
++
++    assert '>Сайт</button>' in web
++    assert '>+ Добавить событие</button>' in web
++    assert 'fetch(`${API}/api/v1/site/feed?' in web
++    assert 'fetch(`${API}/api/v1/site/admin/available-events`' in web
++    assert 'fetch(`${API}/api/v1/site/categories`' in web
++    assert 'siteCategories.map((category)' in web
++    assert 'siteAvailableEvents.map((event)' in web
++    assert 'FNCS' not in web
++    assert 'Чатрулетка' not in web
++
++
++def test_site_feed_reuses_telegram_hls_playback_without_double_api_prefix():
++    route = _read("apps/api/app/routers/site.py")
++    web = _read("apps/web/src/main.tsx")
++
++    assert 'f"/api/v1/playback/video-sessions/{session.id}/index.m3u8"' in route
++    assert 'const source = apiUrl(playlistUrl);' in web
++    assert 'playlistUrl={selectedSiteEvent.playback_url}' in web
++    assert 'playlistUrl={`${API}${selectedSiteEvent.playback_url}`}' not in web
++
++
++def test_site_watch_exposes_persisted_chat_and_syncs_it_through_source_timeline():
++    route = _read("apps/api/app/routers/site.py")
++    web = _read("apps/web/src/main.tsx")
++
++    assert 'ChatMessage.timeline_offset_ms >= start' in route
++    assert 'ChatMessage.timeline_offset_ms <= end' in route
++    assert '@router.get("/events/{event_id}/playback-timeline")' in route
++    assert '"source_start_ms"' in route
++    assert '"timeline_start_ms"' in route
++    assert '"mapping_quality"' in route
++    assert '"primary_chat_session_id"' in route
++    assert '"chat_message_count"' in route
++    assert 'function SiteReplayChat(' in web
++    assert '/chat/messages?' in web
++    assert '/playback-timeline' in web
++    assert 'playerToSourceMs(currentPlayer, ranges)' in web
++    assert 'sourceToPlayerMs(message.timeline_offset_ms, ranges)' in web
++    assert '(message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentMs + 100' in web
++    assert 'className="site-replay-chat-time"' not in web
++    assert '{message.player_offset_ms != null ? fmtMs(message.player_offset_ms) : "—"}' in web
++    assert 'message.player_offset_ms ?? message.timeline_offset_ms' not in web
++    assert 'video.currentTime = Math.max(0, message.timeline_offset_ms / 1000);' not in web
++
++
++def test_site_chat_reconstructs_vod_text_and_exposes_rich_presentation_fields():
++    route = _read("apps/api/app/routers/site.py")
++    adapter = _read("apps/twitch_adapter/app/main.py")
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert 'return "".join(str(item.get("text") or "") for item in _chat_fragments(row))' in route
++    assert '"color": _chat_color(row)' in route
++    assert '"badges": _chat_badges(row)' in route
++    assert '"fragments": _chat_fragments(row)' in route
++    assert '"reply": row.reply_json' in route
++    assert '"bits": row.bits' in route
++
++    assert 'color=message.get("userColor") or message.get("color") or commenter.get("color")' in adapter
++    assert '"".join(' in adapter
++    assert 'str(fragment.get("text") or "") for fragment in fragments if isinstance(fragment, dict)' in adapter
++
++    assert 'function chatBadges(' in web
++    assert 'function ChatMessageFragments(' in web
++    assert 'static-cdn.jtvnw.net/emoticons/v2/' in web
++    assert 'chatReplySummary(message.reply)' in web
++    assert 'message.bits.toLocaleString("ru-RU")' in web
++    assert 'site-chat-badge' in css
++    assert 'site-chat-emote' in css
++
++
++def test_video_manager_does_not_auto_mount_telegram_player_and_site_badges_use_twitch_assets():
++    route = _read("apps/api/app/routers/site.py")
++    adapter = _read("apps/twitch_adapter/app/main.py")
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert 'Telegram playback ready · segments' in web
++    assert '<TelegramVideoPlayer playlistUrl={playbackStatus.playlist_url} />' not in web
++    assert '@router.get("/events/{event_id}/chat/badges")' in route
++    assert '/internal/v1/chat/badges/{broadcaster_id}' in adapter
++    assert '"/chat/badges/global"' in adapter
++    assert '"/chat/badges"' in adapter
++    assert 'image_url_1x' in adapter
++    assert 'fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/badges`)' in web
++    assert 'site-chat-badge-image' in web
++    assert 'site-chat-badge-image' in css
++    assert 'badge.imageUrl ? (' in web
++    assert '<span className="site-chat-badge"' in web
++
++
++def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
++    route = _read("apps/api/app/routers/site.py")
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert '@router.get("/events/{event_id}/chat/stats")' in route
++    assert '@router.get("/events/{event_id}/chat/user-summary")' in route
++    assert 'ChatMessage.chatter_external_id == external_id' in route
++    assert 'func.count(ChatMessage.id)' in route
++    assert '"most_active": _chat_user_payload(most_active)' in route
++    assert '"least_active": _chat_user_payload(least_active)' in route
++    assert '"chatter_external_id": row.chatter_external_id' in route
++
++    assert 'function StreamVaultHeader(' in web
++    assert 'function SiteChatStats(' in web
++    assert '/chat/stats`' in web
++    assert 'Последний стрим' in web
++    assert 'PREVIEW ${siteHeroFrame + 1}' in web
++    assert 'Чат записи' in web
++    assert 'Все сообщения' in web
++    assert 'Посмотреть профиль' in web
++    assert 'Отметить в комментарии' in web
++    assert '<span>Отметить в комментарии</span><b>@</b>' not in web
++    assert '/chat/user-summary?' in web
++    assert 'site-inline-spinner' in web
++    assert 'className="site-chat-author"' in web
++
++    assert '.site-chat-user-menu' in css
++    assert 'position: fixed;' in css
++    assert '.streamvault-watch-layout' in css
++    assert '.streamvault-recording-grid' in css
++
++
++def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
++    route = _read("apps/api/app/routers/site.py")
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert '@router.get("/events/{event_id}/chat/user-messages")' in route
++    assert '@router.get("/events/{event_id}/chat/user-events")' in route
++    assert '"messages": [_chat_message_payload(row) for row in page]' in route
++    assert 'SiteEventPublication.event_id == MediaEvent.id' in route
++    assert 'ChatMessage.session_id.in_(session_ids)' in route
++    assert '"message_count": message_count' in route
++    assert '"badges": _chat_badges(profile_row) if profile_row else []' in route
++    assert 'ChatMessage.chatter_external_id.is_(None)' in route
++
++    assert 'function SiteChatUserContext(' in web
++    assert '/chat/user-messages?' in web
++    assert '/chat/user-events?' in web
++    assert '>Этот стрим</button>' in web
++    assert '<span>Другие</span>' in web
++    assert 'site-chat-history-tab-count' in web
++    assert 'site-chat-history-other-heading' not in web
++    assert 'value.toLowerCase() === "#000000" ? "#8b949e" : value' in web
++    assert 'Сообщений:' in web
++    assert 'Посмотреть профиль Twitch' in web
++    assert 'function TwitchIcon()' in web
++    assert 'onClick={(event) => openStatsUser(event, stats?.most_active)}' in web
++    assert 'onClick={(event) => openStatsUser(event, stats?.least_active)}' in web
++
++    assert 'onWheel={handleChatWheel}' in web
++    assert 'onTouchMove={handleChatTouchMove}' in web
++    assert 'setFollowing(distance <= 2)' in web
++    assert 'node.scrollTo({ top: node.scrollHeight, behavior: "smooth" })' in web
++    assert 'node.scrollTop = node.scrollHeight' in web
++    assert 'className="site-chat-follow"' in web
++    assert 'site-chat-type' not in web
++    assert 'Срез всей записи' not in web
++    assert 'Нажми на пользователя, чтобы открыть профиль и историю сообщений' not in web
++    assert 'streamvault-chat-stat-user-name' in web
++
++    assert '.site-chat-history-modal' in css
++    assert '.site-chat-history-events' in css
++    assert '.site-chat-history-event' in css
++    assert '.site-twitch-icon' in css
++    assert 'left: 50%; bottom: 43px; transform: translateX(-50%)' in css

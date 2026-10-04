@@ -3,7 +3,11 @@ body { margin: 0; width: 360px; background: #f7f7f8; }
 main { padding: 16px; }
 h1 { margin: 0 0 14px; font-size: 20px; }
 .status, .details, .message { background: white; border: 1px solid #e4e4e7; border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+.status.capture-warning { white-space: pre-wrap; border-color: #ef4444; background: #fff1f2; color: #b91c1c; font-weight: 800; box-shadow: inset 3px 0 0 #ef4444; }
 .details { font-size: 12px; line-height: 1.55; color: #52525b; white-space: pre-wrap; }
+.control-surface { min-width: 0; margin: 0; padding: 0; border: 0; }
+.control-surface[disabled] { opacity: .58; pointer-events: none; user-select: none; }
+main.is-busy .control-surface { cursor: progress; }
 .capture-toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
 .toggle { display: flex; gap: 8px; align-items: center; margin: 0; padding: 10px; border: 1px solid #e4e4e7; border-radius: 9px; background: white; font-size: 13px; }
 .section-title { margin: 13px 2px 6px; color: #71717a; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }

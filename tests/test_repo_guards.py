@@ -175,3 +175,64 @@ def test_vod_progress_is_backend_enriched_and_vod_is_not_labeled_live():
     assert 'return session.media_type === "live" ? "LIVE" : "VOD · …";' in web
     assert '<span className="active-badge">chat {chatProgressLabel(' in web
     assert '<span className="active-badge">video {videoProgressLabel(' in web
+
+
+def test_extension_auto_authorizes_and_disables_chat_resume_while_recording():
+    root = Path(__file__).resolve().parents[1]
+    popup = (root / "apps/chrome_extension/popup.js").read_text()
+    popup_css = (root / "apps/chrome_extension/popup.css").read_text()
+
+    assert "isTwitchAuthorizationError" in popup
+    assert "startTwitchAuthorization({ automatic: true })" in popup
+    assert "chrome.tabs.create({ url: result.verification_uri })" in popup
+    assert 'chatStatus !== "paused"' in popup
+    assert "partialCapture" in popup
+    assert "Video не пишется" in popup
+    assert "Chat не пишется" in popup
+    assert ".status.capture-warning" in popup_css
+
+
+def test_chat_ui_has_flat_context_actions_and_clean_history_header():
+    root = Path(__file__).resolve().parents[1]
+    web = (root / "apps/web/src/main.tsx").read_text()
+    css = (root / "apps/web/src/styles.css").read_text()
+
+    assert "Посмотреть профиль Twitch</span><b>↗</b>" not in web
+    assert '<i aria-hidden="true">↗</i>' not in web
+    assert "site-chat-history-stream-context" in web
+    assert "otherEventsLoaded" in web
+    assert "else if (!otherEventsLoaded)" in web
+    assert "site-chat-history-section-title" not in web
+    assert ">Назад</button>" in web
+    assert "СООБЩЕНИЯ В СТРИМЕ" not in web
+    assert "border-radius: 0; box-shadow: inset 0 -1px #1b242c" in css
+    assert "border-right-color: var(--sv-line-soft)" in css
+
+
+
+def test_extension_locks_controls_during_capture_actions_and_active_mode_toggle():
+    root = Path(__file__).resolve().parents[1]
+    popup = (root / "apps/chrome_extension/popup.js").read_text()
+    popup_html = (root / "apps/chrome_extension/popup.html").read_text()
+    popup_css = (root / "apps/chrome_extension/popup.css").read_text()
+
+    assert 'id="controls"' in popup_html
+    assert "let actionInFlight = null;" in popup
+    assert '$("controls").disabled = uiBusy;' in popup
+    assert '$("chat-toggle").disabled = Boolean(activeChatSession);' in popup
+    assert '$("video-toggle").disabled = Boolean(activeVideoSession);' in popup
+    assert 'bindAction("start"' in popup
+    assert 'bindAction("pause-chat"' in popup
+    assert 'bindAction("stop-all"' in popup
+    assert ".control-surface[disabled]" in popup_css
+    assert "pointer-events: none" in popup_css
+
+
+def test_public_chat_header_hides_sync_copy_and_video_manager_date_is_first():
+    root = Path(__file__).resolve().parents[1]
+    web = (root / "apps/web/src/main.tsx").read_text()
+
+    assert "Синхронно с видео" not in web
+    assert "sync ≈" not in web
+    selected_video = web.split("if (selectedVideo)", 1)[1]
+    assert selected_video.index('<div className="video-manager-event-date">') < selected_video.index('<button className="link"')

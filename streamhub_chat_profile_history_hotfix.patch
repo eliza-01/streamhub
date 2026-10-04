@@ -1,0 +1,1151 @@
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+index 207dc63..e3decf8 100644
+--- a/apps/api/app/routers/site.py
++++ b/apps/api/app/routers/site.py
+@@ -569,6 +569,50 @@ def _chat_badges(row: ChatMessage):
+     return raw_message.get("userBadges") or raw_message.get("badges") or []
+ 
+ 
++def _chat_message_payload(row: ChatMessage) -> dict:
++    return {
++        "id": int(row.id),
++        "timeline_offset_ms": int(row.timeline_offset_ms),
++        "chatter_external_id": row.chatter_external_id,
++        "chatter_login": row.chatter_login,
++        "chatter_name": row.chatter_name,
++        "color": _chat_color(row),
++        "badges": _chat_badges(row),
++        "message_text": _chat_message_text(row),
++        "fragments": _chat_fragments(row),
++        "reply": row.reply_json,
++        "bits": row.bits,
++        "message_type": row.message_type,
++        "is_action": bool(row.is_action),
++        "source_kind": row.source_kind,
++        "provider_message_id": row.provider_message_id,
++        "channel_points_reward_id": row.channel_points_reward_id,
++    }
++
++
++def _chat_identity(
++    chatter_external_id: str | None,
++    chatter_login: str | None,
++):
++    external_id = str(chatter_external_id or "").strip()
++    login = str(chatter_login or "").strip()
++    if not external_id and not login:
++        raise HTTPException(400, "chatter_external_id or chatter_login is required")
++    if external_id and login:
++        condition = or_(
++            ChatMessage.chatter_external_id == external_id,
++            and_(
++                ChatMessage.chatter_external_id.is_(None),
++                func.lower(ChatMessage.chatter_login) == login.lower(),
++            ),
++        )
++    elif external_id:
++        condition = ChatMessage.chatter_external_id == external_id
++    else:
++        condition = func.lower(ChatMessage.chatter_login) == login.lower()
++    return external_id, login, condition
++
++
+ @router.get("/events/{event_id}/chat/badges")
+ async def site_event_chat_badges(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+     if await db.get(SiteEventPublication, event_id) is None:
+@@ -678,27 +722,7 @@ async def site_event_chat_messages(
+         "chat_session_id": str(session.id),
+         "from_ms": start,
+         "to_ms": end,
+-        "messages": [
+-            {
+-                "id": int(row.id),
+-                "timeline_offset_ms": int(row.timeline_offset_ms),
+-                "chatter_external_id": row.chatter_external_id,
+-                "chatter_login": row.chatter_login,
+-                "chatter_name": row.chatter_name,
+-                "color": _chat_color(row),
+-                "badges": _chat_badges(row),
+-                "message_text": _chat_message_text(row),
+-                "fragments": _chat_fragments(row),
+-                "reply": row.reply_json,
+-                "bits": row.bits,
+-                "message_type": row.message_type,
+-                "is_action": bool(row.is_action),
+-                "source_kind": row.source_kind,
+-                "provider_message_id": row.provider_message_id,
+-                "channel_points_reward_id": row.channel_points_reward_id,
+-            }
+-            for row in page
+-        ],
++        "messages": [_chat_message_payload(row) for row in page],
+         "has_more": has_more,
+         "next_cursor": next_cursor,
+     }
+@@ -788,10 +812,7 @@ async def site_event_chat_user_summary(
+     if await db.get(SiteEventPublication, event_id) is None:
+         raise HTTPException(404, "site event not found")
+ 
+-    external_id = str(chatter_external_id or "").strip()
+-    login = str(chatter_login or "").strip()
+-    if not external_id and not login:
+-        raise HTTPException(400, "chatter_external_id or chatter_login is required")
++    external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
+ 
+     primary = await _primary_chat_session(db, event_id)
+     if primary is None:
+@@ -806,11 +827,6 @@ async def site_event_chat_user_summary(
+         }
+ 
+     session, _message_count = primary
+-    identity = (
+-        ChatMessage.chatter_external_id == external_id
+-        if external_id
+-        else func.lower(ChatMessage.chatter_login) == login.lower()
+-    )
+     count_row = (
+         await db.execute(
+             select(
+@@ -825,17 +841,169 @@ async def site_event_chat_user_summary(
+         )
+     ).one()
+     count, first_ms, last_ms = count_row
++    profile_row = (
++        await db.execute(
++            select(ChatMessage)
++            .where(
++                ChatMessage.session_id == session.id,
++                ChatMessage.is_deleted.is_(False),
++                identity,
++            )
++            .order_by(ChatMessage.timeline_offset_ms.desc(), ChatMessage.id.desc())
++            .limit(1)
++        )
++    ).scalars().first()
+     return {
+         "event_id": str(event_id),
+         "chat_session_id": str(session.id),
+-        "chatter_external_id": external_id or None,
+-        "chatter_login": login or None,
++        "chatter_external_id": (profile_row.chatter_external_id if profile_row else None) or external_id or None,
++        "chatter_login": (profile_row.chatter_login if profile_row else None) or login or None,
++        "chatter_name": profile_row.chatter_name if profile_row else None,
++        "color": _chat_color(profile_row) if profile_row else None,
++        "badges": _chat_badges(profile_row) if profile_row else [],
+         "message_count": int(count or 0),
+         "first_message_ms": int(first_ms) if first_ms is not None else None,
+         "last_message_ms": int(last_ms) if last_ms is not None else None,
+     }
+ 
+ 
++@router.get("/events/{event_id}/chat/user-messages")
++async def site_event_chat_user_messages(
++    event_id: uuid.UUID,
++    chatter_external_id: str | None = Query(default=None, max_length=64),
++    chatter_login: str | None = Query(default=None, max_length=255),
++    after_ms: int | None = Query(default=None, ge=0),
++    after_id: int = Query(default=0, ge=0),
++    page_size: int = Query(default=500, ge=1, le=1000),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    if await db.get(SiteEventPublication, event_id) is None:
++        raise HTTPException(404, "site event not found")
++
++    external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
++    primary = await _primary_chat_session(db, event_id)
++    if primary is None:
++        return {
++            "event_id": str(event_id),
++            "chat_session_id": None,
++            "chatter_external_id": external_id or None,
++            "chatter_login": login or None,
++            "messages": [],
++            "has_more": False,
++            "next_cursor": None,
++        }
++
++    session, _message_count = primary
++    conditions = [
++        ChatMessage.session_id == session.id,
++        ChatMessage.is_deleted.is_(False),
++        identity,
++    ]
++    if after_ms is not None:
++        cursor_ms = max(0, int(after_ms))
++        conditions.append(
++            or_(
++                ChatMessage.timeline_offset_ms > cursor_ms,
++                and_(ChatMessage.timeline_offset_ms == cursor_ms, ChatMessage.id > max(0, int(after_id))),
++            )
++        )
++
++    rows = (
++        await db.execute(
++            select(ChatMessage)
++            .where(*conditions)
++            .order_by(ChatMessage.timeline_offset_ms, ChatMessage.id)
++            .limit(page_size + 1)
++        )
++    ).scalars().all()
++    has_more = len(rows) > page_size
++    page = rows[:page_size]
++    next_cursor = None
++    if has_more and page:
++        last = page[-1]
++        next_cursor = {"time_ms": int(last.timeline_offset_ms), "id": int(last.id)}
++
++    return {
++        "event_id": str(event_id),
++        "chat_session_id": str(session.id),
++        "chatter_external_id": external_id or None,
++        "chatter_login": login or None,
++        "messages": [_chat_message_payload(row) for row in page],
++        "has_more": has_more,
++        "next_cursor": next_cursor,
++    }
++
++
++@router.get("/events/{event_id}/chat/user-events")
++async def site_event_chat_user_events(
++    event_id: uuid.UUID,
++    chatter_external_id: str | None = Query(default=None, max_length=64),
++    chatter_login: str | None = Query(default=None, max_length=255),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    if await db.get(SiteEventPublication, event_id) is None:
++        raise HTTPException(404, "site event not found")
++
++    external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
++    events = (
++        await db.execute(
++            select(MediaEvent)
++            .join(SiteEventPublication, SiteEventPublication.event_id == MediaEvent.id)
++            .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
++        )
++    ).scalars().all()
++    event_ids = [event.id for event in events]
++    summaries = await _chat_summaries(db, event_ids)
++
++    primary_session_by_event: dict[uuid.UUID, uuid.UUID] = {}
++    for published_event in events:
++        event_sessions = summaries.get(published_event.id) or []
++        if event_sessions:
++            primary_session_by_event[published_event.id] = uuid.UUID(str(event_sessions[0]["id"]))
++
++    session_ids = list(primary_session_by_event.values())
++    counts_by_session: dict[uuid.UUID, int] = {}
++    if session_ids:
++        count_rows = (
++            await db.execute(
++                select(ChatMessage.session_id, func.count(ChatMessage.id))
++                .where(
++                    ChatMessage.session_id.in_(session_ids),
++                    ChatMessage.is_deleted.is_(False),
++                    identity,
++                )
++                .group_by(ChatMessage.session_id)
++            )
++        ).all()
++        counts_by_session = {session_id: int(count or 0) for session_id, count in count_rows}
++
++    items = []
++    for published_event in events:
++        if published_event.id == event_id:
++            continue
++        session_id = primary_session_by_event.get(published_event.id)
++        message_count = counts_by_session.get(session_id, 0) if session_id else 0
++        if message_count <= 0:
++            continue
++        items.append(
++            {
++                "event_id": str(published_event.id),
++                "title": _event_title(published_event),
++                "channel_login": published_event.channel_login,
++                "channel_display_name": published_event.channel_display_name,
++                "source_started_at_utc": published_event.source_started_at_utc,
++                "message_count": message_count,
++            }
++        )
++
++    return {
++        "event_id": str(event_id),
++        "chatter_external_id": external_id or None,
++        "chatter_login": login or None,
++        "items": items,
++    }
++
++
+ @router.get("/admin/available-events")
+ async def site_available_events(db: AsyncSession = Depends(get_db)) -> dict:
+     storage_ids = await _storage_event_ids(db)
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 72455e5..f853fc8 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -285,16 +285,31 @@ type SiteChatMessage = {
+   channel_points_reward_id?: string | null;
+ };
+ 
+-type SiteChatUserSummary = {
+-  event_id: string;
+-  chat_session_id?: string | null;
++type SiteChatUserIdentity = {
+   chatter_external_id?: string | null;
+   chatter_login?: string | null;
++  chatter_name?: string | null;
++  color?: string | null;
++  badges?: unknown;
++};
++
++type SiteChatUserSummary = SiteChatUserIdentity & {
++  event_id: string;
++  chat_session_id?: string | null;
+   message_count: number;
+   first_message_ms?: number | null;
+   last_message_ms?: number | null;
+ };
+ 
++type SiteChatUserEvent = {
++  event_id: string;
++  title: string;
++  channel_login?: string | null;
++  channel_display_name?: string | null;
++  source_started_at_utc?: string | null;
++  message_count: number;
++};
++
+ type SiteChatStatsUser = {
+   chatter_external_id?: string | null;
+   chatter_login?: string | null;
+@@ -695,7 +710,7 @@ function chatReplySummary(value: unknown) {
+   return `${author ? `↪ ${author}` : "↪"}${body ? `${author ? ": " : " "}${body}` : ""}`;
+ }
+ 
+-function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
++function ChatMessageFragments({ message, onAssetLoad }: { message: SiteChatMessage; onAssetLoad?: () => void }) {
+   const fragments = Array.isArray(message.fragments) ? message.fragments : [];
+   if (!fragments.length) return <>{message.message_text}</>;
+   return <>
+@@ -709,6 +724,7 @@ function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
+           alt={text}
+           title={text}
+           loading="lazy"
++          onLoad={onAssetLoad}
+           key={`${emoteId}:${index}`}
+         />;
+       }
+@@ -717,12 +733,367 @@ function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
+   </>;
+ }
+ 
+-function SiteChatStats({ eventId, hasChat, totalMessages }: { eventId: string; hasChat: boolean; totalMessages: number }) {
++function chatUserQuery(user: SiteChatUserIdentity) {
++  const params = new URLSearchParams();
++  if (user.chatter_external_id) params.set("chatter_external_id", user.chatter_external_id);
++  else if (user.chatter_login) params.set("chatter_login", user.chatter_login);
++  return params;
++}
++
++function chatUserMenuPosition(clientX: number, clientY: number) {
++  const width = 286;
++  const height = 250;
++  return {
++    x: Math.max(10, Math.min(clientX + 10, window.innerWidth - width - 10)),
++    y: Math.max(10, Math.min(clientY + 10, window.innerHeight - height - 10)),
++  };
++}
++
++function TwitchIcon() {
++  return (
++    <svg className="site-twitch-icon" viewBox="0 0 24 24" aria-hidden="true">
++      <path fill="currentColor" d="M4 2h18v13l-5 5h-4l-3 3v-3H5V17H2V5l2-3Zm2 3v11h5v3l3-3h4l2-2V5H6Zm5 3h2v5h-2V8Zm5 0h2v5h-2V8Z" />
++    </svg>
++  );
++}
++
++function SiteChatUserContext({
++  eventId,
++  user,
++  x,
++  y,
++  onClose,
++  onMention,
++  videoRef,
++}: {
++  eventId: string;
++  user: SiteChatUserIdentity;
++  x: number;
++  y: number;
++  onClose: () => void;
++  onMention?: (mention: string) => void;
++  videoRef?: { current: HTMLVideoElement | null };
++}) {
++  const [summary, setSummary] = useState<SiteChatUserSummary | null>(null);
++  const [summaryLoading, setSummaryLoading] = useState(true);
++  const [badgeAssets, setBadgeAssets] = useState<Record<string, SiteChatBadgeAsset>>({});
++  const [messagesOpen, setMessagesOpen] = useState(false);
++  const [historyTab, setHistoryTab] = useState<"current" | "other">("current");
++  const [otherEvents, setOtherEvents] = useState<SiteChatUserEvent[]>([]);
++  const [otherEventsLoading, setOtherEventsLoading] = useState(false);
++  const [selectedOther, setSelectedOther] = useState<SiteChatUserEvent | null>(null);
++  const [historyMessages, setHistoryMessages] = useState<SiteChatMessage[]>([]);
++  const [historyLoading, setHistoryLoading] = useState(false);
++  const [historyError, setHistoryError] = useState("");
++  const menuRef = useRef<HTMLDivElement | null>(null);
++  const modalRef = useRef<HTMLDivElement | null>(null);
++  const historyRequestRef = useRef<AbortController | null>(null);
++
++  const identityParams = useMemo(() => chatUserQuery(user), [user.chatter_external_id, user.chatter_login]);
++  const identityQuery = identityParams.toString();
++
++  useEffect(() => {
++    const controller = new AbortController();
++    setSummary(null);
++    setSummaryLoading(true);
++    if (!identityQuery) {
++      setSummaryLoading(false);
++      return () => controller.abort();
++    }
++    void (async () => {
++      try {
++        const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/user-summary?${identityQuery}`), {
++          cache: "no-store",
++          signal: controller.signal,
++        });
++        if (!response.ok) throw new Error(await response.text());
++        setSummary(await response.json() as SiteChatUserSummary);
++      } catch (e) {
++        if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("chat user summary unavailable", e);
++      } finally {
++        if (!controller.signal.aborted) setSummaryLoading(false);
++      }
++    })();
++    return () => controller.abort();
++  }, [eventId, identityQuery]);
++
++  useEffect(() => {
++    const controller = new AbortController();
++    void (async () => {
++      try {
++        const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/badges`), {
++          cache: "no-store",
++          signal: controller.signal,
++        });
++        if (!response.ok) return;
++        const payload = await response.json();
++        const next: Record<string, SiteChatBadgeAsset> = {};
++        ((payload.badges || []) as SiteChatBadgeAsset[]).forEach((badge) => {
++          const setId = String(badge.set_id || "").trim();
++          const version = String(badge.version || "").trim();
++          if (setId && version) next[chatBadgeAssetKey(setId, version)] = badge;
++        });
++        setBadgeAssets(next);
++      } catch (e) {
++        if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("chat user badges unavailable", e);
++      }
++    })();
++    return () => controller.abort();
++  }, [eventId]);
++
++  useEffect(() => {
++    const onPointerDown = (event: PointerEvent) => {
++      if (messagesOpen) return;
++      if (menuRef.current?.contains(event.target as Node)) return;
++      onClose();
++    };
++    const onKeyDown = (event: KeyboardEvent) => {
++      if (event.key === "Escape") onClose();
++    };
++    const onResize = () => onClose();
++    document.addEventListener("pointerdown", onPointerDown);
++    window.addEventListener("keydown", onKeyDown);
++    window.addEventListener("resize", onResize);
++    return () => {
++      document.removeEventListener("pointerdown", onPointerDown);
++      window.removeEventListener("keydown", onKeyDown);
++      window.removeEventListener("resize", onResize);
++    };
++  }, [messagesOpen, onClose]);
++
++  async function loadHistoryMessages(targetEventId: string) {
++    historyRequestRef.current?.abort();
++    const controller = new AbortController();
++    historyRequestRef.current = controller;
++    setHistoryMessages([]);
++    setHistoryLoading(true);
++    setHistoryError("");
++    try {
++      const timelinePromise = fetch(apiUrl(`/api/v1/site/events/${targetEventId}/playback-timeline`), {
++        cache: "no-store",
++        signal: controller.signal,
++      }).then(async (response) => response.ok ? await response.json() as SitePlaybackTimeline : null).catch(() => null);
++
++      const loaded: SiteChatMessage[] = [];
++      let cursor: { time_ms: number; id: number } | null = null;
++      do {
++        const params = new URLSearchParams(identityQuery);
++        params.set("page_size", "1000");
++        if (cursor) {
++          params.set("after_ms", String(cursor.time_ms));
++          params.set("after_id", String(cursor.id));
++        }
++        const response = await fetch(apiUrl(`/api/v1/site/events/${targetEventId}/chat/user-messages?${params.toString()}`), {
++          cache: "no-store",
++          signal: controller.signal,
++        });
++        if (!response.ok) throw new Error(await response.text());
++        const payload = await response.json();
++        loaded.push(...((payload.messages || []) as SiteChatMessage[]));
++        cursor = payload.next_cursor || null;
++      } while (cursor && !controller.signal.aborted);
++
++      const timeline = await timelinePromise;
++      const ranges = timeline?.synchronized ? timeline.ranges : [];
++      setHistoryMessages(loaded.map((message) => ({
++        ...message,
++        player_offset_ms: ranges.length ? sourceToPlayerMs(message.timeline_offset_ms, ranges) : null,
++      })));
++    } catch (e) {
++      if (!(e instanceof DOMException && e.name === "AbortError")) setHistoryError(`Не удалось загрузить сообщения: ${String(e)}`);
++    } finally {
++      if (!controller.signal.aborted) setHistoryLoading(false);
++    }
++  }
++
++  async function loadOtherEvents() {
++    setOtherEventsLoading(true);
++    setHistoryError("");
++    try {
++      const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/user-events?${identityQuery}`), { cache: "no-store" });
++      if (!response.ok) throw new Error(await response.text());
++      const payload = await response.json();
++      setOtherEvents((payload.items || []) as SiteChatUserEvent[]);
++    } catch (e) {
++      setHistoryError(`Не удалось загрузить другие стримы: ${String(e)}`);
++    } finally {
++      setOtherEventsLoading(false);
++    }
++  }
++
++  useEffect(() => {
++    if (!messagesOpen) return;
++    if (historyTab === "current") {
++      setSelectedOther(null);
++      void loadHistoryMessages(eventId);
++      return;
++    }
++    setHistoryMessages([]);
++    if (selectedOther) {
++      void loadHistoryMessages(selectedOther.event_id);
++    } else {
++      void loadOtherEvents();
++    }
++    return () => historyRequestRef.current?.abort();
++  // identityQuery is stable for the lifetime of the menu target.
++  // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [messagesOpen, historyTab, selectedOther?.event_id, eventId, identityQuery]);
++
++  useEffect(() => () => historyRequestRef.current?.abort(), []);
++
++  const name = summary?.chatter_name || user.chatter_name || summary?.chatter_login || user.chatter_login || "Гость";
++  const login = summary?.chatter_login || user.chatter_login || "";
++  const color = safeChatColor(summary?.color || user.color) || "#ff8a32";
++  const badges = chatBadges(summary?.badges ?? user.badges, badgeAssets).slice(0, 4);
++  const targetEventId = historyTab === "current" ? eventId : selectedOther?.event_id;
++  const targetTitle = historyTab === "current" ? "Этот стрим" : selectedOther?.title || "Другие стримы";
++
++  function seekHistoryMessage(message: SiteChatMessage) {
++    if (targetEventId !== eventId || message.player_offset_ms == null || !videoRef?.current) return;
++    videoRef.current.currentTime = Math.max(0, message.player_offset_ms / 1000);
++    void videoRef.current.play().catch(() => {});
++  }
++
++  return <>
++    {!messagesOpen ? (
++      <div
++        className="site-chat-user-menu"
++        ref={menuRef}
++        style={{ left: x, top: y }}
++        role="dialog"
++        aria-label={`Профиль ${name}`}
++      >
++        <div className="site-chat-user-head">
++          <div className="site-chat-user-avatar" style={{ background: color }}>{name.slice(0, 1).toUpperCase()}</div>
++          <div className="site-chat-user-identity">
++            <strong style={{ color }}>{name}</strong>
++            {login ? <span>@{login}</span> : <span>пользователь чата</span>}
++            {badges.length > 0 ? (
++              <div className="site-chat-user-badges">
++                {badges.map((badge) => badge.imageUrl ? (
++                  <img key={badge.key} src={badge.imageUrl} alt={badge.title} title={badge.title} />
++                ) : <span key={badge.key} title={badge.title}>{badge.label}</span>)}
++              </div>
++            ) : null}
++          </div>
++        </div>
++        <button className="site-chat-user-stat is-button" type="button" onClick={() => setMessagesOpen(true)}>
++          <span>Все сообщения</span>
++          <strong aria-label={summaryLoading ? "Загружается количество сообщений" : undefined}>
++            {summaryLoading ? <i className="site-inline-spinner" /> : (summary?.message_count ?? 0).toLocaleString("ru-RU")}
++          </strong>
++        </button>
++        {login ? (
++          <a className="site-chat-user-action" href={`https://www.twitch.tv/${encodeURIComponent(login)}`} target="_blank" rel="noreferrer">
++            <span className="site-chat-user-action-label"><TwitchIcon />Посмотреть профиль Twitch</span><b>↗</b>
++          </a>
++        ) : (
++          <div className="site-chat-user-action is-disabled"><span className="site-chat-user-action-label"><TwitchIcon />Посмотреть профиль Twitch</span><b>↗</b></div>
++        )}
++        <button
++          className="site-chat-user-action"
++          type="button"
++          onClick={() => {
++            onMention?.(`@${login || name}`);
++            onClose();
++          }}
++        >
++          <span>Отметить в комментарии</span><b>@</b>
++        </button>
++      </div>
++    ) : null}
++
++    {messagesOpen ? (
++      <div className="site-chat-history-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
++        <section className="site-chat-history-modal" ref={modalRef} role="dialog" aria-modal="true" aria-label={`Сообщения ${name}`}>
++          <header className="site-chat-history-head">
++            <div>
++              <span>ИСТОРИЯ ЧАТА</span>
++              <strong>{name}</strong>
++              {login ? <small>@{login}</small> : null}
++            </div>
++            <button type="button" onClick={onClose} aria-label="Закрыть">×</button>
++          </header>
++          <div className="site-chat-history-tabs" role="tablist">
++            <button className={historyTab === "current" ? "active" : ""} type="button" onClick={() => setHistoryTab("current")}>Этот стрим</button>
++            <button className={historyTab === "other" ? "active" : ""} type="button" onClick={() => { setHistoryTab("other"); setSelectedOther(null); }}>Другие</button>
++          </div>
++          <div className="site-chat-history-content">
++            {historyError ? <div className="site-chat-history-error">{historyError}</div> : null}
++            {historyTab === "other" && !selectedOther ? (
++              <>
++                <div className="site-chat-history-section-title">
++                  <strong>Другие стримы</strong>
++                  <span>{otherEvents.length.toLocaleString("ru-RU")}</span>
++                </div>
++                {otherEventsLoading ? <div className="site-chat-history-loading"><i className="site-inline-spinner" /></div> : null}
++                {!otherEventsLoading && otherEvents.length === 0 ? <div className="site-chat-history-empty">В других опубликованных стримах сообщений нет.</div> : null}
++                <div className="site-chat-history-events">
++                  {otherEvents.map((item) => (
++                    <button type="button" className="site-chat-history-event" key={item.event_id} onClick={() => setSelectedOther(item)}>
++                      <strong>{item.title}</strong>
++                      <span>Сообщений: <b>{item.message_count.toLocaleString("ru-RU")}</b></span>
++                    </button>
++                  ))}
++                </div>
++              </>
++            ) : (
++              <>
++                <div className="site-chat-history-section-title">
++                  <div>
++                    {historyTab === "other" ? <button className="site-chat-history-back" type="button" onClick={() => setSelectedOther(null)}>← Другие стримы</button> : null}
++                    <strong>{targetTitle}</strong>
++                  </div>
++                  <span>{historyLoading ? "…" : `${historyMessages.length.toLocaleString("ru-RU")} сообщений`}</span>
++                </div>
++                {historyLoading ? <div className="site-chat-history-loading"><i className="site-inline-spinner" /></div> : null}
++                {!historyLoading && historyMessages.length === 0 ? <div className="site-chat-history-empty">Сообщений не найдено.</div> : null}
++                <div className="site-chat-history-messages">
++                  {historyMessages.map((message) => {
++                    const reply = chatReplySummary(message.reply);
++                    const canSeek = targetEventId === eventId && message.player_offset_ms != null && !!videoRef?.current;
++                    return (
++                      <article className="site-chat-history-message" key={message.id}>
++                        <button type="button" disabled={!canSeek} onClick={() => seekHistoryMessage(message)}>
++                          {fmtMs(message.player_offset_ms ?? message.timeline_offset_ms)}
++                        </button>
++                        <div>
++                          {reply ? <small>{reply}</small> : null}
++                          <p><ChatMessageFragments message={message} /></p>
++                        </div>
++                      </article>
++                    );
++                  })}
++                </div>
++              </>
++            )}
++          </div>
++        </section>
++      </div>
++    ) : null}
++  </>;
++}
++
++function SiteChatStats({
++  eventId,
++  hasChat,
++  totalMessages,
++  videoRef,
++  onMention,
++}: {
++  eventId: string;
++  hasChat: boolean;
++  totalMessages: number;
++  videoRef?: { current: HTMLVideoElement | null };
++  onMention?: (mention: string) => void;
++}) {
+   const [stats, setStats] = useState<SiteChatStatsPayload | null>(null);
+   const [loading, setLoading] = useState(hasChat);
++  const [userMenu, setUserMenu] = useState<{ user: SiteChatUserIdentity; x: number; y: number } | null>(null);
+ 
+   useEffect(() => {
+     setStats(null);
++    setUserMenu(null);
+     setLoading(hasChat);
+     if (!hasChat) return;
+     const controller = new AbortController();
+@@ -741,20 +1112,46 @@ function SiteChatStats({ eventId, hasChat, totalMessages }: { eventId: string; h
+   }, [eventId, hasChat]);
+ 
+   const userLabel = (user?: SiteChatStatsUser | null) => user?.chatter_name || user?.chatter_login || "—";
+-  const value = (text: React.ReactNode) => loading ? <i className="site-inline-spinner" /> : text;
++  const value = (content: React.ReactNode) => loading ? <i className="site-inline-spinner" /> : content;
++
++  function openStatsUser(event: React.MouseEvent<HTMLElement>, user?: SiteChatStatsUser | null) {
++    if (!user) return;
++    const rect = event.currentTarget.getBoundingClientRect();
++    const position = chatUserMenuPosition(rect.left, rect.bottom);
++    setUserMenu({ user, ...position });
++  }
+ 
+   return (
+     <section className="streamvault-chat-stats" aria-label="Статистика чата">
+       <div className="streamvault-chat-stats-head">
+         <div><span>СТАТИСТИКА ЧАТА</span><strong>Срез всей записи</strong></div>
+-        <small>Детальный просмотр пользователей — из чата по клику на ник</small>
++        <small>Нажми на пользователя, чтобы открыть профиль и историю сообщений</small>
+       </div>
+       <div className="streamvault-chat-stats-grid">
+         <div><span>Сообщения</span><strong>{totalMessages.toLocaleString("ru-RU")}</strong></div>
+         <div><span>Участники</span><strong>{hasChat ? value((stats?.unique_chatters ?? 0).toLocaleString("ru-RU")) : "—"}</strong></div>
+-        <div className="user"><span>Больше всего</span><strong>{hasChat ? value(userLabel(stats?.most_active)) : "—"}</strong>{!loading && stats?.most_active ? <small>{stats.most_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}</div>
+-        <div className="user"><span>Меньше всего</span><strong>{hasChat ? value(userLabel(stats?.least_active)) : "—"}</strong>{!loading && stats?.least_active ? <small>{stats.least_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}</div>
++        <button className="user" type="button" disabled={!stats?.most_active || loading} onClick={(event) => openStatsUser(event, stats?.most_active)}>
++          <span>Больше всего</span>
++          <strong>{hasChat ? value(userLabel(stats?.most_active)) : "—"}</strong>
++          {!loading && stats?.most_active ? <small>{stats.most_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}
++        </button>
++        <button className="user" type="button" disabled={!stats?.least_active || loading} onClick={(event) => openStatsUser(event, stats?.least_active)}>
++          <span>Меньше всего</span>
++          <strong>{hasChat ? value(userLabel(stats?.least_active)) : "—"}</strong>
++          {!loading && stats?.least_active ? <small>{stats.least_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}
++        </button>
+       </div>
++      {userMenu ? (
++        <SiteChatUserContext
++          eventId={eventId}
++          user={userMenu.user}
++          x={userMenu.x}
++          y={userMenu.y}
++          onClose={() => setUserMenu(null)}
++          onMention={onMention}
++          videoRef={videoRef}
++        />
++      ) : null}
+     </section>
+   );
+ }
+@@ -810,13 +1207,9 @@ function SiteReplayChat({
+   const [currentMs, setCurrentMs] = useState(0);
+   const [chatStatus, setChatStatus] = useState(hasChat ? "Загрузка…" : "Чат не записан");
+   const [following, setFollowing] = useState(true);
+-  const [userMenu, setUserMenu] = useState<{ message: SiteChatMessage; x: number; y: number } | null>(null);
+-  const [userSummary, setUserSummary] = useState<SiteChatUserSummary | null>(null);
+-  const [userSummaryLoading, setUserSummaryLoading] = useState(false);
++  const [userMenu, setUserMenu] = useState<{ user: SiteChatUserIdentity; x: number; y: number } | null>(null);
+   const listRef = useRef<HTMLDivElement | null>(null);
+-  const menuRef = useRef<HTMLDivElement | null>(null);
+   const loadedRangeRef = useRef<{ from: number; to: number } | null>(null);
+-  const summaryRequestRef = useRef<AbortController | null>(null);
+ 
+   useEffect(() => {
+     setBadgeAssets({});
+@@ -997,37 +1390,27 @@ function SiteReplayChat({
+     };
+   }, [eventId, hasChat, messageCount, playbackTimeline, videoRef]);
+ 
+-  useEffect(() => () => summaryRequestRef.current?.abort(), []);
+-
+-  useEffect(() => {
+-    if (!userMenu) return;
+-    const onPointerDown = (event: PointerEvent) => {
+-      if (menuRef.current?.contains(event.target as Node)) return;
+-      setUserMenu(null);
+-    };
+-    const onKeyDown = (event: KeyboardEvent) => {
+-      if (event.key === "Escape") setUserMenu(null);
+-    };
+-    const close = () => setUserMenu(null);
+-    document.addEventListener("pointerdown", onPointerDown);
+-    window.addEventListener("keydown", onKeyDown);
+-    window.addEventListener("resize", close);
+-    return () => {
+-      document.removeEventListener("pointerdown", onPointerDown);
+-      window.removeEventListener("keydown", onKeyDown);
+-      window.removeEventListener("resize", close);
+-    };
+-  }, [userMenu]);
+-
+   const visible = useMemo(
+     () => messages.filter((message) => (message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentMs + 100).slice(-500),
+     [messages, currentMs]
+   );
+ 
+   useEffect(() => {
+-    if (!following || !listRef.current) return;
+-    listRef.current.scrollTop = listRef.current.scrollHeight;
+-  }, [visible.length, following]);
++    if (!following) return;
++    const node = listRef.current;
++    if (!node) return;
++    let frame2 = 0;
++    const frame1 = window.requestAnimationFrame(() => {
++      node.scrollTop = node.scrollHeight;
++      frame2 = window.requestAnimationFrame(() => {
++        node.scrollTop = node.scrollHeight;
++      });
++    });
++    return () => {
++      window.cancelAnimationFrame(frame1);
++      if (frame2) window.cancelAnimationFrame(frame2);
++    };
++  }, [visible.length, messages, following]);
+ 
+   function seekTo(message: SiteChatMessage) {
+     const video = videoRef.current;
+@@ -1038,54 +1421,33 @@ function SiteReplayChat({
+ 
+   function followCurrent() {
+     setFollowing(true);
+-    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
++    const node = listRef.current;
++    if (!node) return;
++    window.requestAnimationFrame(() => {
++      node.scrollTop = node.scrollHeight;
++    });
+   }
+ 
+   function handleChatScroll() {
+     const node = listRef.current;
+     if (!node) return;
+     const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+-    setFollowing(distance < 56);
++    setFollowing(distance <= 2);
+   }
+ 
+-  async function openUserMenu(event: React.MouseEvent<HTMLElement>, message: SiteChatMessage) {
+-    event.stopPropagation();
+-    const width = 286;
+-    const height = 230;
+-    const x = Math.max(10, Math.min(event.clientX + 10, window.innerWidth - width - 10));
+-    const y = Math.max(10, Math.min(event.clientY + 10, window.innerHeight - height - 10));
+-    setUserMenu({ message, x, y });
+-    setUserSummary(null);
+-    setUserSummaryLoading(true);
+-    summaryRequestRef.current?.abort();
+-    const controller = new AbortController();
+-    summaryRequestRef.current = controller;
+-    try {
+-      const params = new URLSearchParams();
+-      if (message.chatter_external_id) params.set("chatter_external_id", message.chatter_external_id);
+-      else if (message.chatter_login) params.set("chatter_login", message.chatter_login);
+-      else {
+-        setUserSummary({ event_id: eventId, message_count: 0 });
+-        return;
+-      }
+-      const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/user-summary?${params.toString()}`), {
+-        cache: "no-store",
+-        signal: controller.signal,
+-      });
+-      if (!response.ok) throw new Error(await response.text());
+-      setUserSummary(await response.json() as SiteChatUserSummary);
+-    } catch (e) {
+-      if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("chat user summary unavailable", e);
+-    } finally {
+-      if (!controller.signal.aborted) setUserSummaryLoading(false);
+-    }
++  function handleChatWheel(event: React.WheelEvent<HTMLDivElement>) {
++    if (event.deltaY < 0) setFollowing(false);
+   }
+ 
+-  const menuMessage = userMenu?.message;
+-  const menuName = menuMessage?.chatter_name || menuMessage?.chatter_login || "Гость";
+-  const menuLogin = menuMessage?.chatter_login || "";
+-  const menuColor = safeChatColor(menuMessage?.color) || "#ff8a32";
+-  const menuBadges = menuMessage ? chatBadges(menuMessage.badges, badgeAssets).slice(0, 4) : [];
++  function handleChatKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
++    if (["ArrowUp", "PageUp", "Home"].includes(event.key)) setFollowing(false);
++  }
++
++  function openUserMenu(event: React.MouseEvent<HTMLElement>, message: SiteChatMessage) {
++    event.stopPropagation();
++    const position = chatUserMenuPosition(event.clientX, event.clientY);
++    setUserMenu({ user: message, ...position });
++  }
+ 
+   return (
+     <aside className="site-replay-chat">
+@@ -1096,7 +1458,7 @@ function SiteReplayChat({
+         </div>
+         <span>{chatStatus}</span>
+       </div>
+-      <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll}>
++      <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onTouchMove={() => setFollowing(false)} onKeyDown={handleChatKeyDown} tabIndex={0}>
+         {visible.length === 0 ? (
+           <div className="site-replay-chat-empty">{hasChat ? "В этой точке таймлайна сообщений пока нет." : "Для этого события чат не записан."}</div>
+         ) : visible.map((message) => {
+@@ -1129,6 +1491,9 @@ function SiteReplayChat({
+                       alt={badge.title}
+                       title={badge.title}
+                       loading="lazy"
++                      onLoad={() => {
++                        if (following && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
++                      }}
+                       key={badge.key}
+                     />
+                   ) : (
+@@ -1141,13 +1506,13 @@ function SiteReplayChat({
+                     type="button"
+                     className="site-chat-author"
+                     style={{ color: authorColor }}
+-                    onClick={(event) => void openUserMenu(event, message)}
++                    onClick={(event) => openUserMenu(event, message)}
+                     title={`Открыть профиль ${author}`}
+                   >{author}</button>
+                   {message.bits ? <span className="site-chat-bits">{message.bits.toLocaleString("ru-RU")} bits</span> : null}
+                   {specialType ? <span className="site-chat-type">{specialType}</span> : null}
+                   <span className="site-chat-text" style={message.is_action && authorColor ? { color: authorColor } : undefined}>
+-                    <ChatMessageFragments message={message} />
++                    <ChatMessageFragments message={message} onAssetLoad={() => { if (following && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }} />
+                   </span>
+                 </div>
+               </div>
+@@ -1160,52 +1525,16 @@ function SiteReplayChat({
+       ) : null}
+       <div className="site-replay-chat-foot">Клик по времени — перемотка · клик по нику — профиль и статистика</div>
+ 
+-      {userMenu && menuMessage ? (
+-        <div
+-          className="site-chat-user-menu"
+-          ref={menuRef}
+-          style={{ left: userMenu.x, top: userMenu.y }}
+-          role="dialog"
+-          aria-label={`Профиль ${menuName}`}
+-        >
+-          <div className="site-chat-user-head">
+-            <div className="site-chat-user-avatar" style={{ background: menuColor }}>{menuName.slice(0, 1).toUpperCase()}</div>
+-            <div className="site-chat-user-identity">
+-              <strong style={{ color: menuColor }}>{menuName}</strong>
+-              {menuLogin ? <span>@{menuLogin}</span> : <span>пользователь чата</span>}
+-              {menuBadges.length > 0 ? (
+-                <div className="site-chat-user-badges">
+-                  {menuBadges.map((badge) => badge.imageUrl ? (
+-                    <img key={badge.key} src={badge.imageUrl} alt={badge.title} title={badge.title} />
+-                  ) : <span key={badge.key} title={badge.title}>{badge.label}</span>)}
+-                </div>
+-              ) : null}
+-            </div>
+-          </div>
+-          <div className="site-chat-user-stat">
+-            <span>Все сообщения</span>
+-            <strong aria-label={userSummaryLoading ? "Загружается количество сообщений" : undefined}>
+-              {userSummaryLoading ? <i className="site-inline-spinner" /> : (userSummary?.message_count ?? "—").toLocaleString("ru-RU")}
+-            </strong>
+-          </div>
+-          {menuLogin ? (
+-            <a className="site-chat-user-action" href={`https://www.twitch.tv/${encodeURIComponent(menuLogin)}`} target="_blank" rel="noreferrer">
+-              <span>Посмотреть профиль</span><b>↗</b>
+-            </a>
+-          ) : (
+-            <div className="site-chat-user-action is-disabled"><span>Посмотреть профиль</span><b>↗</b></div>
+-          )}
+-          <button
+-            className="site-chat-user-action"
+-            type="button"
+-            onClick={() => {
+-              onMention?.(`@${menuLogin || menuName}`);
+-              setUserMenu(null);
+-            }}
+-          >
+-            <span>Отметить в комментарии</span><b>@</b>
+-          </button>
+-        </div>
++      {userMenu ? (
++        <SiteChatUserContext
++          eventId={eventId}
++          user={userMenu.user}
++          x={userMenu.x}
++          y={userMenu.y}
++          onClose={() => setUserMenu(null)}
++          onMention={onMention}
++          videoRef={videoRef}
++        />
+       ) : null}
+     </aside>
+   );
+@@ -2197,6 +2526,8 @@ function App() {
+                   eventId={selectedSiteEvent.id}
+                   hasChat={selectedSiteEvent.has_chat}
+                   totalMessages={selectedSiteEvent.chat_message_count || 0}
++                  videoRef={siteVideoRef}
++                  onMention={mentionSiteComment}
+                 />
+               </section>
+ 
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 08e96c7..e1af275 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -491,8 +491,8 @@ td { font-variant-numeric: tabular-nums; }
+ .streamvault-app .site-replay-chat-message { grid-template-columns: 48px minmax(0,1fr); gap: 7px; padding: 5px 3px; }
+ .site-chat-author { display: inline; margin: 0 5px 0 0; padding: 0; border: 0; border-radius: 0; background: transparent; font: inherit; font-weight: 800; line-height: inherit; vertical-align: baseline; cursor: context-menu; }
+ .site-chat-author:hover { text-decoration: underline; text-underline-offset: 2px; }
+-.site-chat-follow { position: absolute; z-index: 5; right: 12px; bottom: 39px; border: 1px solid #384552; border-radius: 999px; background: rgba(12,17,22,.94); color: #d5dce2; padding: 7px 10px; font-size: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.35); }
+-.site-chat-follow:hover { border-color: var(--sv-orange); color: var(--sv-orange-2); }
++.site-chat-follow { position: absolute; z-index: 5; left: 50%; bottom: 43px; transform: translateX(-50%); border: 1px solid var(--sv-orange, #ff7818); border-radius: 999px; background: linear-gradient(180deg, var(--sv-orange-2, #ff9b37), var(--sv-orange, #ff7818)); color: #1b1008; padding: 8px 14px; font-size: 10px; font-weight: 850; white-space: nowrap; box-shadow: 0 10px 30px rgba(255,120,24,.24), 0 8px 30px rgba(0,0,0,.35); }
++.site-chat-follow:hover { filter: brightness(1.08); box-shadow: 0 12px 34px rgba(255,120,24,.34), 0 8px 30px rgba(0,0,0,.35); }
+ .site-chat-user-menu {
+   position: fixed;
+   z-index: 100;
+@@ -516,12 +516,52 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-user-badges span { display: inline-flex; align-items: center; min-height: 14px; padding: 0 3px; border: 1px solid #43505d; border-radius: 4px; color: #cfd7dd; font-size: 7px; font-weight: 850; }
+ .site-chat-user-stat, .site-chat-user-action { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 13px; border: 0; border-bottom: 1px solid #1b242c; background: transparent; color: #dbe1e6; font-size: 11px; text-decoration: none; }
+ .site-chat-user-stat { color: #aeb8c1; }
++.site-chat-user-stat.is-button { width: 100%; cursor: pointer; text-align: left; }
++.site-chat-user-stat.is-button:hover { background: #151d24; color: var(--sv-orange-2, #ff9b37); }
+ .site-chat-user-stat strong { min-width: 32px; display: inline-flex; justify-content: flex-end; color: #fff; font-variant-numeric: tabular-nums; }
+ .site-chat-user-action { width: 100%; cursor: pointer; text-align: left; }
+ .site-chat-user-action:hover { background: #151d24; color: var(--sv-orange-2, #ff9b37); }
+ .site-chat-user-action:last-child { border-bottom: 0; }
+ .site-chat-user-action b { color: #71808e; font-size: 13px; }
+ .site-chat-user-action.is-disabled { opacity: .42; cursor: default; }
++.site-chat-user-action-label { display: inline-flex; align-items: center; gap: 7px; }
++.site-twitch-icon { width: 15px; height: 15px; flex: 0 0 auto; color: #a970ff; }
++.site-chat-history-backdrop { position: fixed; inset: 0; z-index: 160; display: grid; place-items: center; padding: 24px; background: rgba(3,6,9,.72); backdrop-filter: blur(8px); }
++.site-chat-history-modal { width: min(760px, calc(100vw - 32px)); height: min(78vh, 760px); min-height: 460px; display: grid; grid-template-rows: auto auto minmax(0,1fr); overflow: hidden; border: 1px solid #34404b; border-radius: 17px; background: #0e141a; color: #eef2f6; box-shadow: 0 28px 90px rgba(0,0,0,.68); }
++.site-chat-history-head { min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 17px; border-bottom: 1px solid #202a33; background: linear-gradient(180deg, rgba(255,255,255,.025), transparent); }
++.site-chat-history-head > div { min-width: 0; display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 2px 8px; }
++.site-chat-history-head span { grid-column: 1 / -1; color: var(--sv-orange-2, #ff9b37); font-size: 9px; font-weight: 900; letter-spacing: .09em; }
++.site-chat-history-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; }
++.site-chat-history-head small { color: #73808b; font-size: 10px; }
++.site-chat-history-head > button { width: 34px; height: 34px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid #2a3540; border-radius: 10px; background: #121920; color: #aeb7bf; font-size: 21px; line-height: 1; cursor: pointer; }
++.site-chat-history-head > button:hover { border-color: #4a5865; color: #fff; }
++.site-chat-history-tabs { display: flex; gap: 4px; padding: 9px 12px; border-bottom: 1px solid #1c252d; background: #0b1015; }
++.site-chat-history-tabs button { min-height: 32px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #7e8993; padding: 0 13px; font-size: 11px; font-weight: 800; cursor: pointer; }
++.site-chat-history-tabs button:hover { color: #dce2e7; background: #131a21; }
++.site-chat-history-tabs button.active { border-color: rgba(255,120,24,.22); background: rgba(255,120,24,.13); color: var(--sv-orange-2, #ff9b37); }
++.site-chat-history-content { min-height: 0; overflow-y: auto; padding: 14px; scrollbar-width: thin; scrollbar-color: #33404d transparent; }
++.site-chat-history-section-title { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
++.site-chat-history-section-title > div { min-width: 0; display: grid; gap: 3px; }
++.site-chat-history-section-title strong { font-size: 13px; }
++.site-chat-history-section-title > span { color: #6f7a84; font-size: 10px; white-space: nowrap; }
++.site-chat-history-back { width: max-content; border: 0; background: transparent; color: #7d8994; padding: 0; font-size: 10px; cursor: pointer; }
++.site-chat-history-back:hover { color: var(--sv-orange-2, #ff9b37); }
++.site-chat-history-events { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
++.site-chat-history-event { min-height: 104px; display: grid; grid-template-rows: 1fr auto; overflow: hidden; border: 1px solid #202a33; border-radius: 12px; background: #11181f; color: #edf1f4; padding: 0; text-align: left; cursor: pointer; }
++.site-chat-history-event:hover { border-color: rgba(255,120,24,.58); transform: translateY(-1px); }
++.site-chat-history-event strong { display: flex; align-items: center; padding: 13px; overflow: hidden; font-size: 12px; line-height: 1.35; }
++.site-chat-history-event span { display: flex; align-items: center; justify-content: space-between; min-height: 36px; border-top: 1px solid #202a33; background: #0d1318; color: #7e8993; padding: 0 13px; font-size: 10px; }
++.site-chat-history-event span b { color: var(--sv-orange-2, #ff9b37); font-variant-numeric: tabular-nums; }
++.site-chat-history-messages { display: grid; }
++.site-chat-history-message { display: grid; grid-template-columns: 64px minmax(0,1fr); gap: 10px; padding: 9px 4px; border-bottom: 1px solid #182128; }
++.site-chat-history-message:last-child { border-bottom: 0; }
++.site-chat-history-message > button { align-self: start; border: 0; background: transparent; color: var(--sv-orange-2, #ff9b37); padding: 1px 0; text-align: left; font-size: 10px; font-variant-numeric: tabular-nums; cursor: pointer; }
++.site-chat-history-message > button:disabled { color: #626e79; cursor: default; }
++.site-chat-history-message > div { min-width: 0; }
++.site-chat-history-message small { display: block; margin-bottom: 3px; overflow: hidden; color: #6f7a84; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
++.site-chat-history-message p { margin: 0; color: #d6dce1; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
++.site-chat-history-loading, .site-chat-history-empty { min-height: 120px; display: grid; place-items: center; color: #707b85; font-size: 11px; text-align: center; }
++.site-chat-history-error { margin-bottom: 10px; padding: 9px 11px; border: 1px solid #713a3a; border-radius: 9px; background: #261718; color: #e6aaaa; font-size: 10px; }
+ .site-inline-spinner { width: 13px; height: 13px; display: inline-block; border: 2px solid #3c4752; border-top-color: #f5f7f8; border-radius: 50%; animation: site-inline-spin .7s linear infinite; }
+ @keyframes site-inline-spin { to { transform: rotate(360deg); } }
+ 
+@@ -586,17 +626,28 @@ td { font-variant-numeric: tabular-nums; }
+ .streamvault-chat-stats-head strong { font-size: 13px; }
+ .streamvault-chat-stats-head small { color: #66717c; font-size: 10px; text-align: right; }
+ .streamvault-chat-stats-grid { display: grid; grid-template-columns: .8fr .8fr 1.2fr 1.2fr; }
+-.streamvault-chat-stats-grid > div { min-width: 0; display: grid; align-content: center; gap: 4px; min-height: 68px; padding: 10px 13px; border-right: 1px solid var(--sv-line-soft); }
+-.streamvault-chat-stats-grid > div:last-child { border-right: 0; }
++.streamvault-chat-stats-grid > div, .streamvault-chat-stats-grid > button { min-width: 0; display: grid; align-content: center; gap: 4px; min-height: 68px; padding: 10px 13px; border: 0; border-right: 1px solid var(--sv-line-soft); border-radius: 0; background: transparent; color: inherit; text-align: left; }
++.streamvault-chat-stats-grid > div:last-child, .streamvault-chat-stats-grid > button:last-child { border-right: 0; }
+ .streamvault-chat-stats-grid span { color: #6f7a84; font-size: 10px; }
+ .streamvault-chat-stats-grid strong { min-height: 17px; display: flex; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-variant-numeric: tabular-nums; }
+ .streamvault-chat-stats-grid .user strong { color: #e7ebee; font-size: 12px; }
++.streamvault-chat-stats-grid button.user { cursor: pointer; }
++.streamvault-chat-stats-grid button.user:hover:not(:disabled) { background: rgba(255,120,24,.07); }
++.streamvault-chat-stats-grid button.user:hover:not(:disabled) strong { color: var(--sv-orange-2); }
++.streamvault-chat-stats-grid button.user:disabled { cursor: default; }
+ .streamvault-chat-stats-grid small { color: #76828d; font-size: 9px; }
+ @media (max-width: 660px) {
+   .streamvault-chat-stats-head { align-items: flex-start; flex-direction: column; gap: 5px; }
+   .streamvault-chat-stats-head small { text-align: left; }
+   .streamvault-chat-stats-grid { grid-template-columns: 1fr 1fr; }
+-  .streamvault-chat-stats-grid > div { border-bottom: 1px solid var(--sv-line-soft); }
+-  .streamvault-chat-stats-grid > div:nth-child(2n) { border-right: 0; }
+-  .streamvault-chat-stats-grid > div:nth-last-child(-n+2) { border-bottom: 0; }
++  .streamvault-chat-stats-grid > div, .streamvault-chat-stats-grid > button { border-bottom: 1px solid var(--sv-line-soft); }
++  .streamvault-chat-stats-grid > div:nth-child(2n), .streamvault-chat-stats-grid > button:nth-child(2n) { border-right: 0; }
++  .streamvault-chat-stats-grid > div:nth-last-child(-n+2), .streamvault-chat-stats-grid > button:nth-last-child(-n+2) { border-bottom: 0; }
++}
++
++@media (max-width: 680px) {
++  .site-chat-history-backdrop { padding: 10px; }
++  .site-chat-history-modal { width: calc(100vw - 20px); height: min(88vh, 780px); min-height: 420px; border-radius: 14px; }
++  .site-chat-history-events { grid-template-columns: 1fr; }
++  .site-chat-history-message { grid-template-columns: 54px minmax(0,1fr); }
+ }
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+index ae556ea..e98af1b 100644
+--- a/tests/test_site_catalog.py
++++ b/tests/test_site_catalog.py
+@@ -162,3 +162,41 @@ def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
+     assert 'position: fixed;' in css
+     assert '.streamvault-watch-layout' in css
+     assert '.streamvault-recording-grid' in css
++
++
++def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
++    route = _read("apps/api/app/routers/site.py")
++    web = _read("apps/web/src/main.tsx")
++    css = _read("apps/web/src/styles.css")
++
++    assert '@router.get("/events/{event_id}/chat/user-messages")' in route
++    assert '@router.get("/events/{event_id}/chat/user-events")' in route
++    assert '"messages": [_chat_message_payload(row) for row in page]' in route
++    assert 'SiteEventPublication.event_id == MediaEvent.id' in route
++    assert 'ChatMessage.session_id.in_(session_ids)' in route
++    assert '"message_count": message_count' in route
++    assert '"badges": _chat_badges(profile_row) if profile_row else []' in route
++    assert 'ChatMessage.chatter_external_id.is_(None)' in route
++
++    assert 'function SiteChatUserContext(' in web
++    assert '/chat/user-messages?' in web
++    assert '/chat/user-events?' in web
++    assert '>Этот стрим</button>' in web
++    assert '>Другие</button>' in web
++    assert 'Сообщений:' in web
++    assert 'Посмотреть профиль Twitch' in web
++    assert 'function TwitchIcon()' in web
++    assert 'onClick={(event) => openStatsUser(event, stats?.most_active)}' in web
++    assert 'onClick={(event) => openStatsUser(event, stats?.least_active)}' in web
++
++    assert 'onWheel={handleChatWheel}' in web
++    assert 'onTouchMove={() => setFollowing(false)}' in web
++    assert 'setFollowing(distance <= 2)' in web
++    assert 'node.scrollTop = node.scrollHeight' in web
++    assert 'className="site-chat-follow"' in web
++
++    assert '.site-chat-history-modal' in css
++    assert '.site-chat-history-events' in css
++    assert '.site-chat-history-event' in css
++    assert '.site-twitch-icon' in css
++    assert 'left: 50%; bottom: 43px; transform: translateX(-50%)' in css

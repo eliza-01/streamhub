@@ -1,0 +1,160 @@
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index f853fc8..2ab107e 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -977,8 +977,8 @@ function SiteChatUserContext({
+             ) : null}
+           </div>
+         </div>
+-        <button className="site-chat-user-stat is-button" type="button" onClick={() => setMessagesOpen(true)}>
+-          <span>Все сообщения</span>
++        <button className="site-chat-user-action site-chat-user-stat is-button" type="button" onClick={() => setMessagesOpen(true)}>
++          <span className="site-chat-user-action-label">Все сообщения</span>
+           <strong aria-label={summaryLoading ? "Загружается количество сообщений" : undefined}>
+             {summaryLoading ? <i className="site-inline-spinner" /> : (summary?.message_count ?? 0).toLocaleString("ru-RU")}
+           </strong>
+@@ -1012,7 +1012,7 @@ function SiteChatUserContext({
+               <strong>{name}</strong>
+               {login ? <small>@{login}</small> : null}
+             </div>
+-            <button type="button" onClick={onClose} aria-label="Закрыть">×</button>
++            <button type="button" onClick={onClose} aria-label="Закрыть"><span className="site-chat-history-close-icon" aria-hidden="true" /></button>
+           </header>
+           <div className="site-chat-history-tabs" role="tablist">
+             <button className={historyTab === "current" ? "active" : ""} type="button" onClick={() => setHistoryTab("current")}>Этот стрим</button>
+@@ -1041,7 +1041,7 @@ function SiteChatUserContext({
+               <>
+                 <div className="site-chat-history-section-title">
+                   <div>
+-                    {historyTab === "other" ? <button className="site-chat-history-back" type="button" onClick={() => setSelectedOther(null)}>← Другие стримы</button> : null}
++                    {historyTab === "other" ? <button className="site-chat-history-back" type="button" onClick={() => setSelectedOther(null)}><span aria-hidden="true">←</span> Другие стримы</button> : null}
+                     <strong>{targetTitle}</strong>
+                   </div>
+                   <span>{historyLoading ? "…" : `${historyMessages.length.toLocaleString("ru-RU")} сообщений`}</span>
+@@ -1054,8 +1054,15 @@ function SiteChatUserContext({
+                     const canSeek = targetEventId === eventId && message.player_offset_ms != null && !!videoRef?.current;
+                     return (
+                       <article className="site-chat-history-message" key={message.id}>
+-                        <button type="button" disabled={!canSeek} onClick={() => seekHistoryMessage(message)}>
+-                          {fmtMs(message.player_offset_ms ?? message.timeline_offset_ms)}
++                        <button
++                          type="button"
++                          disabled={!canSeek}
++                          onClick={() => seekHistoryMessage(message)}
++                          title={canSeek
++                            ? `Перейти к ${fmtMs(message.player_offset_ms as number)}`
++                            : `Видео для этого сообщения пока не загружено · таймлайн Twitch ${fmtMs(message.timeline_offset_ms)}`}
++                        >
++                          {message.player_offset_ms != null ? fmtMs(message.player_offset_ms) : "—"}
+                         </button>
+                         <div>
+                           {reply ? <small>{reply}</small> : null}
+@@ -1412,13 +1419,6 @@ function SiteReplayChat({
+     };
+   }, [visible.length, messages, following]);
+ 
+-  function seekTo(message: SiteChatMessage) {
+-    const video = videoRef.current;
+-    if (!video || message.player_offset_ms == null) return;
+-    video.currentTime = Math.max(0, message.player_offset_ms / 1000);
+-    void video.play().catch(() => {});
+-  }
+-
+   function followCurrent() {
+     setFollowing(true);
+     const node = listRef.current;
+@@ -1471,12 +1471,6 @@ function SiteReplayChat({
+           const author = message.chatter_name || message.chatter_login || "Гость";
+           return (
+             <div className={`site-replay-chat-message${message.is_action ? " is-action" : ""}`} key={message.id}>
+-              <button
+-                type="button"
+-                className="site-replay-chat-time"
+-                onClick={() => seekTo(message)}
+-                title={`Исходный таймлайн стрима: ${fmtMs(message.timeline_offset_ms)}`}
+-              >{fmtMs(message.player_offset_ms ?? message.timeline_offset_ms)}</button>
+               <div className="site-replay-chat-body">
+                 {reply ? <div className="site-chat-reply" title={reply}>{reply}</div> : null}
+                 <div className="site-chat-line">
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index e1af275..4e3d3ad 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -244,7 +244,7 @@ td { font-variant-numeric: tabular-nums; }
+ .site-replay-chat-head strong { font-size: 14px; }
+ .site-replay-chat-head span { color: #7f8c98; font-size: 11px; text-align: right; }
+ .site-replay-chat-list { min-height: 0; overflow-y: auto; padding: 9px 10px 12px; scrollbar-width: thin; scrollbar-color: #33404d transparent; }
+-.site-replay-chat-message { display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 7px; padding: 5px 2px; font-size: 12px; line-height: 1.42; }
++.site-replay-chat-message { display: grid; grid-template-columns: minmax(0, 1fr); padding: 5px 2px; font-size: 12px; line-height: 1.42; }
+ .site-replay-chat-body { min-width: 0; overflow-wrap: anywhere; }
+ .site-chat-line { display: inline; min-width: 0; }
+ .site-replay-chat-message b { margin-right: 5px; font-weight: 800; color: #f5a047; }
+@@ -258,8 +258,6 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-type { padding: 0 4px; border: 1px solid #394654; color: #93a3b2; font-size: 9px; }
+ .site-chat-reply { margin: 0 0 2px; overflow: hidden; color: #7f8c98; font-size: 10px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+ .site-chat-emote { display: inline-block; width: auto; height: 22px; margin: -4px 2px -5px; vertical-align: middle; object-fit: contain; }
+-.site-replay-chat-time { border: 0; background: transparent; color: #6f7a84; padding: 0; text-align: left; cursor: pointer; font-size: 10px; font-variant-numeric: tabular-nums; }
+-.site-replay-chat-time:hover { color: #ff9f59; }
+ .site-replay-chat-empty { padding: 20px 8px; color: #7f8c98; font-size: 12px; line-height: 1.5; text-align: center; }
+ .site-replay-chat-foot { padding: 9px 11px; border-top: 1px solid #202a33; color: #65727e; font-size: 10px; line-height: 1.35; }
+ 
+@@ -488,7 +486,7 @@ td { font-variant-numeric: tabular-nums; }
+ .streamvault-app .site-replay-chat-head > div span { text-align: left; font-size: 9px; color: #66717c; }
+ .streamvault-app .site-replay-chat-head > span { color: var(--sv-muted); }
+ .streamvault-app .site-replay-chat-list { padding: 10px 10px 14px; }
+-.streamvault-app .site-replay-chat-message { grid-template-columns: 48px minmax(0,1fr); gap: 7px; padding: 5px 3px; }
++.streamvault-app .site-replay-chat-message { grid-template-columns: minmax(0,1fr); padding: 5px 3px; }
+ .site-chat-author { display: inline; margin: 0 5px 0 0; padding: 0; border: 0; border-radius: 0; background: transparent; font: inherit; font-weight: 800; line-height: inherit; vertical-align: baseline; cursor: context-menu; }
+ .site-chat-author:hover { text-decoration: underline; text-underline-offset: 2px; }
+ .site-chat-follow { position: absolute; z-index: 5; left: 50%; bottom: 43px; transform: translateX(-50%); border: 1px solid var(--sv-orange, #ff7818); border-radius: 999px; background: linear-gradient(180deg, var(--sv-orange-2, #ff9b37), var(--sv-orange, #ff7818)); color: #1b1008; padding: 8px 14px; font-size: 10px; font-weight: 850; white-space: nowrap; box-shadow: 0 10px 30px rgba(255,120,24,.24), 0 8px 30px rgba(0,0,0,.35); }
+@@ -515,9 +513,7 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-user-badges img { width: 16px; height: 16px; object-fit: contain; }
+ .site-chat-user-badges span { display: inline-flex; align-items: center; min-height: 14px; padding: 0 3px; border: 1px solid #43505d; border-radius: 4px; color: #cfd7dd; font-size: 7px; font-weight: 850; }
+ .site-chat-user-stat, .site-chat-user-action { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 13px; border: 0; border-bottom: 1px solid #1b242c; background: transparent; color: #dbe1e6; font-size: 11px; text-decoration: none; }
+-.site-chat-user-stat { color: #aeb8c1; }
+ .site-chat-user-stat.is-button { width: 100%; cursor: pointer; text-align: left; }
+-.site-chat-user-stat.is-button:hover { background: #151d24; color: var(--sv-orange-2, #ff9b37); }
+ .site-chat-user-stat strong { min-width: 32px; display: inline-flex; justify-content: flex-end; color: #fff; font-variant-numeric: tabular-nums; }
+ .site-chat-user-action { width: 100%; cursor: pointer; text-align: left; }
+ .site-chat-user-action:hover { background: #151d24; color: var(--sv-orange-2, #ff9b37); }
+@@ -533,8 +529,12 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-history-head span { grid-column: 1 / -1; color: var(--sv-orange-2, #ff9b37); font-size: 9px; font-weight: 900; letter-spacing: .09em; }
+ .site-chat-history-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; }
+ .site-chat-history-head small { color: #73808b; font-size: 10px; }
+-.site-chat-history-head > button { width: 34px; height: 34px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid #2a3540; border-radius: 10px; background: #121920; color: #aeb7bf; font-size: 21px; line-height: 1; cursor: pointer; }
++.site-chat-history-head > button { position: relative; width: 34px; height: 34px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid #2a3540; border-radius: 10px; background: #121920; color: #aeb7bf; padding: 0; cursor: pointer; }
+ .site-chat-history-head > button:hover { border-color: #4a5865; color: #fff; }
++.site-chat-history-close-icon { position: relative; display: block; width: 14px; height: 14px; }
++.site-chat-history-close-icon::before, .site-chat-history-close-icon::after { content: ""; position: absolute; left: 50%; top: 50%; width: 14px; height: 2px; border-radius: 999px; background: currentColor; transform-origin: center; }
++.site-chat-history-close-icon::before { transform: translate(-50%, -50%) rotate(45deg); }
++.site-chat-history-close-icon::after { transform: translate(-50%, -50%) rotate(-45deg); }
+ .site-chat-history-tabs { display: flex; gap: 4px; padding: 9px 12px; border-bottom: 1px solid #1c252d; background: #0b1015; }
+ .site-chat-history-tabs button { min-height: 32px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #7e8993; padding: 0 13px; font-size: 11px; font-weight: 800; cursor: pointer; }
+ .site-chat-history-tabs button:hover { color: #dce2e7; background: #131a21; }
+@@ -544,8 +544,9 @@ td { font-variant-numeric: tabular-nums; }
+ .site-chat-history-section-title > div { min-width: 0; display: grid; gap: 3px; }
+ .site-chat-history-section-title strong { font-size: 13px; }
+ .site-chat-history-section-title > span { color: #6f7a84; font-size: 10px; white-space: nowrap; }
+-.site-chat-history-back { width: max-content; border: 0; background: transparent; color: #7d8994; padding: 0; font-size: 10px; cursor: pointer; }
+-.site-chat-history-back:hover { color: var(--sv-orange-2, #ff9b37); }
++.site-chat-history-back { width: max-content; min-height: 29px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid #2a3540; border-radius: 8px; background: #121920; color: #aeb7bf; padding: 0 10px; font-size: 10px; font-weight: 800; cursor: pointer; transition: border-color .12s ease, background .12s ease, color .12s ease, transform .12s ease; }
++.site-chat-history-back:hover { border-color: rgba(255,120,24,.52); background: rgba(255,120,24,.09); color: var(--sv-orange-2, #ff9b37); transform: translateX(-1px); }
++.site-chat-history-back span { font-size: 13px; line-height: 1; }
+ .site-chat-history-events { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+ .site-chat-history-event { min-height: 104px; display: grid; grid-template-rows: 1fr auto; overflow: hidden; border: 1px solid #202a33; border-radius: 12px; background: #11181f; color: #edf1f4; padding: 0; text-align: left; cursor: pointer; }
+ .site-chat-history-event:hover { border-color: rgba(255,120,24,.58); transform: translateY(-1px); }
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+index e98af1b..e267396 100644
+--- a/tests/test_site_catalog.py
++++ b/tests/test_site_catalog.py
+@@ -82,7 +82,9 @@ def test_site_watch_exposes_persisted_chat_and_syncs_it_through_source_timeline(
+     assert 'playerToSourceMs(currentPlayer, ranges)' in web
+     assert 'sourceToPlayerMs(message.timeline_offset_ms, ranges)' in web
+     assert '(message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentMs + 100' in web
+-    assert 'video.currentTime = Math.max(0, message.player_offset_ms / 1000);' in web
++    assert 'className="site-replay-chat-time"' not in web
++    assert '{message.player_offset_ms != null ? fmtMs(message.player_offset_ms) : "—"}' in web
++    assert 'message.player_offset_ms ?? message.timeline_offset_ms' not in web
+     assert 'video.currentTime = Math.max(0, message.timeline_offset_ms / 1000);' not in web
+ 
+ 

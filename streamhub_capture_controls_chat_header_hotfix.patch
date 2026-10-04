@@ -1,0 +1,314 @@
+diff --git a/apps/chrome_extension/popup.css b/apps/chrome_extension/popup.css
+index 1258210..09e0059 100644
+--- a/apps/chrome_extension/popup.css
++++ b/apps/chrome_extension/popup.css
+@@ -5,6 +5,9 @@ h1 { margin: 0 0 14px; font-size: 20px; }
+ .status, .details, .message { background: white; border: 1px solid #e4e4e7; border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+ .status.capture-warning { white-space: pre-wrap; border-color: #ef4444; background: #fff1f2; color: #b91c1c; font-weight: 800; box-shadow: inset 3px 0 0 #ef4444; }
+ .details { font-size: 12px; line-height: 1.55; color: #52525b; white-space: pre-wrap; }
++.control-surface { min-width: 0; margin: 0; padding: 0; border: 0; }
++.control-surface[disabled] { opacity: .58; pointer-events: none; user-select: none; }
++main.is-busy .control-surface { cursor: progress; }
+ .capture-toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
+ .toggle { display: flex; gap: 8px; align-items: center; margin: 0; padding: 10px; border: 1px solid #e4e4e7; border-radius: 9px; background: white; font-size: 13px; }
+ .section-title { margin: 13px 2px 6px; color: #71717a; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+diff --git a/apps/chrome_extension/popup.html b/apps/chrome_extension/popup.html
+index f7122e7..f71b7ff 100644
+--- a/apps/chrome_extension/popup.html
++++ b/apps/chrome_extension/popup.html
+@@ -11,25 +11,27 @@
+     <h1>StreamHub</h1>
+     <div id="status" class="status">Определяю контекст…</div>
+     <div id="details" class="details"></div>
+-    <div class="capture-toggles">
+-      <label class="toggle"><input id="chat-toggle" type="checkbox" /> <span>Chat</span></label>
+-      <label class="toggle"><input id="video-toggle" type="checkbox" /> <span>Video</span></label>
+-    </div>
+-    <button id="start" class="primary wide">Start selected</button>
+-    <div class="section-title">Chat</div>
+-    <div class="actions three">
+-      <button id="pause-chat">Pause</button>
+-      <button id="resume-chat">Resume</button>
+-      <button id="stop-chat" class="danger">Stop Chat</button>
+-    </div>
+-    <div class="section-title">Video</div>
+-    <div class="actions three">
+-      <button id="pause-video">Pause</button>
+-      <button id="resume-video">Resume</button>
+-      <button id="stop-video" class="danger">Stop Video</button>
+-    </div>
+-    <button id="stop-all" class="danger wide">Stop All</button>
+-    <button id="auth" class="wide auth">Authorize Twitch</button>
++    <fieldset id="controls" class="control-surface">
++      <div class="capture-toggles">
++        <label class="toggle"><input id="chat-toggle" type="checkbox" /> <span>Chat</span></label>
++        <label class="toggle"><input id="video-toggle" type="checkbox" /> <span>Video</span></label>
++      </div>
++      <button id="start" class="primary wide">Start selected</button>
++      <div class="section-title">Chat</div>
++      <div class="actions three">
++        <button id="pause-chat">Pause</button>
++        <button id="resume-chat">Resume</button>
++        <button id="stop-chat" class="danger">Stop Chat</button>
++      </div>
++      <div class="section-title">Video</div>
++      <div class="actions three">
++        <button id="pause-video">Pause</button>
++        <button id="resume-video">Resume</button>
++        <button id="stop-video" class="danger">Stop Video</button>
++      </div>
++      <button id="stop-all" class="danger wide">Stop All</button>
++      <button id="auth" class="wide auth">Authorize Twitch</button>
++    </fieldset>
+     <div id="message" class="message"></div>
+   </main>
+   <script src="popup.js" type="module"></script>
+diff --git a/apps/chrome_extension/popup.js b/apps/chrome_extension/popup.js
+index 79f2135..ffb67ba 100644
+--- a/apps/chrome_extension/popup.js
++++ b/apps/chrome_extension/popup.js
+@@ -6,6 +6,7 @@ let currentEventId = null;
+ let activeChatSession = null;
+ let activeVideoSession = null;
+ let authRequestActive = false;
++let actionInFlight = null;
+ 
+ const $ = (id) => document.getElementById(id);
+ 
+@@ -15,6 +16,20 @@ function showMessage(text) {
+   el.classList.toggle("show", Boolean(text));
+ }
+ 
++function bindAction(id, handler) {
++  $(id).addEventListener("click", async () => {
++    if (actionInFlight || authRequestActive) return;
++    actionInFlight = id;
++    render();
++    try {
++      await handler();
++    } finally {
++      actionInFlight = null;
++      render();
++    }
++  });
++}
++
+ async function getState() {
+   const defaults = {
+     apiBaseUrl: "http://localhost:18741",
+@@ -86,8 +101,15 @@ function render() {
+     : statusText;
+   $("status").classList.toggle("capture-warning", partialCapture);
+ 
+-  $("chat-toggle").checked = Boolean(state?.captureChatEnabled);
+-  $("video-toggle").checked = Boolean(state?.captureVideoEnabled);
++  const uiBusy = Boolean(actionInFlight || authRequestActive);
++  $("controls").disabled = uiBusy;
++  $("controls").setAttribute("aria-busy", String(uiBusy));
++  document.querySelector("main")?.classList.toggle("is-busy", uiBusy);
++
++  $("chat-toggle").checked = Boolean(activeChatSession || state?.captureChatEnabled);
++  $("video-toggle").checked = Boolean(activeVideoSession || state?.captureVideoEnabled);
++  $("chat-toggle").disabled = Boolean(activeChatSession);
++  $("video-toggle").disabled = Boolean(activeVideoSession);
+ 
+   const parts = [
+     context?.channel_login ? `channel: ${context.channel_login}` : null,
+@@ -192,7 +214,7 @@ $("video-toggle").addEventListener("change", async (event) => {
+   render();
+ });
+ 
+-$("start").addEventListener("click", async () => {
++bindAction("start", async () => {
+   showMessage("");
+   try {
+     await syncCurrentCaptureStatus({ silent: true });
+@@ -230,7 +252,7 @@ $("start").addEventListener("click", async () => {
+   }
+ });
+ 
+-$("pause-chat").addEventListener("click", async () => {
++bindAction("pause-chat", async () => {
+   try {
+     await syncCurrentCaptureStatus({ silent: true });
+     if (!activeChatSession) throw new Error("для текущего события активного Chat нет");
+@@ -240,7 +262,7 @@ $("pause-chat").addEventListener("click", async () => {
+   } catch (e) { showMessage(`Ошибка Chat Pause: ${e}`); }
+ });
+ 
+-$("resume-chat").addEventListener("click", async () => {
++bindAction("resume-chat", async () => {
+   try {
+     await syncCurrentCaptureStatus({ silent: true });
+     if (!activeChatSession) throw new Error("для текущего события активного Chat нет");
+@@ -258,7 +280,7 @@ $("resume-chat").addEventListener("click", async () => {
+   } catch (e) { showMessage(`Ошибка Chat Resume: ${e}`); }
+ });
+ 
+-$("stop-chat").addEventListener("click", async () => {
++bindAction("stop-chat", async () => {
+   if (!confirm("Остановить только Chat? Video продолжит запись, если он активен.")) return;
+   try {
+     await syncCurrentCaptureStatus({ silent: true });
+@@ -274,7 +296,7 @@ $("stop-chat").addEventListener("click", async () => {
+   } catch (e) { showMessage(`Ошибка Stop Chat: ${e}`); }
+ });
+ 
+-$("pause-video").addEventListener("click", async () => {
++bindAction("pause-video", async () => {
+   try {
+     await syncCurrentCaptureStatus({ silent: true });
+     if (!activeVideoSession) throw new Error("для текущего события активного Video нет");
+@@ -284,7 +306,7 @@ $("pause-video").addEventListener("click", async () => {
+   } catch (e) { showMessage(`Ошибка Video Pause: ${e}`); }
+ });
+ 
+-$("resume-video").addEventListener("click", async () => {
++bindAction("resume-video", async () => {
+   try {
+     await syncCurrentCaptureStatus({ silent: true });
+     if (!activeVideoSession) throw new Error("для текущего события активного Video нет");
+@@ -294,7 +316,7 @@ $("resume-video").addEventListener("click", async () => {
+   } catch (e) { showMessage(`Ошибка Video Resume: ${e}`); }
+ });
+ 
+-$("stop-video").addEventListener("click", async () => {
++bindAction("stop-video", async () => {
+   if (!confirm("Остановить только Video? Chat продолжит сбор, если он активен.")) return;
+   try {
+     await syncCurrentCaptureStatus({ silent: true });
+@@ -308,7 +330,7 @@ $("stop-video").addEventListener("click", async () => {
+   } catch (e) { showMessage(`Ошибка Stop Video: ${e}`); }
+ });
+ 
+-$("stop-all").addEventListener("click", async () => {
++bindAction("stop-all", async () => {
+   if (!confirm("Остановить Chat и Video текущего события?")) return;
+   try {
+     await syncCurrentCaptureStatus({ silent: true });
+@@ -323,8 +345,9 @@ $("stop-all").addEventListener("click", async () => {
+ });
+ 
+ async function startTwitchAuthorization({ automatic = false } = {}) {
+-  if (authRequestActive) return;
++  if (authRequestActive || (actionInFlight && !automatic)) return;
+   authRequestActive = true;
++  render();
+   try {
+     const result = await api(
+       "/api/v1/auth/twitch/device/start",
+@@ -344,21 +367,25 @@ async function startTwitchAuthorization({ automatic = false } = {}) {
+         if (status.status === "authorized") {
+           clearInterval(pollTimer);
+           authRequestActive = false;
++          render();
+           showMessage(`Twitch авторизован: ${status.identity?.login || "ok"}`);
+           await syncCurrentCaptureStatus({ silent: true });
+         } else if (["failed", "expired"].includes(status.status)) {
+           clearInterval(pollTimer);
+           authRequestActive = false;
++          render();
+           showMessage(`Авторизация: ${status.status}${status.error ? ` — ${status.error}` : ""}`);
+         }
+       } catch (e) {
+         clearInterval(pollTimer);
+         authRequestActive = false;
++        render();
+         showMessage(`Ошибка проверки авторизации: ${e}`);
+       }
+     }, Math.max(3000, Number(result.interval || 5) * 1000));
+   } catch (e) {
+     authRequestActive = false;
++    render();
+     showMessage(`Ошибка авторизации: ${e}`);
+   }
+ }
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 78dcd2c..f4bbf8d 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -1382,8 +1382,7 @@ function SiteReplayChat({
+           .sort((a, b) => ((a.player_offset_ms || 0) - (b.player_offset_ms || 0)) || (a.id - b.id));
+         setMessages(mapped);
+         loadedRangeRef.current = { from, to };
+-        const approximate = playbackTimeline.mapping_quality === "approximate" || playbackTimeline.mapping_quality === "mixed";
+-        setChatStatus(`${messageCount.toLocaleString("ru-RU")} сообщений${approximate ? " · sync ≈" : ""}`);
++        setChatStatus(`${messageCount.toLocaleString("ru-RU")} сообщений`);
+       } catch (e) {
+         if (!(e instanceof DOMException && e.name === "AbortError")) {
+           setChatStatus(`Ошибка чата: ${String(e)}`);
+@@ -1508,10 +1507,7 @@ function SiteReplayChat({
+   return (
+     <aside className="site-replay-chat">
+       <div className="site-replay-chat-head">
+-        <div>
+-          <strong>Чат записи</strong>
+-          <span>Синхронно с видео</span>
+-        </div>
++        <div><strong>Чат записи</strong></div>
+         <span>{chatStatus}</span>
+       </div>
+       <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onTouchMove={handleChatTouchMove} onKeyDown={handleChatKeyDown} tabIndex={0}>
+@@ -2751,11 +2747,11 @@ function App() {
+     const eventDate = selectedVideo.event?.source_started_at_utc || selectedVideo.recording_started_at_utc || selectedVideo.created_at;
+     return (
+       <main>
+-        <button className="link" onClick={() => setSelectedVideo(null)}>← {view === "video-manager" ? "Video Manager" : "Events"}</button>
+         <div className="video-manager-event-date">
+           <span>Дата проведения события</span>
+           <strong>{new Date(eventDate).toLocaleString("ru-RU")}</strong>
+         </div>
++        <button className="link" onClick={() => setSelectedVideo(null)}>← {view === "video-manager" ? "Video Manager" : "Events"}</button>
+         <header className="detail-header">
+           <div>
+             <h1>Video Manager · output</h1>
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 18fbf10..17082bc 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -660,7 +660,7 @@ td { font-variant-numeric: tabular-nums; }
+ }
+ 
+ .video-manager-event-date {
+-  margin: 12px 0 14px;
++  margin: 0 0 14px;
+   padding: 12px 16px;
+   display: flex;
+   align-items: center;
+diff --git a/tests/test_repo_guards.py b/tests/test_repo_guards.py
+index 21f14c9..cf0bac8 100644
+--- a/tests/test_repo_guards.py
++++ b/tests/test_repo_guards.py
+@@ -203,3 +203,32 @@ def test_chat_ui_has_flat_context_actions_and_clean_history_header():
+     assert "СООБЩЕНИЯ В СТРИМЕ" in web
+     assert "border-radius: 0; box-shadow: inset 0 -1px #1b242c" in css
+     assert "border-right-color: var(--sv-line-soft)" in css
++
++
++
++def test_extension_locks_controls_during_capture_actions_and_active_mode_toggle():
++    root = Path(__file__).resolve().parents[1]
++    popup = (root / "apps/chrome_extension/popup.js").read_text()
++    popup_html = (root / "apps/chrome_extension/popup.html").read_text()
++    popup_css = (root / "apps/chrome_extension/popup.css").read_text()
++
++    assert 'id="controls"' in popup_html
++    assert "let actionInFlight = null;" in popup
++    assert '$("controls").disabled = uiBusy;' in popup
++    assert '$("chat-toggle").disabled = Boolean(activeChatSession);' in popup
++    assert '$("video-toggle").disabled = Boolean(activeVideoSession);' in popup
++    assert 'bindAction("start"' in popup
++    assert 'bindAction("pause-chat"' in popup
++    assert 'bindAction("stop-all"' in popup
++    assert ".control-surface[disabled]" in popup_css
++    assert "pointer-events: none" in popup_css
++
++
++def test_public_chat_header_hides_sync_copy_and_video_manager_date_is_first():
++    root = Path(__file__).resolve().parents[1]
++    web = (root / "apps/web/src/main.tsx").read_text()
++
++    assert "Синхронно с видео" not in web
++    assert "sync ≈" not in web
++    selected_video = web.split("if (selectedVideo)", 1)[1]
++    assert selected_video.index('<div className="video-manager-event-date">') < selected_video.index('<button className="link"')
