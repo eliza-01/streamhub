@@ -99,3 +99,19 @@ def test_event_identity_session_trash_data_migration_is_additive():
     assert "SET deleted_at_utc = NULL, deletion_group_id = NULL" in migration
     assert "UPDATE sessions" not in migration
     assert "UPDATE video_sessions" not in migration
+
+
+def test_permanent_event_purge_cleans_site_editorial_state_only_when_event_is_orphaned():
+    root = Path(__file__).resolve().parents[1]
+    events = (root / "apps/api/app/routers/events.py").read_text()
+
+    assert "async def _clear_orphaned_site_editorial_state" in events
+    assert 'return [], {"cleared": False, "reason": "event_has_remaining_sessions"}' in events
+    assert "delete(SiteEventTimecode).where(SiteEventTimecode.event_id == event.id)" in events
+    assert "delete(EventCategory).where(EventCategory.event_id == event.id)" in events
+    assert "delete(SiteEventAsset).where(SiteEventAsset.event_id == event.id)" in events
+    assert "delete(SiteEventPublication).where(SiteEventPublication.event_id == event.id)" in events
+    assert "event.display_title = event.title" in events
+    assert 'action="site_editorial_cleanup"' in events
+    assert "remove_site_asset_file(settings, storage_key)" in events
+    assert '"site_asset_files_cleanup_requested"' in events

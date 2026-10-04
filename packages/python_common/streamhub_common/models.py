@@ -70,6 +70,7 @@ class SiteEventPublication(Base):
         UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), primary_key=True
     )
     published_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+    hidden_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 

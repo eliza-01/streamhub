@@ -199,7 +199,9 @@ def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
 
     assert 'onWheel={handleChatWheel}' in web
     assert 'onTouchMove={handleChatTouchMove}' in web
-    assert 'setFollowing(distance <= 2)' in web
+    assert 'const movingUp = currentTop < previousTop - 0.5' in web
+    assert 'if (movingUp && distance > 4) setFollowing(false)' in web
+    assert 'if (movingDown && distance <= 2) setFollowing(true)' in web
     assert 'node.scrollTo({ top: node.scrollHeight, behavior: "smooth" })' in web
     assert 'node.scrollTop = node.scrollHeight' in web
     assert 'className="site-chat-follow"' in web
@@ -223,7 +225,9 @@ def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
     assert '.site-chat-history-events' in css
     assert '.site-chat-history-event' in css
     assert '.site-twitch-icon' in css
-    assert 'left: 50%; bottom: 43px; transform: translateX(-50%)' in css
+    assert 'left: 50%; bottom: 12px; transform: translateX(-50%)' in css
+    assert 'const onWaiting = () => markLoadingSoon(320)' in web
+    assert 'video.addEventListener("timeupdate", markProgressing)' in web
 
 
 def test_site_admin_assets_migration_keeps_source_title_and_persistent_asset_metadata():
@@ -275,6 +279,7 @@ def test_site_admin_api_and_ui_manage_display_title_cover_and_four_manual_frames
     assert 'onPublish={() => void openSitePublisher()}' not in web
     assert '.site-admin-modal' in css
     assert '.streamvault-artwork.has-image' in css
+    assert '"Файл или Ctrl+V"' not in web
 
 
 def test_site_timecodes_use_event_owned_relational_storage_and_public_payloads():
@@ -325,3 +330,27 @@ def test_public_event_renders_clickable_timecodes_and_active_section_heading_wit
     assert '<span>{siteEvents.length.toLocaleString("ru-RU")}</span>' not in web
     assert '.streamvault-timecodes-list button' in css
     assert '.streamvault-hero > h1, .streamvault-recordings h2 { margin: 0; color: var(--sv-orange-2);' in css
+
+
+def test_site_visibility_is_persistent_and_public_routes_require_visible_active_storage():
+    migration = _read("migrations/versions/0013_site_publication_visibility.py")
+    models = _read("packages/python_common/streamhub_common/models.py")
+    route = _read("apps/api/app/routers/site.py")
+    web = _read("apps/web/src/main.tsx")
+
+    assert 'down_revision = "0012_site_event_timecodes"' in migration
+    assert '"hidden_at_utc"' in migration
+    assert 'hidden_at_utc: Mapped[datetime | None]' in models
+    assert '@router.put("/admin/events/{event_id}/visibility")' in route
+    assert 'action="site_hide" if payload.hidden else "site_show"' in route
+    assert 'SiteEventPublication.hidden_at_utc.is_(None)' in route
+    assert 'MediaEvent.id.in_(storage_ids)' in route
+    assert 'async def _require_public_event' in route
+    assert 'await _require_public_event(db, event_id)' in route
+    assert 'delete(EventCategory).where(EventCategory.event_id == event_id)' not in route.split(
+        '@router.delete("/admin/events/{event_id}")', 1
+    )[1]
+    assert 'Скрыть публикацию' in web
+    assert 'Показать публикацию' in web
+    assert '/visibility`' in web
+    assert 'event.hidden ? "Скрыто" : "Опубликовано"' in web

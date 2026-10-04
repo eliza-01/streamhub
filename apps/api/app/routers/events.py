@@ -10,14 +10,19 @@ from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from streamhub_common.db import get_db
+from streamhub_common.settings import get_settings
 from streamhub_common.models import (
     AuditLog,
     CaptureJob,
     ChatEvent,
     ChatMessage,
+    EventCategory,
     MediaEvent,
     Session,
     SessionSegment,
+    SiteEventAsset,
+    SiteEventPublication,
+    SiteEventTimecode,
     VideoSegment,
     VideoSession,
 )
@@ -41,8 +46,10 @@ from .video import (
     video_progress_percent,
     video_session_dict,
 )
+from ..site_assets import remove_site_asset_file
 
 router = APIRouter(prefix="/api/v1", tags=["events"])
+settings = get_settings()
 
 
 def event_dict(row: MediaEvent) -> dict:
@@ -481,6 +488,66 @@ async def restore_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     }
 
 
+async def _event_has_any_sessions(db: AsyncSession, event_id: uuid.UUID) -> bool:
+    chat_exists = (
+        await db.execute(select(Session.id).where(Session.event_id == event_id).limit(1))
+    ).first() is not None
+    if chat_exists:
+        return True
+    return (
+        await db.execute(select(VideoSession.id).where(VideoSession.event_id == event_id).limit(1))
+    ).first() is not None
+
+
+async def _clear_orphaned_site_editorial_state(
+    db: AsyncSession, event: MediaEvent
+) -> tuple[list[str], dict]:
+    """Remove site-only customization once a canonical Event has no sessions left."""
+    if await _event_has_any_sessions(db, event.id):
+        return [], {"cleared": False, "reason": "event_has_remaining_sessions"}
+
+    assets = (
+        await db.execute(
+            select(SiteEventAsset).where(SiteEventAsset.event_id == event.id)
+        )
+    ).scalars().all()
+    storage_keys = [row.storage_key for row in assets if row.storage_key]
+    timecode_count = int(
+        (
+            await db.scalar(
+                select(func.count()).select_from(SiteEventTimecode).where(SiteEventTimecode.event_id == event.id)
+            )
+        )
+        or 0
+    )
+    category_count = int(
+        (
+            await db.scalar(
+                select(func.count()).select_from(EventCategory).where(EventCategory.event_id == event.id)
+            )
+        )
+        or 0
+    )
+    had_publication = await db.get(SiteEventPublication, event.id) is not None
+
+    await db.execute(delete(SiteEventTimecode).where(SiteEventTimecode.event_id == event.id))
+    await db.execute(delete(EventCategory).where(EventCategory.event_id == event.id))
+    await db.execute(delete(SiteEventAsset).where(SiteEventAsset.event_id == event.id))
+    await db.execute(delete(SiteEventPublication).where(SiteEventPublication.event_id == event.id))
+    event.display_title = event.title
+
+    payload = {
+        "cleared": True,
+        "assets": len(storage_keys),
+        "timecodes": timecode_count,
+        "categories": category_count,
+        "publication": had_publication,
+        "display_title_reset": True,
+    }
+    db.add(AuditLog(event_id=event.id, action="site_editorial_cleanup", payload_json=payload))
+    return storage_keys, payload
+
+
 @router.delete("/deleted/events/{event_id}")
 async def purge_event(
     event_id: uuid.UUID,
@@ -508,7 +575,18 @@ async def purge_event(
         )
     ).scalars().all()
     if not chat_rows and not video_rows:
-        return {"ok": True, "already_purged": True, "video_sessions": 0, "chat_sessions": 0}
+        storage_keys, site_cleanup = await _clear_orphaned_site_editorial_state(db, event)
+        await db.commit()
+        for storage_key in storage_keys:
+            remove_site_asset_file(settings, storage_key)
+        return {
+            "ok": True,
+            "already_purged": True,
+            "video_sessions": 0,
+            "chat_sessions": 0,
+            "site_cleanup": site_cleanup,
+            "site_asset_files_cleanup_requested": len(storage_keys),
+        }
 
     for row in chat_rows:
         await ensure_capture_is_idle_for_delete(db, row)
@@ -538,13 +616,18 @@ async def purge_event(
             await db.execute(delete(SessionSegment).where(SessionSegment.session_id.in_(chat_ids)))
             await db.execute(delete(CaptureJob).where(CaptureJob.session_id.in_(chat_ids)))
             await db.execute(delete(Session).where(Session.id.in_(chat_ids)))
+        storage_keys, site_cleanup = await _clear_orphaned_site_editorial_state(db, event)
         event.deleted_at_utc = None
         event.deletion_group_id = None
         db.add(
             AuditLog(
                 event_id=event_id,
                 action="event_trash_purge",
-                payload_json={"chat_sessions": len(chat_rows), "video_sessions": len(video_rows)},
+                payload_json={
+                    "chat_sessions": len(chat_rows),
+                    "video_sessions": len(video_rows),
+                    "site_cleanup": site_cleanup,
+                },
             )
         )
         await db.commit()
@@ -556,6 +639,9 @@ async def purge_event(
             except Exception:
                 pass
         raise
+
+    for storage_key in storage_keys:
+        remove_site_asset_file(settings, storage_key)
 
     cleanup_pending = 0
     for ticket in tickets:
@@ -569,4 +655,6 @@ async def purge_event(
         "video_sessions": len(video_rows),
         "chat_sessions": len(chat_rows),
         "filesystem_cleanup_pending": cleanup_pending,
+        "site_cleanup": site_cleanup,
+        "site_asset_files_cleanup_requested": len(storage_keys),
     }

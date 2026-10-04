@@ -1,0 +1,3 @@
+После замены любой иконки в будущем достаточно:
+docker compose build web
+docker compose up -d --no-deps --force-recreate web

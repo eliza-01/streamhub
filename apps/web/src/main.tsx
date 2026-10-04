@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
@@ -432,6 +432,7 @@ type SiteAvailableEvent = {
 
 type SiteAdminEvent = SiteAvailableEvent & {
   published: boolean;
+  hidden: boolean;
   categories: Array<SiteCategory & { position?: number }>;
   timecodes: SiteTimecode[];
 };
@@ -491,6 +492,124 @@ type VideoCaptureProgress = {
 };
 
 type ViewMode = "events" | "video-manager" | "site" | "trash" | "storage";
+
+const SITE_CATEGORY_ICON_URLS: Record<string, string> = {
+  all: new URL("./assets/categories/all-videos.png", import.meta.url).href,
+  fncs: new URL("./assets/categories/fncs.png", import.meta.url).href,
+  games: new URL("./assets/categories/games.png", import.meta.url).href,
+  shows: new URL("./assets/categories/shows.png", import.meta.url).href,
+  films: new URL("./assets/categories/films.png", import.meta.url).href,
+  chatroulette: new URL("./assets/categories/chatroulette.png", import.meta.url).href,
+};
+
+const STREAMVAULT_LOGO_FRAMES = [0, 1, 2, 3, 4, 5].map(
+  (frame) => new URL(`./assets/logo/${frame}.png`, import.meta.url).href,
+);
+
+const STREAMVAULT_LOGO_FRAME_SEQUENCE: Array<[number, number]> = [
+  [0, 0],
+  [280, 1],
+  [420, 2],
+  [560, 3],
+  [700, 4],
+  [840, 5],
+  [965, 0],
+  [1090, 0],
+  [1230, 1],
+  [1370, 2],
+  [1510, 3],
+  [1650, 4],
+  [1790, 5],
+];
+const STREAMVAULT_LOGO_ANIMATION_MS = 2040;
+
+function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
+  const [frame, setFrame] = useState(0);
+  const [animating, setAnimating] = useState(false);
+  const timersRef = useRef<number[]>([]);
+  const reducedMotionRef = useRef(false);
+
+  const clearTimers = useCallback(() => {
+    timersRef.current.forEach((timer: number) => window.clearTimeout(timer));
+    timersRef.current = [];
+  }, []);
+
+  const playLogoAnimation = useCallback(() => {
+    if (reducedMotionRef.current) return;
+    clearTimers();
+    setFrame(0);
+    setAnimating(false);
+    timersRef.current.push(window.setTimeout(() => setAnimating(true), 16));
+    STREAMVAULT_LOGO_FRAME_SEQUENCE.forEach(([at, nextFrame]) => {
+      timersRef.current.push(window.setTimeout(() => setFrame(nextFrame), at));
+    });
+    timersRef.current.push(window.setTimeout(() => {
+      setFrame(0);
+      setAnimating(false);
+      timersRef.current = [];
+    }, 2520));
+  }, [clearTimers]);
+
+  useEffect(() => {
+    STREAMVAULT_LOGO_FRAMES.forEach((src) => {
+      const image = new Image();
+      image.decoding = "async";
+      image.src = src;
+    });
+
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const syncReducedMotion = () => {
+      reducedMotionRef.current = reducedMotion.matches;
+      if (reducedMotion.matches) {
+        clearTimers();
+        setFrame(0);
+        setAnimating(false);
+      }
+    };
+    syncReducedMotion();
+    reducedMotion.addEventListener?.("change", syncReducedMotion);
+
+    const introTimer = window.setTimeout(playLogoAnimation, 650);
+    timersRef.current.push(introTimer);
+    return () => {
+      reducedMotion.removeEventListener?.("change", syncReducedMotion);
+      clearTimers();
+    };
+  }, [clearTimers, playLogoAnimation]);
+
+  return (
+    <button
+      type="button"
+      className="streamvault-brand"
+      onClick={onActivate}
+      onPointerEnter={playLogoAnimation}
+      onFocus={playLogoAnimation}
+      aria-label="StreamVault — главная"
+    >
+      <span className={`streamvault-brand-mark${animating ? " is-animating" : ""}`} aria-hidden="true">
+        <span className="streamvault-brand-tilt">
+          <span className="streamvault-brand-scale">
+            <img src={STREAMVAULT_LOGO_FRAMES[frame]} alt="" draggable={false} />
+          </span>
+        </span>
+      </span>
+      <span className="streamvault-brand-copy" aria-hidden="true">
+        <strong>MRW</strong>
+        <small>v0.1</small>
+      </span>
+    </button>
+  );
+}
+
+function SiteCategoryIcon({ slug }: { slug: string }) {
+  const src = SITE_CATEGORY_ICON_URLS[slug];
+  if (!src) return <span className="streamvault-category-icon is-fallback" aria-hidden="true">•</span>;
+  return (
+    <span className="streamvault-category-icon" aria-hidden="true">
+      <img src={src} alt="" draggable={false} />
+    </span>
+  );
+}
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
 const PROGRESS_POLL_MS = 5000;
@@ -636,51 +755,113 @@ function TelegramVideoPlayer({
   autoPlay?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const autoPlayAttemptedRef = useRef(false);
+  const autoPlayStartedRef = useRef(false);
+  const autoPlayInFlightRef = useRef(false);
+  const autoPlayMutedFallbackRef = useRef(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     const source = apiUrl(playlistUrl);
-    autoPlayAttemptedRef.current = false;
+    autoPlayStartedRef.current = false;
+    autoPlayInFlightRef.current = false;
+    autoPlayMutedFallbackRef.current = false;
     setLoading(true);
+    let loadingTimer: number | null = null;
 
+    const clearLoadingTimer = () => {
+      if (loadingTimer == null) return;
+      window.clearTimeout(loadingTimer);
+      loadingTimer = null;
+    };
     const tryAutoPlay = () => {
-      if (!autoPlay || autoPlayAttemptedRef.current) return;
-      autoPlayAttemptedRef.current = true;
-      void video.play().catch((error) => {
-        if (!(error instanceof DOMException) || error.name !== "NotAllowedError") {
-          autoPlayAttemptedRef.current = false;
+      if (!autoPlay || autoPlayStartedRef.current || autoPlayInFlightRef.current) return;
+      if (!video.paused && !video.ended) {
+        autoPlayStartedRef.current = true;
+        return;
+      }
+
+      autoPlayInFlightRef.current = true;
+      const attempt = async () => {
+        try {
+          if (!autoPlayMutedFallbackRef.current) {
+            video.muted = false;
+            video.defaultMuted = false;
+          }
+          await video.play();
+          autoPlayStartedRef.current = true;
+          return;
+        } catch (error) {
+          if (!(error instanceof DOMException) || error.name !== "NotAllowedError") return;
         }
+
+        // Browsers routinely block audible autoplay in a freshly opened tab.
+        // A muted retry is standards-compliant and guarantees that the event starts playing.
+        autoPlayMutedFallbackRef.current = true;
+        video.muted = true;
+        video.defaultMuted = true;
+        try {
+          await video.play();
+          autoPlayStartedRef.current = true;
+        } catch {
+          // A later canplay/playing lifecycle event will retry.
+        }
+      };
+
+      void attempt().finally(() => {
+        autoPlayInFlightRef.current = false;
       });
     };
-    const markLoading = () => setLoading(true);
+    const markLoadingNow = () => {
+      clearLoadingTimer();
+      setLoading(true);
+    };
+    const markLoadingSoon = (delay: number) => {
+      clearLoadingTimer();
+      loadingTimer = window.setTimeout(() => {
+        loadingTimer = null;
+        if (video.seeking || video.readyState < 3) setLoading(true);
+      }, delay);
+    };
     const markReady = () => {
+      clearLoadingTimer();
       setLoading(false);
       tryAutoPlay();
     };
-    const markSeeked = () => {
-      if (video.readyState >= 3) setLoading(false);
+    const markProgressing = () => {
+      if (video.seeking || video.readyState < 2) return;
+      clearLoadingTimer();
+      setLoading(false);
     };
+    const markSeeked = () => {
+      if (video.readyState >= 2) markReady();
+      else markLoadingSoon(120);
+    };
+    const onWaiting = () => markLoadingSoon(320);
+    const onStalled = () => markLoadingSoon(450);
+    const onSeeking = () => markLoadingSoon(180);
 
-    video.addEventListener("loadstart", markLoading);
-    video.addEventListener("waiting", markLoading);
-    video.addEventListener("stalled", markLoading);
-    video.addEventListener("seeking", markLoading);
+    video.addEventListener("loadstart", markLoadingNow);
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("stalled", onStalled);
+    video.addEventListener("seeking", onSeeking);
     video.addEventListener("loadeddata", markReady);
     video.addEventListener("canplay", markReady);
     video.addEventListener("playing", markReady);
+    video.addEventListener("timeupdate", markProgressing);
     video.addEventListener("seeked", markSeeked);
 
     const detachMediaEvents = () => {
-      video.removeEventListener("loadstart", markLoading);
-      video.removeEventListener("waiting", markLoading);
-      video.removeEventListener("stalled", markLoading);
-      video.removeEventListener("seeking", markLoading);
+      clearLoadingTimer();
+      video.removeEventListener("loadstart", markLoadingNow);
+      video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("stalled", onStalled);
+      video.removeEventListener("seeking", onSeeking);
       video.removeEventListener("loadeddata", markReady);
       video.removeEventListener("canplay", markReady);
       video.removeEventListener("playing", markReady);
+      video.removeEventListener("timeupdate", markProgressing);
       video.removeEventListener("seeked", markSeeked);
     };
 
@@ -1368,6 +1549,7 @@ function SiteReplayChat({
   const loadedRangeRef = useRef<{ from: number; to: number } | null>(null);
   const smoothFollowRef = useRef(false);
   const smoothFollowTimerRef = useRef<number | null>(null);
+  const lastChatScrollTopRef = useRef(0);
 
   useEffect(() => {
     setBadgeAssets({});
@@ -1433,6 +1615,7 @@ function SiteReplayChat({
   useEffect(() => {
     setMessages([]);
     setFollowing(true);
+    lastChatScrollTopRef.current = 0;
     loadedRangeRef.current = null;
     if (!hasChat) {
       setChatStatus("Чат не записан");
@@ -1639,15 +1822,26 @@ function SiteReplayChat({
   }
 
   function handleChatScroll() {
-    if (smoothFollowRef.current) return;
-    if (visible.length === 0) {
-      setFollowing(true);
-      return;
-    }
     const node = listRef.current;
     if (!node) return;
-    const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
-    setFollowing(distance <= 2);
+    const previousTop = lastChatScrollTopRef.current;
+    const currentTop = node.scrollTop;
+    const movingUp = currentTop < previousTop - 0.5;
+    const movingDown = currentTop > previousTop + 0.5;
+    lastChatScrollTopRef.current = currentTop;
+
+    if (smoothFollowRef.current) return;
+    if (visible.length === 0) {
+      if (!following) setFollowing(true);
+      return;
+    }
+
+    const distance = Math.max(0, node.scrollHeight - currentTop - node.clientHeight);
+    if (following) {
+      if (movingUp && distance > 4) setFollowing(false);
+      return;
+    }
+    if (movingDown && distance <= 2) setFollowing(true);
   }
 
   function handleChatWheel(event: React.WheelEvent<HTMLDivElement>) {
@@ -1816,9 +2010,7 @@ function StreamVaultHeader({
   return (
     <header className="streamvault-header">
       <div className="streamvault-header-inner">
-        <button type="button" className="streamvault-brand" onClick={onBrand} aria-label="StreamVault — главная">
-          <span className="streamvault-brand-mark" aria-hidden="true" />
-        </button>
+        <StreamVaultAnimatedBrand onActivate={onBrand} />
         <div
           className="streamvault-search-wrap"
           onBlur={(event) => {
@@ -1943,6 +2135,7 @@ function SiteAdminPanel({
   onSaveTitle,
   onUpload,
   onSaveTimecodes,
+  onToggleVisibility,
   onAddEvent,
   onClose,
 }: {
@@ -1954,6 +2147,7 @@ function SiteAdminPanel({
   onSaveTitle: (eventId: string) => void;
   onUpload: (eventId: string, slot: string, file: File) => void;
   onSaveTimecodes: (eventId: string, items: Array<{ offset_ms: number; title: string }>) => Promise<boolean>;
+  onToggleVisibility: (eventId: string, hidden: boolean) => void;
   onAddEvent: () => void;
   onClose: () => void;
 }) {
@@ -2062,7 +2256,9 @@ function SiteAdminPanel({
                   <summary className="site-admin-event-summary">
                     <div className="site-admin-summary-cell is-status">
                       <span>Статус</span>
-                      <strong className={`site-admin-publish-state ${event.published ? "is-published" : ""}`}>{event.published ? "Опубликовано" : "Не опубликовано"}</strong>
+                      <strong className={`site-admin-publish-state ${event.published && !event.hidden ? "is-published" : ""}${event.hidden ? " is-hidden" : ""}`}>
+                        {!event.published ? "Не опубликовано" : event.hidden ? "Скрыто" : "Опубликовано"}
+                      </strong>
                     </div>
                     <div className="site-admin-summary-cell is-date">
                       <span>Дата</span>
@@ -2086,6 +2282,19 @@ function SiteAdminPanel({
                       <span>Исходное название: <strong>{event.source_title || "—"}</strong></span>
                       <span>TG {event.linked_parts}/{event.ready_parts}</span>
                     </div>
+                    {event.published ? (
+                      <div className="site-admin-publication-actions">
+                        <span>{event.hidden ? "Публикация скрыта с публичного сайта. Данные и оформление сохранены." : "Публикация видна на публичном сайте."}</span>
+                        <button
+                          type="button"
+                          className={event.hidden ? "is-show" : "is-hide"}
+                          disabled={Boolean(actionKey)}
+                          onClick={() => onToggleVisibility(event.id, !event.hidden)}
+                        >
+                          {actionKey === `visibility:${event.id}` ? "Сохраняю…" : event.hidden ? "Показать публикацию" : "Скрыть публикацию"}
+                        </button>
+                      </div>
+                    ) : null}
                     <div className="site-admin-title-editor">
                       <label>
                         <span>Отображаемое название</span>
@@ -2109,7 +2318,7 @@ function SiteAdminPanel({
                           >
                             <span>{label}</span>
                             <div>{asset ? <img src={apiUrl(asset.url)} alt="" /> : <b>+</b>}</div>
-                            <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height} · заменить` : "Файл или Ctrl+V"}</small>
+                            {busy || asset ? <small>{busy ? "Загрузка…" : `${asset?.width}×${asset?.height} · заменить`}</small> : null}
                           </button>
                         );
                       })}
@@ -2611,6 +2820,26 @@ function App() {
       setSiteAdminEvents((current) => current.map((event) => event.id === eventId ? { ...event, title: value, display_title: value } : event));
       setSiteEvents((current) => current.map((event) => event.id === eventId ? { ...event, title: value, display_title: value } : event));
       setSelectedSiteEvent((current) => current?.id === eventId ? { ...current, title: value, display_title: value } : current);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSiteAdminActionKey(null);
+    }
+  }
+
+  async function toggleSiteVisibility(eventId: string, hidden: boolean) {
+    setSiteAdminActionKey(`visibility:${eventId}`);
+    try {
+      const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}/visibility`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hidden }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setSiteAdminEvents((current) => current.map((event) => event.id === eventId ? { ...event, hidden } : event));
+      await loadSiteFeed(siteCategory, "");
+      if (hidden && selectedSiteEvent?.id === eventId) closeSiteEvent();
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -3380,6 +3609,7 @@ function App() {
             onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
             onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
             onSaveTimecodes={saveSiteTimecodes}
+            onToggleVisibility={(eventId, hidden) => void toggleSiteVisibility(eventId, hidden)}
             onAddEvent={() => { setSiteAdminOpen(false); closeSiteEvent(); void openSitePublisher(); }}
             onClose={() => setSiteAdminOpen(false)}
           />
@@ -3405,18 +3635,30 @@ function App() {
         />
 
         <nav className="streamvault-mobile-categories" aria-label="Категории">
-          <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}>Все</button>
+          <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}>
+            <SiteCategoryIcon slug="all" />
+            <span className="streamvault-category-label">Все</span>
+          </button>
           {siteCategories.map((category) => (
-            <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, ""); }}>{category.label}</button>
+            <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, ""); }}>
+              <SiteCategoryIcon slug={category.slug} />
+              <span className="streamvault-category-label">{category.label}</span>
+            </button>
           ))}
         </nav>
 
         <div className="streamvault-home-shell">
           <aside className="streamvault-sidebar">
             <nav aria-label="Категории видео">
-              <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}><span>⌂</span>Все видео</button>
+              <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}>
+                <SiteCategoryIcon slug="all" />
+                <span className="streamvault-category-label">Все видео</span>
+              </button>
               {siteCategories.map((category) => (
-                <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, ""); }}><span>•</span>{category.label}</button>
+                <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, ""); }}>
+                  <SiteCategoryIcon slug={category.slug} />
+                  <span className="streamvault-category-label">{category.label}</span>
+                </button>
               ))}
             </nav>
           </aside>
@@ -3512,6 +3754,7 @@ function App() {
             onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
             onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
             onSaveTimecodes={saveSiteTimecodes}
+            onToggleVisibility={(eventId, hidden) => void toggleSiteVisibility(eventId, hidden)}
             onAddEvent={() => { setSiteAdminOpen(false); void openSitePublisher(); }}
             onClose={() => setSiteAdminOpen(false)}
           />

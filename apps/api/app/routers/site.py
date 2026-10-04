@@ -59,6 +59,10 @@ class SiteEventAdminUpdateRequest(BaseModel):
     display_title: str = Field(min_length=1, max_length=1024)
 
 
+class SiteVisibilityRequest(BaseModel):
+    hidden: bool
+
+
 class SiteTimecodeInput(BaseModel):
     offset_ms: int = Field(ge=0, le=2_592_000_000)
     title: str = Field(min_length=1, max_length=255)
@@ -211,6 +215,23 @@ async def _storage_event_ids(db: AsyncSession) -> set[uuid.UUID]:
         )
     ).scalars().all()
     return set(rows)
+
+
+async def _event_has_public_storage(db: AsyncSession, event_id: uuid.UUID) -> bool:
+    row = (
+        await db.execute(
+            select(VideoSession.id)
+            .join(VideoPart, VideoPart.video_session_id == VideoSession.id)
+            .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
+            .where(
+                VideoSession.event_id == event_id,
+                VideoSession.deleted_at_utc.is_(None),
+                VideoPart.status == "ready",
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
 
 
 async def _event_categories(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[dict]]:
@@ -377,6 +398,22 @@ async def _published_event_row(db: AsyncSession, event_id: uuid.UUID) -> tuple[S
     ).first()
 
 
+async def _public_event_row(db: AsyncSession, event_id: uuid.UUID) -> tuple[SiteEventPublication, MediaEvent] | None:
+    row = await _published_event_row(db, event_id)
+    if row is None or row[0].hidden_at_utc is not None:
+        return None
+    if not await _event_has_public_storage(db, event_id):
+        return None
+    return row
+
+
+async def _require_public_event(db: AsyncSession, event_id: uuid.UUID) -> tuple[SiteEventPublication, MediaEvent]:
+    row = await _public_event_row(db, event_id)
+    if row is None:
+        raise HTTPException(404, "site event not found")
+    return row
+
+
 async def _replace_categories(db: AsyncSession, event_id: uuid.UUID, slugs: list[str]) -> None:
     slugs = _clean_category_slugs(slugs)
     rows = await _category_rows(db, slugs)
@@ -433,7 +470,23 @@ async def site_feed(
         category_clean = None
     query_clean = (q or "").strip() or None
 
-    stmt = select(SiteEventPublication, MediaEvent).join(MediaEvent, MediaEvent.id == SiteEventPublication.event_id)
+    storage_ids = await _storage_event_ids(db)
+    if not storage_ids:
+        categories = await _active_categories(db)
+        return {
+            "categories": [{"slug": row.slug, "label": row.label_ru} for row in categories],
+            "latest": None,
+            "items": [],
+        }
+
+    stmt = (
+        select(SiteEventPublication, MediaEvent)
+        .join(MediaEvent, MediaEvent.id == SiteEventPublication.event_id)
+        .where(
+            SiteEventPublication.hidden_at_utc.is_(None),
+            MediaEvent.id.in_(storage_ids),
+        )
+    )
     if category_clean:
         stmt = stmt.where(
             select(EventCategory.event_id)
@@ -472,9 +525,7 @@ async def site_feed(
 
 @router.get("/events/{event_id}")
 async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
-    row = await _published_event_row(db, event_id)
-    if row is None:
-        raise HTTPException(404, "site event not found")
+    row = await _require_public_event(db, event_id)
     return (await _site_payloads(db, [row], include_timecodes=True))[0]
 
 
@@ -534,9 +585,7 @@ def _merge_timeline_range(
 
 @router.get("/events/{event_id}/playback-timeline")
 async def site_event_playback_timeline(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
-    publication_row = await _published_event_row(db, event_id)
-    if publication_row is None:
-        raise HTTPException(404, "site event not found")
+    publication_row = await _require_public_event(db, event_id)
     _publication, event = publication_row
 
     video_summaries = (await _video_summaries(db, [event_id])).get(event_id, [])
@@ -742,8 +791,7 @@ def _chat_identity(
 
 @router.get("/events/{event_id}/chat/badges")
 async def site_event_chat_badges(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
-    if await db.get(SiteEventPublication, event_id) is None:
-        raise HTTPException(404, "site event not found")
+    await _require_public_event(db, event_id)
     event = await db.get(MediaEvent, event_id)
     if event is None:
         raise HTTPException(404, "event not found")
@@ -796,8 +844,7 @@ async def site_event_chat_messages(
     page_size: int = Query(default=1000, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    if await db.get(SiteEventPublication, event_id) is None:
-        raise HTTPException(404, "site event not found")
+    await _require_public_event(db, event_id)
 
     start = max(0, int(from_ms))
     end = max(start, int(to_ms))
@@ -868,8 +915,7 @@ def _chat_user_payload(row) -> dict | None:
 
 @router.get("/events/{event_id}/chat/stats")
 async def site_event_chat_stats(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
-    if await db.get(SiteEventPublication, event_id) is None:
-        raise HTTPException(404, "site event not found")
+    await _require_public_event(db, event_id)
 
     primary = await _primary_chat_session(db, event_id)
     if primary is None:
@@ -936,8 +982,7 @@ async def site_event_chat_user_summary(
     chatter_login: str | None = Query(default=None, max_length=255),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    if await db.get(SiteEventPublication, event_id) is None:
-        raise HTTPException(404, "site event not found")
+    await _require_public_event(db, event_id)
 
     external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
 
@@ -1004,8 +1049,7 @@ async def site_event_chat_user_messages(
     page_size: int = Query(default=500, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    if await db.get(SiteEventPublication, event_id) is None:
-        raise HTTPException(404, "site event not found")
+    await _require_public_event(db, event_id)
 
     external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
     primary = await _primary_chat_session(db, event_id)
@@ -1068,17 +1112,23 @@ async def site_event_chat_user_events(
     chatter_login: str | None = Query(default=None, max_length=255),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    if await db.get(SiteEventPublication, event_id) is None:
-        raise HTTPException(404, "site event not found")
+    await _require_public_event(db, event_id)
 
     external_id, login, identity = _chat_identity(chatter_external_id, chatter_login)
-    events = (
-        await db.execute(
-            select(MediaEvent)
-            .join(SiteEventPublication, SiteEventPublication.event_id == MediaEvent.id)
-            .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
-        )
-    ).scalars().all()
+    storage_ids = await _storage_event_ids(db)
+    events = []
+    if storage_ids:
+        events = (
+            await db.execute(
+                select(MediaEvent)
+                .join(SiteEventPublication, SiteEventPublication.event_id == MediaEvent.id)
+                .where(
+                    SiteEventPublication.hidden_at_utc.is_(None),
+                    MediaEvent.id.in_(storage_ids),
+                )
+                .order_by(MediaEvent.source_started_at_utc.desc(), MediaEvent.created_at.desc())
+            )
+        ).scalars().all()
     event_ids = [event.id for event in events]
     summaries = await _chat_summaries(db, event_ids)
 
@@ -1144,13 +1194,12 @@ async def site_admin_events(db: AsyncSession = Depends(get_db)) -> dict:
         )
     ).scalars().all()
     event_ids = [event.id for event in events]
-    publication_ids = set(
-        (
-            await db.execute(
-                select(SiteEventPublication.event_id).where(SiteEventPublication.event_id.in_(event_ids))
-            )
-        ).scalars().all()
-    )
+    publication_rows = (
+        await db.execute(
+            select(SiteEventPublication).where(SiteEventPublication.event_id.in_(event_ids))
+        )
+    ).scalars().all()
+    publications = {row.event_id: row for row in publication_rows}
     categories = await _event_categories(db, event_ids)
     assets = await _event_assets(db, event_ids)
     timecodes = await _event_timecodes(db, event_ids)
@@ -1159,7 +1208,8 @@ async def site_admin_events(db: AsyncSession = Depends(get_db)) -> dict:
         "items": [
             {
                 **_base_event_payload(event),
-                "published": event.id in publication_ids,
+                "published": event.id in publications,
+                "hidden": bool(publications.get(event.id) and publications[event.id].hidden_at_utc is not None),
                 "categories": categories.get(event.id, []),
                 "assets": _site_assets_payload(assets.get(event.id, {})),
                 "timecodes": [_site_timecode_payload(row) for row in timecodes.get(event.id, [])],
@@ -1361,6 +1411,27 @@ async def publish_site_event(payload: SitePublishRequest, db: AsyncSession = Dep
     return (await _site_payloads(db, [row]))[0]
 
 
+@router.put("/admin/events/{event_id}/visibility")
+async def update_site_event_visibility(
+    event_id: uuid.UUID,
+    payload: SiteVisibilityRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    publication = await db.get(SiteEventPublication, event_id)
+    if publication is None:
+        raise HTTPException(404, "site event not found")
+    publication.hidden_at_utc = datetime.now(UTC).replace(tzinfo=None) if payload.hidden else None
+    db.add(
+        AuditLog(
+            event_id=event_id,
+            action="site_hide" if payload.hidden else "site_show",
+            payload_json={"hidden": bool(payload.hidden)},
+        )
+    )
+    await db.commit()
+    return {"ok": True, "event_id": str(event_id), "hidden": bool(payload.hidden)}
+
+
 @router.put("/admin/events/{event_id}/categories")
 async def update_site_event_categories(
     event_id: uuid.UUID,
@@ -1380,12 +1451,12 @@ async def update_site_event_categories(
 
 
 @router.delete("/admin/events/{event_id}")
-async def unpublish_site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+async def hide_site_event_legacy(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    """Backward-compatible hide action; editorial metadata is intentionally preserved."""
     publication = await db.get(SiteEventPublication, event_id)
     if publication is None:
         return {"ok": True, "already_unpublished": True}
-    await db.execute(delete(EventCategory).where(EventCategory.event_id == event_id))
-    await db.delete(publication)
-    db.add(AuditLog(event_id=event_id, action="site_unpublish", payload_json={}))
+    publication.hidden_at_utc = datetime.now(UTC).replace(tzinfo=None)
+    db.add(AuditLog(event_id=event_id, action="site_hide", payload_json={"legacy_delete_route": True}))
     await db.commit()
-    return {"ok": True, "event_id": str(event_id)}
+    return {"ok": True, "event_id": str(event_id), "hidden": True}
