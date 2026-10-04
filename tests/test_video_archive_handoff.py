@@ -214,3 +214,34 @@ def test_purge_file_move_fallback_rolls_back_if_one_artifact_is_locked(tmp_path:
     assert first.read_bytes() == b"first"
     assert second.read_bytes() == b"second"
     assert not quarantine.exists()
+
+
+def test_storage_worker_claim_failures_are_retried_and_supervised_in_source():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps/video_recorder/app/main.py").read_text()
+    worker = source.split("async def storage_worker_loop", 1)[1].split(
+        "async def storage_worker_supervisor", 1
+    )[0]
+    supervisor = source.split("async def storage_worker_supervisor", 1)[1].split(
+        "async def recover_archive_handoff", 1
+    )[0]
+
+    assert "candidates = await claim_archive_batch()" in worker
+    assert "except Exception as exc:" in worker
+    assert "storage worker claim failed" in worker
+    assert "await storage_worker_retry_delay()" in worker
+    assert "await storage_worker_loop(worker_no)" in supervisor
+    assert "supervisor will restart it" in supervisor
+
+
+def test_recorder_health_exposes_archive_workers_and_backlog_in_source():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps/video_recorder/app/main.py").read_text()
+    health = source.split('@app.get("/health/ready")', 1)[1].split(
+        '@app.post("/internal/v1/video-sessions"', 1
+    )[0]
+
+    assert '"storage_workers": worker_status' in health
+    assert '"archive_backlog": archive_backlog' in health
+    assert '"dead_workers": dead_workers' in health
+    assert 'VideoSegment.storage_state.in_({"spool", "copying"})' in health

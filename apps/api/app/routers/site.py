@@ -509,6 +509,7 @@ async def site_event_chat_messages(
             {
                 "id": int(row.id),
                 "timeline_offset_ms": int(row.timeline_offset_ms),
+                "chatter_external_id": row.chatter_external_id,
                 "chatter_login": row.chatter_login,
                 "chatter_name": row.chatter_name,
                 "color": _chat_color(row),
@@ -527,6 +528,138 @@ async def site_event_chat_messages(
         ],
         "has_more": has_more,
         "next_cursor": next_cursor,
+    }
+
+
+def _chat_user_payload(row) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "chatter_external_id": row.chatter_external_id,
+        "chatter_login": row.chatter_login,
+        "chatter_name": row.chatter_name,
+        "message_count": int(row.message_count or 0),
+    }
+
+
+@router.get("/events/{event_id}/chat/stats")
+async def site_event_chat_stats(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    if await db.get(SiteEventPublication, event_id) is None:
+        raise HTTPException(404, "site event not found")
+
+    primary = await _primary_chat_session(db, event_id)
+    if primary is None:
+        return {
+            "event_id": str(event_id),
+            "chat_session_id": None,
+            "total_messages": 0,
+            "unique_chatters": 0,
+            "most_active": None,
+            "least_active": None,
+        }
+
+    session, total_messages = primary
+    identity_key = func.coalesce(
+        ChatMessage.chatter_external_id,
+        func.lower(ChatMessage.chatter_login),
+        func.lower(ChatMessage.chatter_name),
+        "unknown",
+    )
+    grouped = (
+        select(
+            identity_key.label("identity_key"),
+            func.max(ChatMessage.chatter_external_id).label("chatter_external_id"),
+            func.max(ChatMessage.chatter_login).label("chatter_login"),
+            func.max(ChatMessage.chatter_name).label("chatter_name"),
+            func.count(ChatMessage.id).label("message_count"),
+        )
+        .where(
+            ChatMessage.session_id == session.id,
+            ChatMessage.is_deleted.is_(False),
+        )
+        .group_by(identity_key)
+        .subquery()
+    )
+    unique_chatters = int((await db.scalar(select(func.count()).select_from(grouped))) or 0)
+    most_active = (
+        await db.execute(
+            select(grouped)
+            .order_by(grouped.c.message_count.desc(), grouped.c.identity_key.asc())
+            .limit(1)
+        )
+    ).first()
+    least_active = (
+        await db.execute(
+            select(grouped)
+            .order_by(grouped.c.message_count.asc(), grouped.c.identity_key.asc())
+            .limit(1)
+        )
+    ).first()
+    return {
+        "event_id": str(event_id),
+        "chat_session_id": str(session.id),
+        "total_messages": int(total_messages or 0),
+        "unique_chatters": unique_chatters,
+        "most_active": _chat_user_payload(most_active),
+        "least_active": _chat_user_payload(least_active),
+    }
+
+
+@router.get("/events/{event_id}/chat/user-summary")
+async def site_event_chat_user_summary(
+    event_id: uuid.UUID,
+    chatter_external_id: str | None = Query(default=None, max_length=64),
+    chatter_login: str | None = Query(default=None, max_length=255),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if await db.get(SiteEventPublication, event_id) is None:
+        raise HTTPException(404, "site event not found")
+
+    external_id = str(chatter_external_id or "").strip()
+    login = str(chatter_login or "").strip()
+    if not external_id and not login:
+        raise HTTPException(400, "chatter_external_id or chatter_login is required")
+
+    primary = await _primary_chat_session(db, event_id)
+    if primary is None:
+        return {
+            "event_id": str(event_id),
+            "chat_session_id": None,
+            "chatter_external_id": external_id or None,
+            "chatter_login": login or None,
+            "message_count": 0,
+            "first_message_ms": None,
+            "last_message_ms": None,
+        }
+
+    session, _message_count = primary
+    identity = (
+        ChatMessage.chatter_external_id == external_id
+        if external_id
+        else func.lower(ChatMessage.chatter_login) == login.lower()
+    )
+    count_row = (
+        await db.execute(
+            select(
+                func.count(ChatMessage.id),
+                func.min(ChatMessage.timeline_offset_ms),
+                func.max(ChatMessage.timeline_offset_ms),
+            ).where(
+                ChatMessage.session_id == session.id,
+                ChatMessage.is_deleted.is_(False),
+                identity,
+            )
+        )
+    ).one()
+    count, first_ms, last_ms = count_row
+    return {
+        "event_id": str(event_id),
+        "chat_session_id": str(session.id),
+        "chatter_external_id": external_id or None,
+        "chatter_login": login or None,
+        "message_count": int(count or 0),
+        "first_message_ms": int(first_ms) if first_ms is not None else None,
+        "last_message_ms": int(last_ms) if last_ms is not None else None,
     }
 
 

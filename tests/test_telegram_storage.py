@@ -95,3 +95,14 @@ def test_playback_reads_only_the_required_part_byte_range():
     assert "Telegram sync" in web
     assert "telegramBindings[part.id]" in web
     assert "TelegramVideoPlayer" in web
+
+
+def test_telegram_playback_refreshes_expired_file_reference_and_resumes_range():
+    root = Path(__file__).resolve().parents[1]
+    storage = (root / "apps/api/app/telegram/storage.py").read_text()
+
+    assert "FileReferenceExpiredError" in storage
+    assert "refresh: bool = False" in storage
+    assert "refresh=refreshed_reference" in storage
+    assert "current_offset += len(data)" in storage
+    assert "Telegram file reference expired again after refresh" in storage

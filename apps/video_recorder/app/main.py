@@ -337,6 +337,62 @@ archive_shutdown = asyncio.Event()
 archive_metadata_lock = asyncio.Lock()
 
 
+@dataclass
+class StorageWorkerStatus:
+    worker_no: int
+    state: str = "starting"
+    heartbeat_at_utc: datetime | None = None
+    last_success_at_utc: datetime | None = None
+    last_error_at_utc: datetime | None = None
+    last_error: str | None = None
+    claim_failures: int = 0
+    batch_failures: int = 0
+    batches_completed: int = 0
+    segments_completed: int = 0
+    current_session_id: uuid.UUID | None = None
+    current_batch_size: int = 0
+
+
+storage_worker_status: dict[int, StorageWorkerStatus] = {}
+storage_worker_tasks: dict[int, asyncio.Task] = {}
+
+
+def touch_storage_worker(worker_no: int, *, state: str | None = None) -> StorageWorkerStatus:
+    status = storage_worker_status.setdefault(worker_no, StorageWorkerStatus(worker_no=worker_no))
+    status.heartbeat_at_utc = utcnow_naive()
+    if state is not None:
+        status.state = state
+    return status
+
+
+def storage_worker_status_payload() -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for worker_no in range(1, settings.video_storage_copy_workers + 1):
+        status = storage_worker_status.get(worker_no)
+        task = storage_worker_tasks.get(worker_no)
+        if status is None:
+            result[str(worker_no)] = {
+                "state": "missing",
+                "task_alive": bool(task is not None and not task.done()),
+            }
+            continue
+        result[str(worker_no)] = {
+            "state": status.state,
+            "task_alive": bool(task is not None and not task.done()),
+            "heartbeat_at_utc": iso_utc(status.heartbeat_at_utc),
+            "last_success_at_utc": iso_utc(status.last_success_at_utc),
+            "last_error_at_utc": iso_utc(status.last_error_at_utc),
+            "last_error": status.last_error,
+            "claim_failures": status.claim_failures,
+            "batch_failures": status.batch_failures,
+            "batches_completed": status.batches_completed,
+            "segments_completed": status.segments_completed,
+            "current_session_id": str(status.current_session_id) if status.current_session_id else None,
+            "current_batch_size": status.current_batch_size,
+        }
+    return result
+
+
 def archive_source_path(candidate: ArchiveCandidate) -> Path:
     return safe_session_root(candidate.session_id) / "segments" / candidate.file_name
 
@@ -702,28 +758,105 @@ async def process_archive_batch(candidates: list[ArchiveCandidate]) -> None:
         logger.exception("failed refreshing archive metadata session=%s", session_id)
 
 
+async def storage_worker_retry_delay() -> None:
+    try:
+        await asyncio.wait_for(archive_shutdown.wait(), timeout=settings.video_archive_retry_seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def storage_worker_loop(worker_no: int) -> None:
-    while not archive_shutdown.is_set():
-        archive_wakeup.clear()
-        candidates = await claim_archive_batch()
-        if not candidates:
+    status = touch_storage_worker(worker_no, state="starting")
+    try:
+        while not archive_shutdown.is_set():
+            candidates: list[ArchiveCandidate] = []
             try:
-                await asyncio.wait_for(archive_wakeup.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-            continue
+                archive_wakeup.clear()
+                status = touch_storage_worker(worker_no, state="claiming")
+                candidates = await claim_archive_batch()
+                if not candidates:
+                    status.current_session_id = None
+                    status.current_batch_size = 0
+                    touch_storage_worker(worker_no, state="idle")
+                    try:
+                        await asyncio.wait_for(archive_wakeup.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
+                status.current_session_id = candidates[0].session_id
+                status.current_batch_size = len(candidates)
+                touch_storage_worker(worker_no, state="copying")
+                await process_archive_batch(candidates)
+                status.batches_completed += 1
+                status.segments_completed += len(candidates)
+                status.last_success_at_utc = utcnow_naive()
+                status.current_session_id = None
+                status.current_batch_size = 0
+                touch_storage_worker(worker_no, state="idle")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                now = utcnow_naive()
+                status.last_error_at_utc = now
+                status.last_error = str(exc)[:4000]
+                if candidates:
+                    status.batch_failures += 1
+                    logger.exception(
+                        "storage worker batch failed worker=%s session=%s batch=%s; retrying",
+                        worker_no,
+                        candidates[0].session_id,
+                        len(candidates),
+                    )
+                    for candidate in candidates:
+                        try:
+                            await mark_archive_failure(candidate, exc)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "storage worker could not reset failed archive candidate worker=%s "
+                                "session=%s segment=%s",
+                                worker_no,
+                                candidate.session_id,
+                                candidate.file_name,
+                            )
+                else:
+                    status.claim_failures += 1
+                    logger.exception(
+                        "storage worker claim failed worker=%s; retrying instead of stopping worker",
+                        worker_no,
+                    )
+                status.current_session_id = None
+                status.current_batch_size = 0
+                touch_storage_worker(worker_no, state="backoff")
+                await storage_worker_retry_delay()
+    finally:
+        status.current_session_id = None
+        status.current_batch_size = 0
+        touch_storage_worker(worker_no, state="stopped")
+        logger.info("storage worker stopped worker=%s", worker_no)
+
+
+async def storage_worker_supervisor(worker_no: int) -> None:
+    while not archive_shutdown.is_set():
         try:
-            await process_archive_batch(candidates)
+            await storage_worker_loop(worker_no)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            for candidate in candidates:
-                await mark_archive_failure(candidate, exc)
-            try:
-                await asyncio.wait_for(archive_shutdown.wait(), timeout=settings.video_archive_retry_seconds)
-            except asyncio.TimeoutError:
-                pass
-    logger.info("storage worker stopped worker=%s", worker_no)
+            status = touch_storage_worker(worker_no, state="restarting")
+            status.last_error_at_utc = utcnow_naive()
+            status.last_error = str(exc)[:4000]
+            logger.exception("storage worker crashed worker=%s; supervisor will restart it", worker_no)
+            await storage_worker_retry_delay()
+            continue
+        if not archive_shutdown.is_set():
+            status = touch_storage_worker(worker_no, state="restarting")
+            status.last_error_at_utc = utcnow_naive()
+            status.last_error = "storage worker exited unexpectedly"
+            logger.error("storage worker exited unexpectedly worker=%s; supervisor will restart it", worker_no)
+            await storage_worker_retry_delay()
 
 
 async def recover_archive_handoff() -> None:
@@ -1448,10 +1581,14 @@ async def lifespan(_app: FastAPI):
         output_root.mkdir(parents=True, exist_ok=True)
     archive_shutdown.clear()
     await recover_archive_handoff()
-    storage_tasks = [
-        asyncio.create_task(storage_worker_loop(worker_no), name=f"video-storage-{worker_no}")
-        for worker_no in range(1, settings.video_storage_copy_workers + 1)
-    ]
+    storage_worker_status.clear()
+    storage_worker_tasks.clear()
+    for worker_no in range(1, settings.video_storage_copy_workers + 1):
+        storage_worker_tasks[worker_no] = asyncio.create_task(
+            storage_worker_supervisor(worker_no),
+            name=f"video-storage-{worker_no}",
+        )
+    storage_tasks = list(storage_worker_tasks.values())
     watchdog = asyncio.create_task(storage_watchdog_loop(), name="video-storage-watchdog")
     migration = asyncio.create_task(storage_migration_loop(), name="video-storage-migration")
     recovery = asyncio.create_task(recover_active_sessions())
@@ -1471,6 +1608,7 @@ async def lifespan(_app: FastAPI):
         for task in storage_tasks:
             task.cancel()
         await asyncio.gather(watchdog, migration, *storage_tasks, return_exceptions=True)
+        storage_worker_tasks.clear()
 
 
 app = FastAPI(title="StreamHub Video Recorder", version="0.1.0", lifespan=lifespan)
@@ -1500,13 +1638,40 @@ async def health_ready() -> dict:
     try:
         async with SessionLocal() as db:
             await db.scalar(select(func.count()).select_from(VideoSession))
+            archive_rows = (
+                await db.execute(
+                    select(VideoSegment.storage_state, func.count(VideoSegment.id))
+                    .where(VideoSegment.storage_state.in_({"spool", "copying"}))
+                    .group_by(VideoSegment.storage_state)
+                )
+            ).all()
     except Exception as exc:
         raise HTTPException(503, detail=f"database unavailable: {exc}") from exc
+
+    archive_backlog = {str(state): int(count or 0) for state, count in archive_rows}
+    worker_status = storage_worker_status_payload()
+    dead_workers = [
+        worker_no
+        for worker_no in range(1, settings.video_storage_copy_workers + 1)
+        if worker_no not in storage_worker_tasks or storage_worker_tasks[worker_no].done()
+    ]
+    if dead_workers:
+        raise HTTPException(
+            503,
+            detail={
+                "error": "video storage worker supervisor is not running",
+                "dead_workers": dead_workers,
+                "storage_workers": worker_status,
+                "archive_backlog": archive_backlog,
+            },
+        )
     return {
         "status": "ready",
         "spool_root": str(spool_root),
         "output_roots": {key: str(path) for key, path in output_roots.items()},
         "storage_copy_workers": settings.video_storage_copy_workers,
+        "storage_workers": worker_status,
+        "archive_backlog": archive_backlog,
         "archive_batch_segments": settings.video_archive_batch_segments,
     }
 

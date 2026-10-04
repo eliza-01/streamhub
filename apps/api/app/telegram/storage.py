@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -9,10 +10,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from telethon import TelegramClient, utils
+from telethon.errors import FileReferenceExpiredError
 from telethon.tl.types import DocumentAttributeFilename
 
 from streamhub_common.settings import Settings
 from streamhub_common.telegram_names import canonical_part_identity, filename_tokens, filenames_equivalent
+
+
+logger = logging.getLogger(__name__)
 
 
 _DOWNLOAD_CHUNK = 512 * 1024
@@ -339,26 +344,38 @@ class TelegramMediaReader:
         while len(self._message_cache) > _MESSAGE_CACHE_SIZE:
             self._message_cache.popitem(last=False)
 
-    async def _message(self, message_id: int) -> Any:
+    async def _message(self, message_id: int, *, refresh: bool = False) -> Any:
         await self.ensure_connected()
-        cached = self._message_cache.get(int(message_id))
-        if cached is not None:
-            self._message_cache.move_to_end(int(message_id))
-            return cached
-        async with self._message_lock:
-            cached = self._message_cache.get(int(message_id))
+        key = int(message_id)
+        if not refresh:
+            cached = self._message_cache.get(key)
             if cached is not None:
-                self._message_cache.move_to_end(int(message_id))
+                self._message_cache.move_to_end(key)
                 return cached
+        async with self._message_lock:
+            if refresh:
+                self._message_cache.pop(key, None)
+            else:
+                cached = self._message_cache.get(key)
+                if cached is not None:
+                    self._message_cache.move_to_end(key)
+                    return cached
             assert self._channel is not None
-            message = await self._client.get_messages(self._channel, ids=int(message_id))
+            message = await self._client.get_messages(self._channel, ids=key)
             if message is None or getattr(message, "document", None) is None:
                 raise TelegramStorageError(f"Telegram message {message_id} does not contain a document")
             self._remember(message)
             return message
 
-    async def validate_document(self, message_id: int, *, expected_name: str, expected_size: int) -> Any:
-        message = await self._message(message_id)
+    async def validate_document(
+        self,
+        message_id: int,
+        *,
+        expected_name: str,
+        expected_size: int,
+        refresh: bool = False,
+    ) -> Any:
+        message = await self._message(message_id, refresh=refresh)
         document = message.document
         actual_name = _file_name(message)
         actual_size = int(getattr(document, "size", 0) or 0)
@@ -385,33 +402,57 @@ class TelegramMediaReader:
             raise TelegramStorageError(
                 f"invalid byte range offset={offset} length={length} size={expected_size}"
             )
-        document = await self.validate_document(
-            message_id, expected_name=expected_name, expected_size=expected_size
-        )
         async with self._download_slots:
             remaining = int(length)
-            stream = self._client.iter_download(
-                document,
-                offset=int(offset),
-                chunk_size=_DOWNLOAD_CHUNK,
-                request_size=_DOWNLOAD_CHUNK,
-                file_size=int(expected_size),
-            )
-            try:
-                async for chunk in stream:
-                    if remaining <= 0:
-                        break
-                    data = bytes(chunk)
-                    if not data:
-                        continue
-                    if len(data) > remaining:
-                        data = data[:remaining]
-                    remaining -= len(data)
-                    yield data
-                    if remaining == 0:
-                        break
-            finally:
-                await stream.close()
+            current_offset = int(offset)
+            refreshed_reference = False
+
+            while remaining > 0:
+                document = await self.validate_document(
+                    message_id,
+                    expected_name=expected_name,
+                    expected_size=expected_size,
+                    refresh=refreshed_reference,
+                )
+                stream = self._client.iter_download(
+                    document,
+                    offset=current_offset,
+                    chunk_size=_DOWNLOAD_CHUNK,
+                    request_size=_DOWNLOAD_CHUNK,
+                    file_size=int(expected_size),
+                )
+                try:
+                    async for chunk in stream:
+                        if remaining <= 0:
+                            break
+                        data = bytes(chunk)
+                        if not data:
+                            continue
+                        if len(data) > remaining:
+                            data = data[:remaining]
+                        remaining -= len(data)
+                        current_offset += len(data)
+                        yield data
+                        if remaining == 0:
+                            break
+                except FileReferenceExpiredError as exc:
+                    if refreshed_reference:
+                        raise TelegramStorageError(
+                            f"Telegram file reference expired again after refresh: message={message_id}"
+                        ) from exc
+                    logger.info(
+                        "Telegram file reference expired; refreshing message=%s offset=%s remaining=%s",
+                        message_id,
+                        current_offset,
+                        remaining,
+                    )
+                    refreshed_reference = True
+                    continue
+                finally:
+                    await stream.close()
+
+                break
+
             if remaining != 0:
                 raise TelegramStorageError(
                     f"Telegram download ended early: message={message_id}, remaining={remaining} bytes"

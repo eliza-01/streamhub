@@ -122,3 +122,35 @@ def test_video_manager_does_not_auto_mount_telegram_player_and_site_badges_use_t
     assert 'site-chat-badge-image' in css
     assert 'badge.imageUrl ? (' in web
     assert '<span className="site-chat-badge"' in web
+
+
+def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
+    route = _read("apps/api/app/routers/site.py")
+    web = _read("apps/web/src/main.tsx")
+    css = _read("apps/web/src/styles.css")
+
+    assert '@router.get("/events/{event_id}/chat/stats")' in route
+    assert '@router.get("/events/{event_id}/chat/user-summary")' in route
+    assert 'ChatMessage.chatter_external_id == external_id' in route
+    assert 'func.count(ChatMessage.id)' in route
+    assert '"most_active": _chat_user_payload(most_active)' in route
+    assert '"least_active": _chat_user_payload(least_active)' in route
+    assert '"chatter_external_id": row.chatter_external_id' in route
+
+    assert 'function StreamVaultHeader(' in web
+    assert 'function SiteChatStats(' in web
+    assert '/chat/stats`' in web
+    assert 'Последний стрим' in web
+    assert 'PREVIEW ${siteHeroFrame + 1}' in web
+    assert 'Чат записи' in web
+    assert 'Все сообщения' in web
+    assert 'Посмотреть профиль' in web
+    assert 'Отметить в комментарии' in web
+    assert '/chat/user-summary?' in web
+    assert 'site-inline-spinner' in web
+    assert 'className="site-chat-author"' in web
+
+    assert '.site-chat-user-menu' in css
+    assert 'position: fixed;' in css
+    assert '.streamvault-watch-layout' in css
+    assert '.streamvault-recording-grid' in css

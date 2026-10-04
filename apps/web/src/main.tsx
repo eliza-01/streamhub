@@ -268,6 +268,7 @@ type SiteChatSession = {
 type SiteChatMessage = {
   id: number;
   timeline_offset_ms: number;
+  chatter_external_id?: string | null;
   chatter_login?: string | null;
   chatter_name?: string | null;
   color?: string | null;
@@ -281,6 +282,32 @@ type SiteChatMessage = {
   source_kind?: string | null;
   provider_message_id?: string | null;
   channel_points_reward_id?: string | null;
+};
+
+type SiteChatUserSummary = {
+  event_id: string;
+  chat_session_id?: string | null;
+  chatter_external_id?: string | null;
+  chatter_login?: string | null;
+  message_count: number;
+  first_message_ms?: number | null;
+  last_message_ms?: number | null;
+};
+
+type SiteChatStatsUser = {
+  chatter_external_id?: string | null;
+  chatter_login?: string | null;
+  chatter_name?: string | null;
+  message_count: number;
+};
+
+type SiteChatStatsPayload = {
+  event_id: string;
+  chat_session_id?: string | null;
+  total_messages: number;
+  unique_chatters: number;
+  most_active?: SiteChatStatsUser | null;
+  least_active?: SiteChatStatsUser | null;
 };
 
 type SiteChatBadgeAsset = {
@@ -668,23 +695,73 @@ function ChatMessageFragments({ message }: { message: SiteChatMessage }) {
   </>;
 }
 
+function SiteChatStats({ eventId, hasChat, totalMessages }: { eventId: string; hasChat: boolean; totalMessages: number }) {
+  const [stats, setStats] = useState<SiteChatStatsPayload | null>(null);
+  const [loading, setLoading] = useState(hasChat);
+
+  useEffect(() => {
+    setStats(null);
+    setLoading(hasChat);
+    if (!hasChat) return;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/stats`), { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error(await response.text());
+        setStats(await response.json() as SiteChatStatsPayload);
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("chat stats unavailable", e);
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [eventId, hasChat]);
+
+  const userLabel = (user?: SiteChatStatsUser | null) => user?.chatter_name || user?.chatter_login || "—";
+  const value = (text: React.ReactNode) => loading ? <i className="site-inline-spinner" /> : text;
+
+  return (
+    <section className="streamvault-chat-stats" aria-label="Статистика чата">
+      <div className="streamvault-chat-stats-head">
+        <div><span>СТАТИСТИКА ЧАТА</span><strong>Срез всей записи</strong></div>
+        <small>Детальный просмотр пользователей — из чата по клику на ник</small>
+      </div>
+      <div className="streamvault-chat-stats-grid">
+        <div><span>Сообщения</span><strong>{totalMessages.toLocaleString("ru-RU")}</strong></div>
+        <div><span>Участники</span><strong>{hasChat ? value((stats?.unique_chatters ?? 0).toLocaleString("ru-RU")) : "—"}</strong></div>
+        <div className="user"><span>Больше всего</span><strong>{hasChat ? value(userLabel(stats?.most_active)) : "—"}</strong>{!loading && stats?.most_active ? <small>{stats.most_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}</div>
+        <div className="user"><span>Меньше всего</span><strong>{hasChat ? value(userLabel(stats?.least_active)) : "—"}</strong>{!loading && stats?.least_active ? <small>{stats.least_active.message_count.toLocaleString("ru-RU")} сообщений</small> : null}</div>
+      </div>
+    </section>
+  );
+}
+
 function SiteReplayChat({
   eventId,
   hasChat,
   messageCount,
   videoRef,
+  onMention,
 }: {
   eventId: string;
   hasChat: boolean;
   messageCount: number;
   videoRef: { current: HTMLVideoElement | null };
+  onMention?: (mention: string) => void;
 }) {
   const [messages, setMessages] = useState<SiteChatMessage[]>([]);
   const [badgeAssets, setBadgeAssets] = useState<Record<string, SiteChatBadgeAsset>>({});
   const [currentMs, setCurrentMs] = useState(0);
   const [chatStatus, setChatStatus] = useState(hasChat ? "Загрузка…" : "Чат не записан");
+  const [following, setFollowing] = useState(true);
+  const [userMenu, setUserMenu] = useState<{ message: SiteChatMessage; x: number; y: number } | null>(null);
+  const [userSummary, setUserSummary] = useState<SiteChatUserSummary | null>(null);
+  const [userSummaryLoading, setUserSummaryLoading] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const loadedRangeRef = useRef<{ from: number; to: number } | null>(null);
+  const summaryRequestRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setBadgeAssets({});
@@ -721,6 +798,7 @@ function SiteReplayChat({
 
   useEffect(() => {
     setMessages([]);
+    setFollowing(true);
     loadedRangeRef.current = null;
     if (!hasChat) {
       setChatStatus("Чат не записан");
@@ -814,15 +892,37 @@ function SiteReplayChat({
     };
   }, [eventId, hasChat, messageCount, videoRef]);
 
+  useEffect(() => () => summaryRequestRef.current?.abort(), []);
+
+  useEffect(() => {
+    if (!userMenu) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (menuRef.current?.contains(event.target as Node)) return;
+      setUserMenu(null);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setUserMenu(null);
+    };
+    const close = () => setUserMenu(null);
+    document.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", close);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", close);
+    };
+  }, [userMenu]);
+
   const visible = useMemo(
     () => messages.filter((message) => message.timeline_offset_ms <= currentMs + 100).slice(-500),
     [messages, currentMs]
   );
 
   useEffect(() => {
-    if (!listRef.current) return;
+    if (!following || !listRef.current) return;
     listRef.current.scrollTop = listRef.current.scrollHeight;
-  }, [visible.length]);
+  }, [visible.length, following]);
 
   function seekTo(message: SiteChatMessage) {
     const video = videoRef.current;
@@ -831,13 +931,67 @@ function SiteReplayChat({
     void video.play().catch(() => {});
   }
 
+  function followCurrent() {
+    setFollowing(true);
+    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+  }
+
+  function handleChatScroll() {
+    const node = listRef.current;
+    if (!node) return;
+    const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+    setFollowing(distance < 56);
+  }
+
+  async function openUserMenu(event: React.MouseEvent<HTMLElement>, message: SiteChatMessage) {
+    event.stopPropagation();
+    const width = 286;
+    const height = 230;
+    const x = Math.max(10, Math.min(event.clientX + 10, window.innerWidth - width - 10));
+    const y = Math.max(10, Math.min(event.clientY + 10, window.innerHeight - height - 10));
+    setUserMenu({ message, x, y });
+    setUserSummary(null);
+    setUserSummaryLoading(true);
+    summaryRequestRef.current?.abort();
+    const controller = new AbortController();
+    summaryRequestRef.current = controller;
+    try {
+      const params = new URLSearchParams();
+      if (message.chatter_external_id) params.set("chatter_external_id", message.chatter_external_id);
+      else if (message.chatter_login) params.set("chatter_login", message.chatter_login);
+      else {
+        setUserSummary({ event_id: eventId, message_count: 0 });
+        return;
+      }
+      const response = await fetch(apiUrl(`/api/v1/site/events/${eventId}/chat/user-summary?${params.toString()}`), {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setUserSummary(await response.json() as SiteChatUserSummary);
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("chat user summary unavailable", e);
+    } finally {
+      if (!controller.signal.aborted) setUserSummaryLoading(false);
+    }
+  }
+
+  const menuMessage = userMenu?.message;
+  const menuName = menuMessage?.chatter_name || menuMessage?.chatter_login || "Гость";
+  const menuLogin = menuMessage?.chatter_login || "";
+  const menuColor = safeChatColor(menuMessage?.color) || "#ff8a32";
+  const menuBadges = menuMessage ? chatBadges(menuMessage.badges, badgeAssets).slice(0, 4) : [];
+
   return (
     <aside className="site-replay-chat">
       <div className="site-replay-chat-head">
-        <strong>Чат трансляции</strong>
+        <div>
+          <strong>Чат записи</strong>
+          <span>Синхронно с видео</span>
+        </div>
         <span>{chatStatus}</span>
       </div>
-      <div className="site-replay-chat-list" ref={listRef}>
+      <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll}>
         {visible.length === 0 ? (
           <div className="site-replay-chat-empty">{hasChat ? "В этой точке таймлайна сообщений пока нет." : "Для этого события чат не записан."}</div>
         ) : visible.map((message) => {
@@ -847,6 +1001,7 @@ function SiteReplayChat({
           const specialType = message.message_type && !["message", "action"].includes(message.message_type)
             ? message.message_type
             : null;
+          const author = message.chatter_name || message.chatter_login || "Гость";
           return (
             <div className={`site-replay-chat-message${message.is_action ? " is-action" : ""}`} key={message.id}>
               <button type="button" className="site-replay-chat-time" onClick={() => seekTo(message)}>{fmtMs(message.timeline_offset_ms)}</button>
@@ -872,7 +1027,13 @@ function SiteReplayChat({
                   {message.channel_points_reward_id ? (
                     <span className="site-chat-reward" title={`Channel points reward · ${message.channel_points_reward_id}`}>★</span>
                   ) : null}
-                  <b style={{ color: authorColor }}>{message.chatter_name || message.chatter_login || "Гость"}</b>
+                  <button
+                    type="button"
+                    className="site-chat-author"
+                    style={{ color: authorColor }}
+                    onClick={(event) => void openUserMenu(event, message)}
+                    title={`Открыть профиль ${author}`}
+                  >{author}</button>
                   {message.bits ? <span className="site-chat-bits">{message.bits.toLocaleString("ru-RU")} bits</span> : null}
                   {specialType ? <span className="site-chat-type">{specialType}</span> : null}
                   <span className="site-chat-text" style={message.is_action && authorColor ? { color: authorColor } : undefined}>
@@ -884,10 +1045,113 @@ function SiteReplayChat({
           );
         })}
       </div>
-      <div className="site-replay-chat-foot">Синхронизация по timeline_offset_ms · клик по времени перематывает видео</div>
+      {!following && hasChat ? (
+        <button className="site-chat-follow" type="button" onClick={followCurrent}>↓ К текущему моменту</button>
+      ) : null}
+      <div className="site-replay-chat-foot">Клик по времени — перемотка · клик по нику — профиль и статистика</div>
+
+      {userMenu && menuMessage ? (
+        <div
+          className="site-chat-user-menu"
+          ref={menuRef}
+          style={{ left: userMenu.x, top: userMenu.y }}
+          role="dialog"
+          aria-label={`Профиль ${menuName}`}
+        >
+          <div className="site-chat-user-head">
+            <div className="site-chat-user-avatar" style={{ background: menuColor }}>{menuName.slice(0, 1).toUpperCase()}</div>
+            <div className="site-chat-user-identity">
+              <strong style={{ color: menuColor }}>{menuName}</strong>
+              {menuLogin ? <span>@{menuLogin}</span> : <span>пользователь чата</span>}
+              {menuBadges.length > 0 ? (
+                <div className="site-chat-user-badges">
+                  {menuBadges.map((badge) => badge.imageUrl ? (
+                    <img key={badge.key} src={badge.imageUrl} alt={badge.title} title={badge.title} />
+                  ) : <span key={badge.key} title={badge.title}>{badge.label}</span>)}
+                </div>
+              ) : null}
+            </div>
+          </div>
+          <div className="site-chat-user-stat">
+            <span>Все сообщения</span>
+            <strong aria-label={userSummaryLoading ? "Загружается количество сообщений" : undefined}>
+              {userSummaryLoading ? <i className="site-inline-spinner" /> : (userSummary?.message_count ?? "—").toLocaleString("ru-RU")}
+            </strong>
+          </div>
+          {menuLogin ? (
+            <a className="site-chat-user-action" href={`https://www.twitch.tv/${encodeURIComponent(menuLogin)}`} target="_blank" rel="noreferrer">
+              <span>Посмотреть профиль</span><b>↗</b>
+            </a>
+          ) : (
+            <div className="site-chat-user-action is-disabled"><span>Посмотреть профиль</span><b>↗</b></div>
+          )}
+          <button
+            className="site-chat-user-action"
+            type="button"
+            onClick={() => {
+              onMention?.(`@${menuLogin || menuName}`);
+              setUserMenu(null);
+            }}
+          >
+            <span>Отметить в комментарии</span><b>@</b>
+          </button>
+        </div>
+      ) : null}
     </aside>
   );
 }
+
+function StreamVaultHeader({
+  query,
+  onQueryChange,
+  onSubmit,
+  onBrand,
+  onAdmin,
+  onPublish,
+}: {
+  query: string;
+  onQueryChange: (value: string) => void;
+  onSubmit: () => void;
+  onBrand: () => void;
+  onAdmin: () => void;
+  onPublish?: () => void;
+}) {
+  return (
+    <header className="streamvault-header">
+      <div className="streamvault-header-inner">
+        <button type="button" className="streamvault-brand" onClick={onBrand} aria-label="StreamVault — главная">
+          <span className="streamvault-brand-mark" aria-hidden="true" />
+          <span>StreamVault</span>
+        </button>
+        <label className="streamvault-search">
+          <span aria-hidden="true">⌕</span>
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => onQueryChange(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && onSubmit()}
+            placeholder="Поиск записей, стримеров, шоу…"
+          />
+        </label>
+        <div className="streamvault-header-actions">
+          {onPublish ? <button type="button" className="streamvault-header-button primary" onClick={onPublish}>+ Добавить событие</button> : null}
+          <button type="button" className="streamvault-header-button" onClick={onAdmin}>StreamHub</button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function SiteArtwork({ event, wide = false, label }: { event: SiteEvent; wide?: boolean; label?: string }) {
+  const primaryCategory = event.categories[0]?.label || event.media_type.toUpperCase();
+  return (
+    <div className={`streamvault-artwork${wide ? " wide" : ""}`} aria-hidden="true">
+      <span>{label || primaryCategory}</span>
+      <div><strong>{event.channel_display_name || event.channel_login || "TWITCH"}</strong><small>{event.media_type.toUpperCase()}</small></div>
+    </div>
+  );
+}
+
 
 function App() {
   const [events, setEvents] = useState<MediaEvent[]>([]);
@@ -940,6 +1204,10 @@ function App() {
   const [sitePublishEventId, setSitePublishEventId] = useState("");
   const [sitePublishCategories, setSitePublishCategories] = useState<string[]>([]);
   const [siteAction, setSiteAction] = useState(false);
+  const [siteHeroFrame, setSiteHeroFrame] = useState(0);
+  const [siteCommentDraft, setSiteCommentDraft] = useState("");
+  const [siteCommentNotice, setSiteCommentNotice] = useState("");
+  const siteCommentRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     try { window.localStorage.setItem(PART_TARGET_MIB_KEY, String(partTargetMib)); } catch { /* browser storage unavailable */ }
@@ -1143,6 +1411,25 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  function openSiteEvent(event: SiteEvent) {
+    setSelectedSiteEvent(event);
+    setSiteCommentDraft("");
+    setSiteCommentNotice("");
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }
+
+  function mentionSiteComment(mention: string) {
+    setSiteCommentDraft((current) => {
+      const trimmed = current.trimStart();
+      return trimmed ? `${current}${current.endsWith(" ") ? "" : " "}${mention} ` : `${mention} `;
+    });
+    setSiteCommentNotice("");
+    window.setTimeout(() => {
+      siteCommentRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      siteCommentRef.current?.focus();
+    }, 0);
   }
 
   async function openSitePublisher() {
@@ -1759,41 +2046,214 @@ function App() {
   );
 
   if (selectedSiteEvent) {
+    const eventDate = selectedSiteEvent.source_started_at_utc
+      ? new Date(selectedSiteEvent.source_started_at_utc).toLocaleString("ru-RU")
+      : "Дата неизвестна";
     return (
-      <main className="site-page">
-        <button className="link" onClick={() => setSelectedSiteEvent(null)}>← Все видео</button>
-        <header className="site-detail-header">
-          <div>
-            <div className="site-brand">StreamVault</div>
-            <h1>{selectedSiteEvent.title}</h1>
-            <p className="muted">{selectedSiteEvent.channel_display_name || selectedSiteEvent.channel_login || "Twitch"} · {selectedSiteEvent.media_type.toUpperCase()}</p>
+      <div className="streamvault-app">
+        <StreamVaultHeader
+          query={siteQuery}
+          onQueryChange={setSiteQuery}
+          onSubmit={() => { setSelectedSiteEvent(null); void loadSiteFeed(siteCategory, siteQuery); }}
+          onBrand={() => setSelectedSiteEvent(null)}
+          onAdmin={() => { setSelectedSiteEvent(null); setView("events"); }}
+        />
+        <main className="streamvault-watch-shell">
+          <button className="streamvault-back" type="button" onClick={() => setSelectedSiteEvent(null)}>← К записям</button>
+          <div className="streamvault-watch-layout">
+            <div className="streamvault-watch-primary">
+              <div className="streamvault-player">
+                {selectedSiteEvent.playable && selectedSiteEvent.playback_url ? (
+                  <TelegramVideoPlayer playlistUrl={selectedSiteEvent.playback_url} externalRef={siteVideoRef} />
+                ) : (
+                  <div className="streamvault-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
+                )}
+              </div>
+              <section className="streamvault-watch-meta">
+                <div className="streamvault-watch-title-row">
+                  <div>
+                    <h1>{selectedSiteEvent.title}</h1>
+                    <div className="streamvault-watch-byline">
+                      <strong>{selectedSiteEvent.channel_display_name || selectedSiteEvent.channel_login || "Twitch"}</strong>
+                      <span>{eventDate}</span>
+                      {selectedSiteEvent.source_duration_ms ? <span>{fmtMs(selectedSiteEvent.source_duration_ms)}</span> : null}
+                    </div>
+                  </div>
+                  <div className="streamvault-badges">
+                    {selectedSiteEvent.categories.map((category) => <span key={category.slug}>{category.label}</span>)}
+                  </div>
+                </div>
+                <SiteChatStats
+                  eventId={selectedSiteEvent.id}
+                  hasChat={selectedSiteEvent.has_chat}
+                  totalMessages={selectedSiteEvent.chat_message_count || 0}
+                />
+              </section>
+
+              <section className="streamvault-comments" aria-labelledby="streamvaultCommentsTitle">
+                <div className="streamvault-comments-head">
+                  <div>
+                    <h2 id="streamvaultCommentsTitle">Комментарии</h2>
+                    <p>UI v1 · пользовательские комментарии подключим после утверждения интерфейса.</p>
+                  </div>
+                </div>
+                <div className="streamvault-comment-composer">
+                  <div className="streamvault-comment-avatar">SV</div>
+                  <div>
+                    <textarea
+                      ref={siteCommentRef}
+                      value={siteCommentDraft}
+                      onChange={(event) => { setSiteCommentDraft(event.target.value); setSiteCommentNotice(""); }}
+                      rows={3}
+                      placeholder="Написать комментарий…"
+                    />
+                    <div className="streamvault-comment-actions">
+                      <span>{siteCommentNotice}</span>
+                      <button
+                        type="button"
+                        disabled={!siteCommentDraft.trim()}
+                        onClick={() => setSiteCommentNotice("Сохранение комментариев подключим на backend-этапе.")}
+                      >Отправить</button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <SiteReplayChat
+              eventId={selectedSiteEvent.id}
+              hasChat={selectedSiteEvent.has_chat}
+              messageCount={selectedSiteEvent.chat_message_count || 0}
+              videoRef={siteVideoRef}
+              onMention={mentionSiteComment}
+            />
           </div>
-          <div className="site-category-badges">
-            {selectedSiteEvent.categories.map((category) => <span key={category.slug}>{category.label}</span>)}
-          </div>
-        </header>
-        <section className="site-watch-layout">
-          <div className="site-watch-card">
-            {selectedSiteEvent.playable && selectedSiteEvent.playback_url ? (
-              <TelegramVideoPlayer playlistUrl={selectedSiteEvent.playback_url} externalRef={siteVideoRef} />
-            ) : (
-              <div className="site-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
-            )}
-            <div className="site-watch-meta">
-              <span>{selectedSiteEvent.source_started_at_utc ? new Date(selectedSiteEvent.source_started_at_utc).toLocaleString() : "Дата неизвестна"}</span>
-              <span>{selectedSiteEvent.linked_parts}/{selectedSiteEvent.ready_parts} parts в Telegram</span>
-              <span>{selectedSiteEvent.video_sessions.length} video session</span>
-              <span>{selectedSiteEvent.chat_message_count || 0} chat messages</span>
+        </main>
+      </div>
+    );
+  }
+
+  if (view === "site") {
+    const latest = siteEvents[0] || null;
+    return (
+      <div className="streamvault-app">
+        <StreamVaultHeader
+          query={siteQuery}
+          onQueryChange={setSiteQuery}
+          onSubmit={() => void loadSiteFeed(siteCategory, siteQuery)}
+          onBrand={() => { setSiteCategory("all"); setSiteQuery(""); void loadSiteFeed("all", ""); }}
+          onAdmin={() => setView("events")}
+          onPublish={() => void openSitePublisher()}
+        />
+
+        <nav className="streamvault-mobile-categories" aria-label="Категории">
+          <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", siteQuery); }}>Все</button>
+          {siteCategories.map((category) => (
+            <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, siteQuery); }}>{category.label}</button>
+          ))}
+        </nav>
+
+        <div className="streamvault-home-shell">
+          <aside className="streamvault-sidebar">
+            <nav aria-label="Категории видео">
+              <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", siteQuery); }}><span>⌂</span>Все видео</button>
+              {siteCategories.map((category) => (
+                <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, siteQuery); }}><span>•</span>{category.label}</button>
+              ))}
+            </nav>
+          </aside>
+
+          <main className="streamvault-content">
+            {error ? <div className="streamvault-error">{error}</div> : null}
+            {latest ? (
+              <section className="streamvault-hero" aria-labelledby="streamvaultLatestTitle">
+                <h1>Последний стрим</h1>
+                <div className="streamvault-latest-layout">
+                  <button type="button" className="streamvault-latest-cover" onClick={() => openSiteEvent(latest)} aria-label={`Открыть ${latest.title}`}>
+                    <SiteArtwork event={latest} label="COVER" />
+                  </button>
+                  <div className="streamvault-preview-stage">
+                    <button type="button" className="streamvault-preview-main" onClick={() => openSiteEvent(latest)}>
+                      <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} />
+                    </button>
+                    <div className="streamvault-preview-rail" aria-label="Четыре preview-кадра">
+                      {[0, 1, 2, 3].map((frame) => (
+                        <button key={frame} type="button" className={siteHeroFrame === frame ? "active" : ""} onClick={() => setSiteHeroFrame(frame)}>
+                          <SiteArtwork event={latest} wide label={`#${frame + 1}`} />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div className="streamvault-latest-copy">
+                  <div>
+                    <h2 id="streamvaultLatestTitle">{latest.title}</h2>
+                    <p>{latest.channel_display_name || latest.channel_login || "Twitch"} · {latest.source_started_at_utc ? new Date(latest.source_started_at_utc).toLocaleString("ru-RU") : "Дата неизвестна"}</p>
+                  </div>
+                  <div className="streamvault-badges">{latest.categories.map((category) => <span key={category.slug}>{category.label}</span>)}</div>
+                </div>
+              </section>
+            ) : null}
+
+            <section className="streamvault-recordings" aria-labelledby="streamvaultRecordingsTitle">
+              <div className="streamvault-section-head">
+                <div>
+                  <h2 id="streamvaultRecordingsTitle">{siteCategory === "all" ? "Записи" : siteCategories.find((category) => category.slug === siteCategory)?.label || "Записи"}</h2>
+                  {siteQuery.trim() ? <p>Поиск: «{siteQuery.trim()}»</p> : null}
+                </div>
+                <span>{siteEvents.length.toLocaleString("ru-RU")}</span>
+              </div>
+              {siteEvents.length === 0 ? (
+                <div className="streamvault-empty">Пока нет опубликованных записей в этом разделе.</div>
+              ) : (
+                <div className="streamvault-recording-grid">
+                  {siteEvents.map((event) => (
+                    <button type="button" className="streamvault-recording-card" key={event.id} onClick={() => openSiteEvent(event)}>
+                      <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" /></div>
+                      <div className="streamvault-recording-body">
+                        <h3>{event.title}</h3>
+                        <p>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleDateString("ru-RU") : "Дата неизвестна"} · {(event.chat_message_count || 0).toLocaleString("ru-RU")} сообщений</p>
+                        <div className="streamvault-badges">{event.categories.slice(0, 3).map((category) => <span key={category.slug}>{category.label}</span>)}</div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </section>
+          </main>
+        </div>
+
+        {sitePublisherOpen && (
+          <div className="site-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSitePublisherOpen(false); }}>
+            <div className="site-modal" role="dialog" aria-modal="true" aria-labelledby="sitePublisherTitle">
+              <div className="row">
+                <div><div className="section-label">SITE PUBLICATION</div><h2 id="sitePublisherTitle">Добавить событие</h2></div>
+                <button onClick={() => setSitePublisherOpen(false)}>Закрыть</button>
+              </div>
+              {siteAvailableEvents.length === 0 ? (
+                <div className="site-empty compact">Нет доступных Events: событие должно иметь ready part, связанный с Telegram, и ещё не быть опубликовано.</div>
+              ) : (
+                <>
+                  <label className="storage-field site-modal-field">
+                    <span>Событие из хранилища</span>
+                    <select value={sitePublishEventId} onChange={(event) => setSitePublishEventId(event.target.value)}>
+                      {siteAvailableEvents.map((event) => <option key={event.id} value={event.id}>{event.title} · {event.channel_display_name || event.channel_login || event.media_type} · TG {event.linked_parts}/{event.ready_parts}</option>)}
+                    </select>
+                  </label>
+                  <div className="site-publish-categories"><span>Категории · до 3</span><div>
+                    {siteCategories.map((category) => (
+                      <label key={category.slug} className={sitePublishCategories.includes(category.slug) ? "selected" : ""}>
+                        <input type="checkbox" checked={sitePublishCategories.includes(category.slug)} disabled={!sitePublishCategories.includes(category.slug) && sitePublishCategories.length >= 3} onChange={() => toggleSitePublishCategory(category.slug)} />
+                        {category.label}
+                      </label>
+                    ))}
+                  </div></div>
+                  <div className="actions site-modal-actions"><button disabled={siteAction || !sitePublishEventId || sitePublishCategories.length === 0} onClick={publishSiteEvent}>{siteAction ? "Добавляю…" : "Добавить на сайт"}</button></div>
+                </>
+              )}
             </div>
           </div>
-          <SiteReplayChat
-            eventId={selectedSiteEvent.id}
-            hasChat={selectedSiteEvent.has_chat}
-            messageCount={selectedSiteEvent.chat_message_count || 0}
-            videoRef={siteVideoRef}
-          />
-        </section>
-      </main>
+        )}
+      </div>
     );
   }
 
@@ -2123,120 +2583,7 @@ function App() {
             })}
           </section>
         </>
-       ) : view === "site" ? (
-        <section className="site-catalog-panel">
-          <div className="site-catalog-head">
-            <div>
-              <div className="site-brand">StreamVault</div>
-              <h2>Все видео</h2>
-              <p className="muted">На сайте видны только явно добавленные Events. Хранилище и публикация независимы.</p>
-            </div>
-            <button disabled={siteAction} onClick={openSitePublisher}>+ Добавить событие</button>
-          </div>
-
-          <div className="site-search-row">
-            <input
-              type="search"
-              value={siteQuery}
-              onChange={(e) => setSiteQuery(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && loadSiteFeed(siteCategory, siteQuery)}
-              placeholder="Поиск записей, стримеров, шоу…"
-            />
-            <button onClick={() => loadSiteFeed(siteCategory, siteQuery)}>Найти</button>
-          </div>
-
-          <nav className="site-categories" aria-label="Категории видео">
-            <button
-              className={siteCategory === "all" ? "active" : ""}
-              onClick={() => { setSiteCategory("all"); loadSiteFeed("all", siteQuery); }}
-            >Все</button>
-            {siteCategories.map((category) => (
-              <button
-                key={category.slug}
-                className={siteCategory === category.slug ? "active" : ""}
-                onClick={() => { setSiteCategory(category.slug); loadSiteFeed(category.slug, siteQuery); }}
-              >{category.label}</button>
-            ))}
-          </nav>
-
-          {siteEvents.length === 0 ? (
-            <div className="site-empty">На сайте пока нет видео. Нажми «Добавить событие» и выбери Event из хранилища.</div>
-          ) : (
-            <div className="site-video-grid">
-              {siteEvents.map((event) => (
-                <article className="site-video-card" key={event.id}>
-                  <button className="site-video-card-main" onClick={() => setSelectedSiteEvent(event)}>
-                    <div className="site-video-cover">
-                      <span>{event.media_type.toUpperCase()}</span>
-                      <strong>{event.playable ? "▶" : "…"}</strong>
-                    </div>
-                    <div className="site-video-card-body">
-                      <h3>{event.title}</h3>
-                      <div className="muted small">{event.channel_display_name || event.channel_login || "Twitch"}</div>
-                      <div className="muted small">{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleString() : "Дата неизвестна"}</div>
-                      <div className="site-category-badges">
-                        {event.categories.map((category) => <span key={category.slug}>{category.label}</span>)}
-                      </div>
-                      <div className="site-storage-line">{event.linked_parts}/{event.ready_parts} Telegram parts · {event.video_sessions.length} video session</div>
-                    </div>
-                  </button>
-                </article>
-              ))}
-            </div>
-          )}
-
-          {sitePublisherOpen && (
-            <div className="site-modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setSitePublisherOpen(false); }}>
-              <div className="site-modal" role="dialog" aria-modal="true" aria-labelledby="sitePublisherTitle">
-                <div className="row">
-                  <div>
-                    <div className="section-label">SITE PUBLICATION</div>
-                    <h2 id="sitePublisherTitle">Добавить событие</h2>
-                  </div>
-                  <button onClick={() => setSitePublisherOpen(false)}>Закрыть</button>
-                </div>
-                {siteAvailableEvents.length === 0 ? (
-                  <div className="site-empty compact">Нет доступных Events: событие должно иметь ready part, связанный с Telegram, и ещё не быть опубликовано.</div>
-                ) : (
-                  <>
-                    <label className="storage-field site-modal-field">
-                      <span>Событие из хранилища</span>
-                      <select value={sitePublishEventId} onChange={(e) => setSitePublishEventId(e.target.value)}>
-                        {siteAvailableEvents.map((event) => (
-                          <option key={event.id} value={event.id}>
-                            {event.title} · {event.channel_display_name || event.channel_login || event.media_type} · TG {event.linked_parts}/{event.ready_parts}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <div className="site-publish-categories">
-                      <span>Категории · до 3</span>
-                      <div>
-                        {siteCategories.map((category) => (
-                          <label key={category.slug} className={sitePublishCategories.includes(category.slug) ? "selected" : ""}>
-                            <input
-                              type="checkbox"
-                              checked={sitePublishCategories.includes(category.slug)}
-                              disabled={!sitePublishCategories.includes(category.slug) && sitePublishCategories.length >= 3}
-                              onChange={() => toggleSitePublishCategory(category.slug)}
-                            />
-                            {category.label}
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                    <div className="actions site-modal-actions">
-                      <button disabled={siteAction || !sitePublishEventId || sitePublishCategories.length === 0} onClick={publishSiteEvent}>
-                        {siteAction ? "Добавляю…" : "Добавить на сайт"}
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-          )}
-        </section>
-       ) : view === "video-manager" ? (
+       ) : view === "site" ? null : view === "video-manager" ? (
         <section className="storage-panel video-manager-index">
           <div className="section-label">VIDEO SESSIONS</div>
           <p className="muted">Открой session для Overview, Runs, Segments, Parts и durable Build Queue.</p>
