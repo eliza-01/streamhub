@@ -1,0 +1,590 @@
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 9d0d92f..3941560 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -1688,19 +1688,32 @@ function SiteReplayChat({
+ 
+ function StreamVaultHeader({
+   query,
++  searchResults,
++  searchLoading,
+   onQueryChange,
+   onSubmit,
++  onSearchResult,
+   onBrand,
+   onAdmin,
+   onSiteAdmin,
+ }: {
+   query: string;
++  searchResults: SiteEvent[];
++  searchLoading: boolean;
+   onQueryChange: (value: string) => void;
+   onSubmit: () => void;
++  onSearchResult: (event: SiteEvent) => void;
+   onBrand: () => void;
+   onAdmin: () => void;
+   onSiteAdmin: () => void;
+ }) {
++  const [searchOpen, setSearchOpen] = useState(false);
++  const trimmedQuery = query.trim();
++
++  useEffect(() => {
++    if (!trimmedQuery) setSearchOpen(false);
++  }, [trimmedQuery]);
++
+   return (
+     <header className="streamvault-header">
+       <div className="streamvault-header-inner">
+@@ -1708,16 +1721,66 @@ function StreamVaultHeader({
+           <span className="streamvault-brand-mark" aria-hidden="true" />
+           <span>StreamVault</span>
+         </button>
+-        <label className="streamvault-search">
+-          <span aria-hidden="true">⌕</span>
+-          <input
+-            type="search"
+-            value={query}
+-            onChange={(event) => onQueryChange(event.target.value)}
+-            onKeyDown={(event) => event.key === "Enter" && onSubmit()}
+-            placeholder="Поиск записей, стримеров, шоу…"
+-          />
+-        </label>
++        <div
++          className="streamvault-search-wrap"
++          onBlur={(event) => {
++            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setSearchOpen(false);
++          }}
++        >
++          <label className="streamvault-search">
++            <span aria-hidden="true">⌕</span>
++            <input
++              type="search"
++              value={query}
++              onChange={(event) => { onQueryChange(event.target.value); setSearchOpen(true); }}
++              onFocus={() => { if (trimmedQuery) setSearchOpen(true); }}
++              onKeyDown={(event) => {
++                if (event.key === "Escape") {
++                  setSearchOpen(false);
++                  event.currentTarget.blur();
++                  return;
++                }
++                if (event.key === "Enter") {
++                  event.preventDefault();
++                  if (searchResults[0]) {
++                    setSearchOpen(false);
++                    onSearchResult(searchResults[0]);
++                  } else {
++                    onSubmit();
++                  }
++                }
++              }}
++              placeholder="Поиск"
++              autoComplete="off"
++            />
++          </label>
++          {searchOpen && trimmedQuery ? (
++            <div className="streamvault-search-results" role="listbox" aria-label="Результаты поиска">
++              {searchLoading ? <div className="streamvault-search-state">Ищем…</div> : null}
++              {!searchLoading && searchResults.length === 0 ? <div className="streamvault-search-state">Ничего не найдено</div> : null}
++              {!searchLoading ? searchResults.map((event) => (
++                <button
++                  type="button"
++                  className="streamvault-search-result"
++                  key={event.id}
++                  onClick={() => { setSearchOpen(false); onSearchResult(event); }}
++                  role="option"
++                >
++                  <span className="streamvault-search-result-cover">
++                    {event.assets?.cover?.url ? <img src={apiUrl(event.assets.cover.url)} alt="" loading="lazy" /> : <span aria-hidden="true">▶</span>}
++                  </span>
++                  <span className="streamvault-search-result-copy">
++                    <strong>{event.title}</strong>
++                    <small>
++                      {event.channel_display_name || event.channel_login || "Twitch"}
++                      {event.source_started_at_utc ? ` · ${new Date(event.source_started_at_utc).toLocaleDateString("ru-RU")}` : ""}
++                    </small>
++                  </span>
++                </button>
++              )) : null}
++            </div>
++          ) : null}
++        </div>
+         <div className="streamvault-header-actions">
+           <button type="button" className="streamvault-header-button" onClick={onAdmin}>StreamHub</button>
+           <button type="button" className="streamvault-header-button admin" onClick={onSiteAdmin}>Админка</button>
+@@ -1900,7 +1963,7 @@ function SiteAdminPanel({
+ function App() {
+   const [events, setEvents] = useState<MediaEvent[]>([]);
+   const [trashEvents, setTrashEvents] = useState<MediaEvent[]>([]);
+-  const [view, setView] = useState<ViewMode>("events");
++  const [view, setView] = useState<ViewMode>(() => new URLSearchParams(window.location.search).has("site_event") ? "site" : "events");
+   const [expandedIds, setExpandedIds] = useState<string[]>([]);
+   const [selected, setSelected] = useState<Session | null>(null);
+   const [selectedVideo, setSelectedVideo] = useState<VideoSession | null>(null);
+@@ -1941,6 +2004,8 @@ function App() {
+   const [siteCategories, setSiteCategories] = useState<SiteCategory[]>([]);
+   const [siteCategory, setSiteCategory] = useState("all");
+   const [siteQuery, setSiteQuery] = useState("");
++  const [siteSearchResults, setSiteSearchResults] = useState<SiteEvent[]>([]);
++  const [siteSearchLoading, setSiteSearchLoading] = useState(false);
+   const [selectedSiteEvent, setSelectedSiteEvent] = useState<SiteEvent | null>(null);
+   const siteVideoRef = useRef<HTMLVideoElement | null>(null);
+   const [sitePublisherOpen, setSitePublisherOpen] = useState(false);
+@@ -1966,6 +2031,60 @@ function App() {
+     try { window.localStorage.setItem(PART_SEGMENT_COUNT_KEY, String(partSegmentCount)); } catch { /* browser storage unavailable */ }
+   }, [partSegmentCount]);
+ 
++  useEffect(() => {
++    const query = siteQuery.trim();
++    if (view !== "site" || !query) {
++      setSiteSearchResults([]);
++      setSiteSearchLoading(false);
++      return;
++    }
++
++    const controller = new AbortController();
++    const timer = window.setTimeout(async () => {
++      setSiteSearchLoading(true);
++      try {
++        const params = new URLSearchParams({ q: query, limit: "8" });
++        const res = await fetch(`${API}/api/v1/site/feed?${params.toString()}`, { cache: "no-store", signal: controller.signal });
++        if (!res.ok) throw new Error(await res.text());
++        const data = await res.json();
++        setSiteSearchResults(data.items || []);
++      } catch (error) {
++        if (!(error instanceof DOMException && error.name === "AbortError")) {
++          console.warn("site search failed", error);
++          setSiteSearchResults([]);
++        }
++      } finally {
++        if (!controller.signal.aborted) setSiteSearchLoading(false);
++      }
++    }, 180);
++
++    return () => {
++      window.clearTimeout(timer);
++      controller.abort();
++    };
++  }, [siteQuery, view]);
++
++  useEffect(() => {
++    const eventId = new URLSearchParams(window.location.search).get("site_event");
++    if (!eventId) return;
++    const controller = new AbortController();
++    fetch(`${API}/api/v1/site/events/${encodeURIComponent(eventId)}`, { cache: "no-store", signal: controller.signal })
++      .then(async (res) => {
++        if (!res.ok) throw new Error(await res.text());
++        return await res.json() as SiteEvent;
++      })
++      .then((event) => {
++        setView("site");
++        setSelectedSiteEvent(event);
++        setSiteCommentDraft("");
++        setSiteCommentNotice("");
++      })
++      .catch((error) => {
++        if (!(error instanceof DOMException && error.name === "AbortError")) setError(String(error));
++      });
++    return () => controller.abort();
++  }, []);
++
+   async function loadEvents() {
+     try {
+       const res = await fetch(`${API}/api/v1/events?page_size=100`, { cache: "no-store" });
+@@ -2146,7 +2265,7 @@ function App() {
+     }
+   }
+ 
+-  async function loadSiteFeed(category = siteCategory, query = siteQuery) {
++  async function loadSiteFeed(category = siteCategory, query = "") {
+     try {
+       const params = new URLSearchParams();
+       if (category && category !== "all") params.set("category", category);
+@@ -2162,11 +2281,47 @@ function App() {
+     }
+   }
+ 
+-  function openSiteEvent(event: SiteEvent) {
+-    setSelectedSiteEvent(event);
+-    setSiteCommentDraft("");
+-    setSiteCommentNotice("");
+-    window.scrollTo({ top: 0, behavior: "auto" });
++  function siteEventUrl(eventId: string) {
++    const url = new URL(window.location.href);
++    url.search = "";
++    url.hash = "";
++    url.searchParams.set("site_event", eventId);
++    return url.toString();
++  }
++
++  function openSiteEventNewTab(event: SiteEvent) {
++    window.open(siteEventUrl(event.id), "_blank", "noopener,noreferrer");
++  }
++
++  function closeSiteEvent() {
++    setSelectedSiteEvent(null);
++    const url = new URL(window.location.href);
++    if (url.searchParams.has("site_event")) {
++      url.searchParams.delete("site_event");
++      window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
++    }
++  }
++
++  function updateSiteCoverMotion(event: React.PointerEvent<HTMLButtonElement>) {
++    const rect = event.currentTarget.getBoundingClientRect();
++    if (!rect.width || !rect.height) return;
++    const x = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
++    const y = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
++    event.currentTarget.style.setProperty("--sv-cover-shift-x", `${(0.5 - x) * 10}px`);
++    event.currentTarget.style.setProperty("--sv-cover-shift-y", `${(0.5 - y) * 10}px`);
++    event.currentTarget.style.setProperty("--sv-cover-tilt-x", `${(0.5 - y) * 2.2}deg`);
++    event.currentTarget.style.setProperty("--sv-cover-tilt-y", `${(x - 0.5) * 2.2}deg`);
++    event.currentTarget.style.setProperty("--sv-cover-spot-x", `${x * 100}%`);
++    event.currentTarget.style.setProperty("--sv-cover-spot-y", `${y * 100}%`);
++  }
++
++  function resetSiteCoverMotion(event: React.PointerEvent<HTMLButtonElement>) {
++    event.currentTarget.style.setProperty("--sv-cover-shift-x", "0px");
++    event.currentTarget.style.setProperty("--sv-cover-shift-y", "0px");
++    event.currentTarget.style.setProperty("--sv-cover-tilt-x", "0deg");
++    event.currentTarget.style.setProperty("--sv-cover-tilt-y", "0deg");
++    event.currentTarget.style.setProperty("--sv-cover-spot-x", "50%");
++    event.currentTarget.style.setProperty("--sv-cover-spot-y", "50%");
+   }
+ 
+   function mentionSiteComment(mention: string) {
+@@ -2235,7 +2390,7 @@ function App() {
+       const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}/assets/${slot}`, { method: "PUT", body: form });
+       if (!res.ok) throw new Error(await res.text());
+       await loadSiteAdminEvents();
+-      await loadSiteFeed(siteCategory, siteQuery);
++      await loadSiteFeed(siteCategory, "");
+       if (selectedSiteEvent?.id === eventId) {
+         const detail = await fetch(`${API}/api/v1/site/events/${eventId}`, { cache: "no-store" });
+         if (detail.ok) setSelectedSiteEvent(await detail.json() as SiteEvent);
+@@ -2293,7 +2448,7 @@ function App() {
+       });
+       if (!res.ok) throw new Error(await res.text());
+       setSitePublisherOpen(false);
+-      await loadSiteFeed(siteCategory, siteQuery);
++      await loadSiteFeed(siteCategory, "");
+       if (siteAdminOpen) await loadSiteAdminEvents();
+       setError(null);
+     } catch (e) {
+@@ -2871,14 +3026,17 @@ function App() {
+       <div className="streamvault-app">
+         <StreamVaultHeader
+           query={siteQuery}
++          searchResults={siteSearchResults}
++          searchLoading={siteSearchLoading}
+           onQueryChange={setSiteQuery}
+-          onSubmit={() => { setSelectedSiteEvent(null); void loadSiteFeed(siteCategory, siteQuery); }}
+-          onBrand={() => setSelectedSiteEvent(null)}
+-          onAdmin={() => { setSelectedSiteEvent(null); setView("events"); }}
++          onSubmit={() => {}}
++          onSearchResult={openSiteEventNewTab}
++          onBrand={closeSiteEvent}
++          onAdmin={() => { closeSiteEvent(); setView("events"); }}
+           onSiteAdmin={() => void openSiteAdmin()}
+         />
+         <main className="streamvault-watch-shell">
+-          <button className="streamvault-back" type="button" onClick={() => setSelectedSiteEvent(null)}>← К записям</button>
++          <button className="streamvault-back" type="button" onClick={closeSiteEvent}>← К записям</button>
+           <div className="streamvault-watch-layout">
+             <div className="streamvault-watch-primary">
+               <div className="streamvault-player">
+@@ -2958,7 +3116,7 @@ function App() {
+             onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
+             onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
+             onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
+-            onAddEvent={() => { setSiteAdminOpen(false); setSelectedSiteEvent(null); void openSitePublisher(); }}
++            onAddEvent={() => { setSiteAdminOpen(false); closeSiteEvent(); void openSitePublisher(); }}
+             onClose={() => setSiteAdminOpen(false)}
+           />
+         ) : null}
+@@ -2972,26 +3130,29 @@ function App() {
+       <div className="streamvault-app">
+         <StreamVaultHeader
+           query={siteQuery}
++          searchResults={siteSearchResults}
++          searchLoading={siteSearchLoading}
+           onQueryChange={setSiteQuery}
+-          onSubmit={() => void loadSiteFeed(siteCategory, siteQuery)}
++          onSubmit={() => {}}
++          onSearchResult={openSiteEventNewTab}
+           onBrand={() => { setSiteCategory("all"); setSiteQuery(""); void loadSiteFeed("all", ""); }}
+           onAdmin={() => setView("events")}
+           onSiteAdmin={() => void openSiteAdmin()}
+         />
+ 
+         <nav className="streamvault-mobile-categories" aria-label="Категории">
+-          <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", siteQuery); }}>Все</button>
++          <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}>Все</button>
+           {siteCategories.map((category) => (
+-            <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, siteQuery); }}>{category.label}</button>
++            <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, ""); }}>{category.label}</button>
+           ))}
+         </nav>
+ 
+         <div className="streamvault-home-shell">
+           <aside className="streamvault-sidebar">
+             <nav aria-label="Категории видео">
+-              <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", siteQuery); }}><span>⌂</span>Все видео</button>
++              <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}><span>⌂</span>Все видео</button>
+               {siteCategories.map((category) => (
+-                <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, siteQuery); }}><span>•</span>{category.label}</button>
++                <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, ""); }}><span>•</span>{category.label}</button>
+               ))}
+             </nav>
+           </aside>
+@@ -3002,12 +3163,26 @@ function App() {
+               <section className="streamvault-hero" aria-labelledby="streamvaultLatestTitle">
+                 <h1>Последний стрим</h1>
+                 <div className="streamvault-latest-layout">
+-                  <button type="button" className="streamvault-latest-cover" onClick={() => openSiteEvent(latest)} aria-label={`Открыть ${latest.title}`}>
++                  <button
++                    type="button"
++                    className="streamvault-latest-cover streamvault-cover-link"
++                    onClick={() => openSiteEventNewTab(latest)}
++                    onPointerMove={updateSiteCoverMotion}
++                    onPointerLeave={resetSiteCoverMotion}
++                    aria-label={`Открыть ${latest.title} в новой вкладке`}
++                  >
+                     <SiteArtwork event={latest} label="COVER" src={latest.assets?.cover?.url} />
+                   </button>
+                   <div className="streamvault-preview-stage">
+-                    <button type="button" className="streamvault-preview-main" onClick={() => openSiteEvent(latest)}>
+-                      <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} src={latest.assets?.frames?.[siteHeroFrame]?.url} />
++                    <button
++                      type="button"
++                      className="streamvault-preview-main"
++                      onClick={() => setSiteHeroFrame((current) => (current + 1) % 4)}
++                      aria-label="Следующий кадр"
++                    >
++                      <div className="streamvault-preview-transition" key={`${latest.id}:${siteHeroFrame}`}>
++                        <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} src={latest.assets?.frames?.[siteHeroFrame]?.url} />
++                      </div>
+                     </button>
+                     <div className="streamvault-preview-rail" aria-label="Четыре preview-кадра">
+                       {[0, 1, 2, 3].map((frame) => (
+@@ -3032,7 +3207,6 @@ function App() {
+               <div className="streamvault-section-head">
+                 <div>
+                   <h2 id="streamvaultRecordingsTitle">{siteCategory === "all" ? "Записи" : siteCategories.find((category) => category.slug === siteCategory)?.label || "Записи"}</h2>
+-                  {siteQuery.trim() ? <p>Поиск: «{siteQuery.trim()}»</p> : null}
+                 </div>
+                 <span>{siteEvents.length.toLocaleString("ru-RU")}</span>
+               </div>
+@@ -3041,14 +3215,23 @@ function App() {
+               ) : (
+                 <div className="streamvault-recording-grid">
+                   {siteEvents.map((event) => (
+-                    <button type="button" className="streamvault-recording-card" key={event.id} onClick={() => openSiteEvent(event)}>
+-                      <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" src={event.assets?.cover?.url} /></div>
++                    <article className="streamvault-recording-card" key={event.id}>
++                      <button
++                        type="button"
++                        className="streamvault-recording-cover-link streamvault-cover-link"
++                        onClick={() => openSiteEventNewTab(event)}
++                        onPointerMove={updateSiteCoverMotion}
++                        onPointerLeave={resetSiteCoverMotion}
++                        aria-label={`Открыть ${event.title} в новой вкладке`}
++                      >
++                        <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" src={event.assets?.cover?.url} /></div>
++                      </button>
+                       <div className="streamvault-recording-body">
+                         <h3>{event.title}</h3>
+                         <p>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleDateString("ru-RU") : "Дата неизвестна"} · {(event.chat_message_count || 0).toLocaleString("ru-RU")} сообщений</p>
+                         <div className="streamvault-badges">{event.categories.slice(0, 3).map((category) => <span key={category.slug}>{category.label}</span>)}</div>
+                       </div>
+-                    </button>
++                    </article>
+                   ))}
+                 </div>
+               )}
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 5ddcf7d..bdad32f 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -310,6 +310,7 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+   gap: 24px;
+   align-items: center;
+ }
++.streamvault-search-wrap { position: relative; min-width: 0; }
+ .streamvault-brand {
+   width: max-content;
+   display: inline-flex;
+@@ -342,6 +343,7 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+   margin-left: 2px;
+ }
+ .streamvault-search {
++  width: 100%;
+   height: 40px;
+   min-width: 0;
+   display: flex;
+@@ -356,6 +358,55 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-search > span { font-size: 21px; line-height: 1; transform: rotate(-15deg); }
+ .streamvault-search input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--sv-text); }
+ .streamvault-search input::placeholder { color: #68737d; }
++.streamvault-search-results {
++  position: absolute;
++  z-index: 80;
++  top: calc(100% + 8px);
++  left: 0;
++  right: 0;
++  overflow: hidden;
++  max-height: min(68vh, 520px);
++  overflow-y: auto;
++  border: 1px solid #2c3741;
++  border-radius: 13px;
++  background: rgba(12,17,22,.985);
++  box-shadow: 0 22px 70px rgba(0,0,0,.55);
++  backdrop-filter: blur(18px);
++}
++.streamvault-search-state { padding: 18px 16px; color: #7c8791; font-size: 12px; text-align: center; }
++.streamvault-search-result {
++  width: 100%;
++  min-height: 68px;
++  display: grid;
++  grid-template-columns: 42px minmax(0,1fr);
++  align-items: center;
++  gap: 11px;
++  padding: 8px 10px;
++  border: 0;
++  border-bottom: 1px solid rgba(255,255,255,.055);
++  border-radius: 0;
++  background: transparent;
++  color: inherit;
++  text-align: left;
++}
++.streamvault-search-result:last-child { border-bottom: 0; }
++.streamvault-search-result:hover, .streamvault-search-result:focus-visible { background: rgba(255,120,24,.1); outline: 0; }
++.streamvault-search-result-cover {
++  width: 42px;
++  height: 52px;
++  overflow: hidden;
++  display: grid;
++  place-items: center;
++  border: 1px solid var(--sv-line);
++  border-radius: 7px;
++  background: linear-gradient(145deg, rgba(255,120,24,.2), #111820 70%);
++  color: var(--sv-orange-2);
++}
++.streamvault-search-result-cover img { width: 100%; height: 100%; display: block; object-fit: cover; }
++.streamvault-search-result-cover > span { font-size: 12px; }
++.streamvault-search-result-copy { min-width: 0; display: grid; gap: 5px; }
++.streamvault-search-result-copy strong { overflow: hidden; color: #edf1f4; font-size: 12px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
++.streamvault-search-result-copy small { overflow: hidden; color: #7f8992; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+ .streamvault-header-actions { justify-self: end; display: flex; align-items: center; gap: 9px; }
+ .streamvault-header-button {
+   height: 38px;
+@@ -402,23 +453,30 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-hero > h1, .streamvault-recordings h2 { margin: 0; font-size: 21px; line-height: 1.2; letter-spacing: -.025em; }
+ .streamvault-hero > h1 { margin-bottom: 13px; }
+ .streamvault-latest-layout { display: grid; grid-template-columns: minmax(190px, 240px) minmax(0, 1fr); gap: 18px; }
+-.streamvault-latest-cover, .streamvault-preview-main, .streamvault-preview-rail > button, .streamvault-recording-card {
++.streamvault-latest-cover, .streamvault-preview-main, .streamvault-preview-rail > button, .streamvault-recording-cover-link {
+   border: 0;
+   background: transparent;
+   color: inherit;
+   padding: 0;
+   text-align: left;
+ }
+-.streamvault-latest-cover { min-height: 280px; overflow: hidden; border-radius: 14px; }
++.streamvault-latest-cover { min-height: 280px; height: 100%; overflow: hidden; border-radius: 14px; }
+ .streamvault-preview-stage { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 170px; gap: 12px; }
+-.streamvault-preview-main { min-height: 280px; overflow: hidden; border-radius: 14px; }
++.streamvault-preview-main { min-height: 280px; position: relative; overflow: hidden; border-radius: 14px; cursor: pointer; }
++.streamvault-preview-transition { position: absolute; inset: 0; animation: streamvault-preview-in .34s cubic-bezier(.2,.75,.2,1) both; }
++@keyframes streamvault-preview-in {
++  from { opacity: .1; transform: translate3d(10px,0,0) scale(1.018); filter: saturate(.75); }
++  to { opacity: 1; transform: translate3d(0,0,0) scale(1); filter: saturate(1); }
++}
++
+ .streamvault-preview-rail { min-height: 0; display: grid; grid-template-rows: repeat(4, minmax(0, 1fr)); gap: 8px; }
+-.streamvault-preview-rail > button { min-height: 0; overflow: hidden; border: 1px solid var(--sv-line); border-radius: 9px; opacity: .64; }
++.streamvault-preview-rail > button { min-height: 0; overflow: hidden; border: 1px solid var(--sv-line); border-radius: 9px; opacity: .64; transition: opacity .18s ease, border-color .18s ease, transform .18s ease; }
++.streamvault-preview-rail > button:hover { transform: translateX(-2px); }
+ .streamvault-preview-rail > button:hover, .streamvault-preview-rail > button.active { opacity: 1; border-color: var(--sv-orange); }
+ .streamvault-artwork {
+   width: 100%;
+   height: 100%;
+-  min-height: inherit;
++  min-height: 0;
+   position: relative;
+   overflow: hidden;
+   display: flex;
+@@ -436,6 +494,45 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-artwork > div { position: relative; z-index: 1; display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; }
+ .streamvault-artwork strong { max-width: 76%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; letter-spacing: .03em; }
+ .streamvault-artwork small { color: #929ca6; font-size: 9px; font-weight: 800; }
++.streamvault-latest-cover .streamvault-artwork,
++.streamvault-recording-cover .streamvault-artwork,
++.streamvault-preview-main .streamvault-artwork,
++.streamvault-preview-rail .streamvault-artwork { width: 100%; height: 100%; min-height: 0; }
++.streamvault-cover-link {
++  --sv-cover-shift-x: 0px;
++  --sv-cover-shift-y: 0px;
++  --sv-cover-tilt-x: 0deg;
++  --sv-cover-tilt-y: 0deg;
++  --sv-cover-spot-x: 50%;
++  --sv-cover-spot-y: 50%;
++  position: relative;
++  cursor: pointer;
++  perspective: 900px;
++}
++.streamvault-cover-link .streamvault-artwork {
++  transform: perspective(900px) rotateX(var(--sv-cover-tilt-x)) rotateY(var(--sv-cover-tilt-y));
++  transform-origin: center;
++  transition: transform .22s cubic-bezier(.2,.7,.2,1), box-shadow .22s ease;
++}
++.streamvault-cover-link .streamvault-artwork::before {
++  content: "";
++  position: absolute;
++  z-index: 3;
++  inset: 0;
++  pointer-events: none;
++  opacity: 0;
++  background: radial-gradient(circle at var(--sv-cover-spot-x) var(--sv-cover-spot-y), rgba(255,190,125,.2), transparent 34%);
++  transition: opacity .2s ease;
++}
++.streamvault-cover-link .streamvault-artwork > img {
++  transform: translate3d(var(--sv-cover-shift-x), var(--sv-cover-shift-y), 0) scale(1.055);
++  transition: transform .18s cubic-bezier(.2,.7,.2,1), filter .2s ease;
++  will-change: transform;
++}
++.streamvault-cover-link:hover .streamvault-artwork { box-shadow: inset 0 0 0 1px rgba(255,145,54,.45), 0 14px 36px rgba(0,0,0,.28); }
++.streamvault-cover-link:hover .streamvault-artwork::before { opacity: 1; }
++.streamvault-cover-link:hover .streamvault-artwork > img { filter: saturate(1.07) contrast(1.025); }
++.streamvault-cover-link:focus-visible { outline: 2px solid var(--sv-orange); outline-offset: 3px; }
+ .streamvault-artwork.wide { aspect-ratio: 16 / 9; }
+ .streamvault-preview-rail .streamvault-artwork { padding: 7px; }
+ .streamvault-preview-rail .streamvault-artwork > div { display: none; }
+@@ -450,8 +547,8 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-section-head > span { color: #67727c; font-size: 12px; }
+ .streamvault-recording-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 24px 15px; }
+ .streamvault-recording-card { min-width: 0; }
+-.streamvault-recording-cover { aspect-ratio: .86 / 1; overflow: hidden; border-radius: 11px; transition: transform .16s ease; }
+-.streamvault-recording-card:hover .streamvault-recording-cover { transform: translateY(-2px); }
++.streamvault-recording-cover-link { width: 100%; display: block; border-radius: 11px; }
++.streamvault-recording-cover { width: 100%; aspect-ratio: .86 / 1; overflow: hidden; border-radius: 11px; background: #090c0f; }
+ .streamvault-recording-body { padding-top: 9px; }
+ .streamvault-recording-body h3 { margin: 0; color: var(--sv-text); font-size: 14px; line-height: 1.34; font-weight: 750; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+ .streamvault-recording-body p { margin: 5px 0 8px; color: var(--sv-muted); font-size: 11px; }
+@@ -589,10 +686,13 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ @media (max-width: 900px) {
+   .streamvault-header { height: 62px; }
+   .streamvault-header-inner { width: calc(100% - 28px); grid-template-columns: auto 1fr auto; gap: 12px; }
+-  .streamvault-search { justify-self: end; width: 42px; padding: 0; justify-content: center; }
++  .streamvault-search-wrap { justify-self: end; width: 42px; }
++  .streamvault-search { width: 42px; padding: 0; justify-content: center; }
+   .streamvault-search input { position: absolute; width: 1px; opacity: 0; pointer-events: none; }
+-  .streamvault-search:focus-within { position: absolute; left: 56px; right: 128px; width: auto; z-index: 5; padding: 0 12px; justify-content: flex-start; box-shadow: 0 8px 28px rgba(0,0,0,.38); }
+-  .streamvault-search:focus-within input { position: static; width: 100%; opacity: 1; pointer-events: auto; }
++  .streamvault-search-wrap:focus-within { position: absolute; left: 56px; right: 128px; width: auto; z-index: 55; }
++  .streamvault-search-wrap:focus-within .streamvault-search { width: 100%; padding: 0 12px; justify-content: flex-start; box-shadow: 0 8px 28px rgba(0,0,0,.38); }
++  .streamvault-search-wrap:focus-within .streamvault-search input { position: static; width: 100%; opacity: 1; pointer-events: auto; }
++  .streamvault-search-results { width: min(430px, calc(100vw - 28px)); left: auto; right: 0; }
+   .streamvault-header-button.primary { display: none; }
+   .streamvault-home-shell { width: 100%; display: block; padding: 0 18px 40px; }
+   .streamvault-sidebar { display: none; }

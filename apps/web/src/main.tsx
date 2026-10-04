@@ -1688,19 +1688,32 @@ function SiteReplayChat({
 
 function StreamVaultHeader({
   query,
+  searchResults,
+  searchLoading,
   onQueryChange,
   onSubmit,
+  onSearchResult,
   onBrand,
   onAdmin,
   onSiteAdmin,
 }: {
   query: string;
+  searchResults: SiteEvent[];
+  searchLoading: boolean;
   onQueryChange: (value: string) => void;
   onSubmit: () => void;
+  onSearchResult: (event: SiteEvent) => void;
   onBrand: () => void;
   onAdmin: () => void;
   onSiteAdmin: () => void;
 }) {
+  const [searchOpen, setSearchOpen] = useState(false);
+  const trimmedQuery = query.trim();
+
+  useEffect(() => {
+    if (!trimmedQuery) setSearchOpen(false);
+  }, [trimmedQuery]);
+
   return (
     <header className="streamvault-header">
       <div className="streamvault-header-inner">
@@ -1708,16 +1721,66 @@ function StreamVaultHeader({
           <span className="streamvault-brand-mark" aria-hidden="true" />
           <span>StreamVault</span>
         </button>
-        <label className="streamvault-search">
-          <span aria-hidden="true">⌕</span>
-          <input
-            type="search"
-            value={query}
-            onChange={(event) => onQueryChange(event.target.value)}
-            onKeyDown={(event) => event.key === "Enter" && onSubmit()}
-            placeholder="Поиск записей, стримеров, шоу…"
-          />
-        </label>
+        <div
+          className="streamvault-search-wrap"
+          onBlur={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setSearchOpen(false);
+          }}
+        >
+          <label className="streamvault-search">
+            <span aria-hidden="true">⌕</span>
+            <input
+              type="search"
+              value={query}
+              onChange={(event) => { onQueryChange(event.target.value); setSearchOpen(true); }}
+              onFocus={() => { if (trimmedQuery) setSearchOpen(true); }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  setSearchOpen(false);
+                  event.currentTarget.blur();
+                  return;
+                }
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  if (searchResults[0]) {
+                    setSearchOpen(false);
+                    onSearchResult(searchResults[0]);
+                  } else {
+                    onSubmit();
+                  }
+                }
+              }}
+              placeholder="Поиск"
+              autoComplete="off"
+            />
+          </label>
+          {searchOpen && trimmedQuery ? (
+            <div className="streamvault-search-results" role="listbox" aria-label="Результаты поиска">
+              {searchLoading ? <div className="streamvault-search-state">Ищем…</div> : null}
+              {!searchLoading && searchResults.length === 0 ? <div className="streamvault-search-state">Ничего не найдено</div> : null}
+              {!searchLoading ? searchResults.map((event) => (
+                <button
+                  type="button"
+                  className="streamvault-search-result"
+                  key={event.id}
+                  onClick={() => { setSearchOpen(false); onSearchResult(event); }}
+                  role="option"
+                >
+                  <span className="streamvault-search-result-cover">
+                    {event.assets?.cover?.url ? <img src={apiUrl(event.assets.cover.url)} alt="" loading="lazy" /> : <span aria-hidden="true">▶</span>}
+                  </span>
+                  <span className="streamvault-search-result-copy">
+                    <strong>{event.title}</strong>
+                    <small>
+                      {event.channel_display_name || event.channel_login || "Twitch"}
+                      {event.source_started_at_utc ? ` · ${new Date(event.source_started_at_utc).toLocaleDateString("ru-RU")}` : ""}
+                    </small>
+                  </span>
+                </button>
+              )) : null}
+            </div>
+          ) : null}
+        </div>
         <div className="streamvault-header-actions">
           <button type="button" className="streamvault-header-button" onClick={onAdmin}>StreamHub</button>
           <button type="button" className="streamvault-header-button admin" onClick={onSiteAdmin}>Админка</button>
@@ -1772,6 +1835,42 @@ function SiteAdminPanel({
   const assetFor = (event: SiteAdminEvent, slot: string) => slot === "cover"
     ? event.assets.cover
     : event.assets.frames[Math.max(0, Number(slot.split("_")[1]) - 1)];
+  const [uploadTarget, setUploadTarget] = useState<{ eventId: string; slot: string; label: string } | null>(null);
+  const [clipboardNotice, setClipboardNotice] = useState("");
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!uploadTarget) return;
+    const onPaste = (event: ClipboardEvent) => {
+      const clipboardItems = Array.from(event.clipboardData?.items || []);
+      const imageItem = clipboardItems.find((item) => item.kind === "file" && item.type.startsWith("image/"));
+      const file = imageItem?.getAsFile() || Array.from(event.clipboardData?.files || []).find((item) => item.type.startsWith("image/"));
+      if (!file) {
+        setClipboardNotice("В буфере обмена нет изображения.");
+        return;
+      }
+      event.preventDefault();
+      const target = uploadTarget;
+      setUploadTarget(null);
+      setClipboardNotice("");
+      onUpload(target.eventId, target.slot, file);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [onUpload, uploadTarget]);
+
+  const openAssetPicker = (eventId: string, slot: string, label: string) => {
+    setClipboardNotice("");
+    setUploadTarget({ eventId, slot, label });
+  };
+
+  const submitPickedFile = (file: File | undefined) => {
+    if (!file || !uploadTarget) return;
+    const target = uploadTarget;
+    setUploadTarget(null);
+    setClipboardNotice("");
+    onUpload(target.eventId, target.slot, file);
+  };
 
   return (
     <div className="site-modal-backdrop site-admin-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -1813,12 +1912,17 @@ function SiteAdminPanel({
                     const asset = assetFor(event, slot);
                     const busy = actionKey === `asset:${event.id}:${slot}`;
                     return (
-                      <label className={`site-admin-asset ${asset ? "has-asset" : ""}`} key={slot}>
+                      <button
+                        type="button"
+                        className={`site-admin-asset ${asset ? "has-asset" : ""}`}
+                        key={slot}
+                        disabled={Boolean(actionKey)}
+                        onClick={() => openAssetPicker(event.id, slot, label)}
+                      >
                         <span>{label}</span>
                         <div>{asset ? <img src={apiUrl(asset.url)} alt="" /> : <b>+</b>}</div>
-                        <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height}` : "Выбрать изображение"}</small>
-                        <input type="file" accept="image/jpeg,image/png,image/webp" disabled={Boolean(actionKey)} onChange={(e) => { const file = e.target.files?.[0]; if (file) onUpload(event.id, slot, file); e.currentTarget.value = ""; }} />
-                      </label>
+                        <small>{busy ? "Загрузка…" : asset ? `${asset.width}×${asset.height} · заменить` : "Файл или Ctrl+V"}</small>
+                      </button>
                     );
                   })}
                 </div>
@@ -1826,6 +1930,30 @@ function SiteAdminPanel({
             ))}
           </div>
         )}
+        {uploadTarget ? (
+          <div className="site-admin-asset-picker-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setUploadTarget(null); }}>
+            <div className="site-admin-asset-picker" role="dialog" aria-modal="true" aria-labelledby="siteAdminAssetPickerTitle">
+              <span className="site-admin-asset-picker-kicker">{uploadTarget.label}</span>
+              <h3 id="siteAdminAssetPickerTitle">Добавить изображение</h3>
+              <p>Выберите файл на компьютере или вставьте изображение прямо из буфера обмена.</p>
+              <div className="site-admin-asset-paste-hint" aria-label="Вставить изображение из буфера сочетанием Control V">
+                <kbd>Ctrl</kbd><span>+</span><kbd>V</kbd>
+              </div>
+              {clipboardNotice ? <div className="site-admin-asset-picker-notice">{clipboardNotice}</div> : null}
+              <div className="site-admin-asset-picker-actions">
+                <button type="button" className="primary" onClick={() => uploadInputRef.current?.click()}>Выбрать файл</button>
+                <button type="button" onClick={() => setUploadTarget(null)}>Отмена</button>
+              </div>
+              <input
+                ref={uploadInputRef}
+                className="site-admin-asset-picker-input"
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                onChange={(event) => { submitPickedFile(event.target.files?.[0]); event.currentTarget.value = ""; }}
+              />
+            </div>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -1835,7 +1963,7 @@ function SiteAdminPanel({
 function App() {
   const [events, setEvents] = useState<MediaEvent[]>([]);
   const [trashEvents, setTrashEvents] = useState<MediaEvent[]>([]);
-  const [view, setView] = useState<ViewMode>("events");
+  const [view, setView] = useState<ViewMode>(() => new URLSearchParams(window.location.search).has("site_event") ? "site" : "events");
   const [expandedIds, setExpandedIds] = useState<string[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
   const [selectedVideo, setSelectedVideo] = useState<VideoSession | null>(null);
@@ -1876,6 +2004,8 @@ function App() {
   const [siteCategories, setSiteCategories] = useState<SiteCategory[]>([]);
   const [siteCategory, setSiteCategory] = useState("all");
   const [siteQuery, setSiteQuery] = useState("");
+  const [siteSearchResults, setSiteSearchResults] = useState<SiteEvent[]>([]);
+  const [siteSearchLoading, setSiteSearchLoading] = useState(false);
   const [selectedSiteEvent, setSelectedSiteEvent] = useState<SiteEvent | null>(null);
   const siteVideoRef = useRef<HTMLVideoElement | null>(null);
   const [sitePublisherOpen, setSitePublisherOpen] = useState(false);
@@ -1900,6 +2030,60 @@ function App() {
   useEffect(() => {
     try { window.localStorage.setItem(PART_SEGMENT_COUNT_KEY, String(partSegmentCount)); } catch { /* browser storage unavailable */ }
   }, [partSegmentCount]);
+
+  useEffect(() => {
+    const query = siteQuery.trim();
+    if (view !== "site" || !query) {
+      setSiteSearchResults([]);
+      setSiteSearchLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setSiteSearchLoading(true);
+      try {
+        const params = new URLSearchParams({ q: query, limit: "8" });
+        const res = await fetch(`${API}/api/v1/site/feed?${params.toString()}`, { cache: "no-store", signal: controller.signal });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        setSiteSearchResults(data.items || []);
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          console.warn("site search failed", error);
+          setSiteSearchResults([]);
+        }
+      } finally {
+        if (!controller.signal.aborted) setSiteSearchLoading(false);
+      }
+    }, 180);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [siteQuery, view]);
+
+  useEffect(() => {
+    const eventId = new URLSearchParams(window.location.search).get("site_event");
+    if (!eventId) return;
+    const controller = new AbortController();
+    fetch(`${API}/api/v1/site/events/${encodeURIComponent(eventId)}`, { cache: "no-store", signal: controller.signal })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await res.text());
+        return await res.json() as SiteEvent;
+      })
+      .then((event) => {
+        setView("site");
+        setSelectedSiteEvent(event);
+        setSiteCommentDraft("");
+        setSiteCommentNotice("");
+      })
+      .catch((error) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) setError(String(error));
+      });
+    return () => controller.abort();
+  }, []);
 
   async function loadEvents() {
     try {
@@ -2081,7 +2265,7 @@ function App() {
     }
   }
 
-  async function loadSiteFeed(category = siteCategory, query = siteQuery) {
+  async function loadSiteFeed(category = siteCategory, query = "") {
     try {
       const params = new URLSearchParams();
       if (category && category !== "all") params.set("category", category);
@@ -2097,11 +2281,47 @@ function App() {
     }
   }
 
-  function openSiteEvent(event: SiteEvent) {
-    setSelectedSiteEvent(event);
-    setSiteCommentDraft("");
-    setSiteCommentNotice("");
-    window.scrollTo({ top: 0, behavior: "auto" });
+  function siteEventUrl(eventId: string) {
+    const url = new URL(window.location.href);
+    url.search = "";
+    url.hash = "";
+    url.searchParams.set("site_event", eventId);
+    return url.toString();
+  }
+
+  function openSiteEventNewTab(event: SiteEvent) {
+    window.open(siteEventUrl(event.id), "_blank", "noopener,noreferrer");
+  }
+
+  function closeSiteEvent() {
+    setSelectedSiteEvent(null);
+    const url = new URL(window.location.href);
+    if (url.searchParams.has("site_event")) {
+      url.searchParams.delete("site_event");
+      window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+  }
+
+  function updateSiteCoverMotion(event: React.PointerEvent<HTMLButtonElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const x = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    const y = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
+    event.currentTarget.style.setProperty("--sv-cover-shift-x", `${(0.5 - x) * 10}px`);
+    event.currentTarget.style.setProperty("--sv-cover-shift-y", `${(0.5 - y) * 10}px`);
+    event.currentTarget.style.setProperty("--sv-cover-tilt-x", `${(0.5 - y) * 2.2}deg`);
+    event.currentTarget.style.setProperty("--sv-cover-tilt-y", `${(x - 0.5) * 2.2}deg`);
+    event.currentTarget.style.setProperty("--sv-cover-spot-x", `${x * 100}%`);
+    event.currentTarget.style.setProperty("--sv-cover-spot-y", `${y * 100}%`);
+  }
+
+  function resetSiteCoverMotion(event: React.PointerEvent<HTMLButtonElement>) {
+    event.currentTarget.style.setProperty("--sv-cover-shift-x", "0px");
+    event.currentTarget.style.setProperty("--sv-cover-shift-y", "0px");
+    event.currentTarget.style.setProperty("--sv-cover-tilt-x", "0deg");
+    event.currentTarget.style.setProperty("--sv-cover-tilt-y", "0deg");
+    event.currentTarget.style.setProperty("--sv-cover-spot-x", "50%");
+    event.currentTarget.style.setProperty("--sv-cover-spot-y", "50%");
   }
 
   function mentionSiteComment(mention: string) {
@@ -2170,7 +2390,7 @@ function App() {
       const res = await fetch(`${API}/api/v1/site/admin/events/${eventId}/assets/${slot}`, { method: "PUT", body: form });
       if (!res.ok) throw new Error(await res.text());
       await loadSiteAdminEvents();
-      await loadSiteFeed(siteCategory, siteQuery);
+      await loadSiteFeed(siteCategory, "");
       if (selectedSiteEvent?.id === eventId) {
         const detail = await fetch(`${API}/api/v1/site/events/${eventId}`, { cache: "no-store" });
         if (detail.ok) setSelectedSiteEvent(await detail.json() as SiteEvent);
@@ -2228,7 +2448,7 @@ function App() {
       });
       if (!res.ok) throw new Error(await res.text());
       setSitePublisherOpen(false);
-      await loadSiteFeed(siteCategory, siteQuery);
+      await loadSiteFeed(siteCategory, "");
       if (siteAdminOpen) await loadSiteAdminEvents();
       setError(null);
     } catch (e) {
@@ -2806,14 +3026,17 @@ function App() {
       <div className="streamvault-app">
         <StreamVaultHeader
           query={siteQuery}
+          searchResults={siteSearchResults}
+          searchLoading={siteSearchLoading}
           onQueryChange={setSiteQuery}
-          onSubmit={() => { setSelectedSiteEvent(null); void loadSiteFeed(siteCategory, siteQuery); }}
-          onBrand={() => setSelectedSiteEvent(null)}
-          onAdmin={() => { setSelectedSiteEvent(null); setView("events"); }}
+          onSubmit={() => {}}
+          onSearchResult={openSiteEventNewTab}
+          onBrand={closeSiteEvent}
+          onAdmin={() => { closeSiteEvent(); setView("events"); }}
           onSiteAdmin={() => void openSiteAdmin()}
         />
         <main className="streamvault-watch-shell">
-          <button className="streamvault-back" type="button" onClick={() => setSelectedSiteEvent(null)}>← К записям</button>
+          <button className="streamvault-back" type="button" onClick={closeSiteEvent}>← К записям</button>
           <div className="streamvault-watch-layout">
             <div className="streamvault-watch-primary">
               <div className="streamvault-player">
@@ -2893,7 +3116,7 @@ function App() {
             onDraftChange={(eventId, value) => setSiteAdminDrafts((current) => ({ ...current, [eventId]: value }))}
             onSaveTitle={(eventId) => void saveSiteDisplayTitle(eventId)}
             onUpload={(eventId, slot, file) => void uploadSiteAsset(eventId, slot, file)}
-            onAddEvent={() => { setSiteAdminOpen(false); setSelectedSiteEvent(null); void openSitePublisher(); }}
+            onAddEvent={() => { setSiteAdminOpen(false); closeSiteEvent(); void openSitePublisher(); }}
             onClose={() => setSiteAdminOpen(false)}
           />
         ) : null}
@@ -2907,26 +3130,29 @@ function App() {
       <div className="streamvault-app">
         <StreamVaultHeader
           query={siteQuery}
+          searchResults={siteSearchResults}
+          searchLoading={siteSearchLoading}
           onQueryChange={setSiteQuery}
-          onSubmit={() => void loadSiteFeed(siteCategory, siteQuery)}
+          onSubmit={() => {}}
+          onSearchResult={openSiteEventNewTab}
           onBrand={() => { setSiteCategory("all"); setSiteQuery(""); void loadSiteFeed("all", ""); }}
           onAdmin={() => setView("events")}
           onSiteAdmin={() => void openSiteAdmin()}
         />
 
         <nav className="streamvault-mobile-categories" aria-label="Категории">
-          <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", siteQuery); }}>Все</button>
+          <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}>Все</button>
           {siteCategories.map((category) => (
-            <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, siteQuery); }}>{category.label}</button>
+            <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, ""); }}>{category.label}</button>
           ))}
         </nav>
 
         <div className="streamvault-home-shell">
           <aside className="streamvault-sidebar">
             <nav aria-label="Категории видео">
-              <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", siteQuery); }}><span>⌂</span>Все видео</button>
+              <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}><span>⌂</span>Все видео</button>
               {siteCategories.map((category) => (
-                <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, siteQuery); }}><span>•</span>{category.label}</button>
+                <button key={category.slug} className={siteCategory === category.slug ? "active" : ""} onClick={() => { setSiteCategory(category.slug); void loadSiteFeed(category.slug, ""); }}><span>•</span>{category.label}</button>
               ))}
             </nav>
           </aside>
@@ -2937,12 +3163,26 @@ function App() {
               <section className="streamvault-hero" aria-labelledby="streamvaultLatestTitle">
                 <h1>Последний стрим</h1>
                 <div className="streamvault-latest-layout">
-                  <button type="button" className="streamvault-latest-cover" onClick={() => openSiteEvent(latest)} aria-label={`Открыть ${latest.title}`}>
+                  <button
+                    type="button"
+                    className="streamvault-latest-cover streamvault-cover-link"
+                    onClick={() => openSiteEventNewTab(latest)}
+                    onPointerMove={updateSiteCoverMotion}
+                    onPointerLeave={resetSiteCoverMotion}
+                    aria-label={`Открыть ${latest.title} в новой вкладке`}
+                  >
                     <SiteArtwork event={latest} label="COVER" src={latest.assets?.cover?.url} />
                   </button>
                   <div className="streamvault-preview-stage">
-                    <button type="button" className="streamvault-preview-main" onClick={() => openSiteEvent(latest)}>
-                      <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} src={latest.assets?.frames?.[siteHeroFrame]?.url} />
+                    <button
+                      type="button"
+                      className="streamvault-preview-main"
+                      onClick={() => setSiteHeroFrame((current) => (current + 1) % 4)}
+                      aria-label="Следующий кадр"
+                    >
+                      <div className="streamvault-preview-transition" key={`${latest.id}:${siteHeroFrame}`}>
+                        <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} src={latest.assets?.frames?.[siteHeroFrame]?.url} />
+                      </div>
                     </button>
                     <div className="streamvault-preview-rail" aria-label="Четыре preview-кадра">
                       {[0, 1, 2, 3].map((frame) => (
@@ -2967,7 +3207,6 @@ function App() {
               <div className="streamvault-section-head">
                 <div>
                   <h2 id="streamvaultRecordingsTitle">{siteCategory === "all" ? "Записи" : siteCategories.find((category) => category.slug === siteCategory)?.label || "Записи"}</h2>
-                  {siteQuery.trim() ? <p>Поиск: «{siteQuery.trim()}»</p> : null}
                 </div>
                 <span>{siteEvents.length.toLocaleString("ru-RU")}</span>
               </div>
@@ -2976,14 +3215,23 @@ function App() {
               ) : (
                 <div className="streamvault-recording-grid">
                   {siteEvents.map((event) => (
-                    <button type="button" className="streamvault-recording-card" key={event.id} onClick={() => openSiteEvent(event)}>
-                      <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" src={event.assets?.cover?.url} /></div>
+                    <article className="streamvault-recording-card" key={event.id}>
+                      <button
+                        type="button"
+                        className="streamvault-recording-cover-link streamvault-cover-link"
+                        onClick={() => openSiteEventNewTab(event)}
+                        onPointerMove={updateSiteCoverMotion}
+                        onPointerLeave={resetSiteCoverMotion}
+                        aria-label={`Открыть ${event.title} в новой вкладке`}
+                      >
+                        <div className="streamvault-recording-cover"><SiteArtwork event={event} label="COVER" src={event.assets?.cover?.url} /></div>
+                      </button>
                       <div className="streamvault-recording-body">
                         <h3>{event.title}</h3>
                         <p>{event.source_started_at_utc ? new Date(event.source_started_at_utc).toLocaleDateString("ru-RU") : "Дата неизвестна"} · {(event.chat_message_count || 0).toLocaleString("ru-RU")} сообщений</p>
                         <div className="streamvault-badges">{event.categories.slice(0, 3).map((category) => <span key={category.slug}>{category.label}</span>)}</div>
                       </div>
-                    </button>
+                    </article>
                   ))}
                 </div>
               )}
