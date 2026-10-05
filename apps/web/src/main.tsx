@@ -97,6 +97,9 @@ type VideoPart = {
   relative_path: string;
   status: string;
   last_error?: string | null;
+  local_file_state: string;
+  local_unlinked_at_utc?: string | null;
+  local_unlink_error?: string | null;
   created_at: string;
   completed_at_utc?: string | null;
   job?: VideoPartJob | null;
@@ -252,6 +255,9 @@ type VideoSegment = {
   archive_attempts: number;
   archive_last_error?: string | null;
   archived_at_utc?: string | null;
+  replacement_directory?: string | null;
+  replacement_path?: string | null;
+  replaced_at_utc?: string | null;
   closed_at_utc: string;
 };
 
@@ -441,6 +447,14 @@ type SiteWatchSession = {
   state_updated_at?: string | null;
   last_activity_at?: string | null;
   created_at?: string | null;
+};
+
+type SiteWatchMessage = {
+  id: number;
+  session_id: string;
+  body: string;
+  created_at: string;
+  user: { id: string; nickname: string; login: string; avatar_url?: string | null };
 };
 
 type SiteCommentReactionName = "like" | "dislike" | "heart" | "broken_heart" | "fire" | "cry" | "laugh" | "poop";
@@ -1684,12 +1698,20 @@ function SiteReplayChat({
   hasChat,
   messageCount,
   videoRef,
+  watchSession,
+  watchClientId,
+  authUser,
+  onLogin,
   onMention,
 }: {
   eventId: string;
   hasChat: boolean;
   messageCount: number;
   videoRef: { current: HTMLVideoElement | null };
+  watchSession: SiteWatchSession | null;
+  watchClientId: string;
+  authUser: AuthUser | null;
+  onLogin: () => void;
   onMention?: (mention: string) => void;
 }) {
   const [messages, setMessages] = useState<SiteChatMessage[]>([]);
@@ -1699,6 +1721,12 @@ function SiteReplayChat({
   const [chatStatus, setChatStatus] = useState(hasChat ? "Загрузка…" : "Чат не записан");
   const [following, setFollowing] = useState(true);
   const [userMenu, setUserMenu] = useState<{ user: SiteChatUserIdentity; x: number; y: number } | null>(null);
+  const [chatMode, setChatMode] = useState<"recording" | "live">("recording");
+  const [roomMessages, setRoomMessages] = useState<SiteWatchMessage[]>([]);
+  const [roomDraft, setRoomDraft] = useState("");
+  const [roomSending, setRoomSending] = useState(false);
+  const [roomNotice, setRoomNotice] = useState("");
+  const roomListRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const loadedRangeRef = useRef<{ from: number; to: number } | null>(null);
   const smoothFollowRef = useRef(false);
@@ -2072,6 +2100,75 @@ function SiteReplayChat({
     setFollowing(true);
   }
 
+  useEffect(() => {
+    setRoomMessages([]);
+    setRoomDraft("");
+    setRoomNotice("");
+    const sessionId = watchSession?.id;
+    if (!sessionId) return;
+    let disposed = false;
+    let inFlight = false;
+    let lastId = 0;
+    const load = async () => {
+      if (inFlight || disposed) return;
+      inFlight = true;
+      try {
+        const params = lastId ? `?after_id=${lastId}&page_size=200` : "?page_size=200";
+        const res = await fetch(apiUrl(`/api/v1/site/watch-sessions/${sessionId}/messages${params}`), { cache: "no-store" });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json() as { items?: SiteWatchMessage[] };
+        const incoming = data.items || [];
+        if (disposed || !incoming.length) return;
+        lastId = Math.max(lastId, ...incoming.map((item) => item.id));
+        setRoomMessages((current) => {
+          const seen = new Set(current.map((item) => item.id));
+          return [...current, ...incoming.filter((item) => !seen.has(item.id))].slice(-500);
+        });
+      } catch (error) {
+        if (!disposed) setRoomNotice(`Чат комнаты недоступен: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const timer = window.setInterval(load, 1000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [watchSession?.id]);
+
+  useEffect(() => {
+    if (chatMode !== "live") return;
+    const node = roomListRef.current;
+    if (!node) return;
+    const frame = window.requestAnimationFrame(() => { node.scrollTop = node.scrollHeight; });
+    return () => window.cancelAnimationFrame(frame);
+  }, [chatMode, roomMessages.length]);
+
+  async function sendRoomMessage() {
+    const sessionId = watchSession?.id;
+    const body = roomDraft.trim();
+    if (!sessionId || !body || roomSending) return;
+    if (!authUser) { onLogin(); return; }
+    setRoomSending(true);
+    setRoomNotice("");
+    try {
+      const res = await fetch(apiUrl(`/api/v1/site/watch-sessions/${sessionId}/messages`), {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: watchClientId, body }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+      const message = data.message as SiteWatchMessage;
+      setRoomMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message].slice(-500));
+      setRoomDraft("");
+    } catch (error) {
+      setRoomNotice(`Не удалось отправить: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setRoomSending(false);
+    }
+  }
+
   function openUserMenu(event: React.MouseEvent<HTMLElement>, message: SiteChatMessage) {
     event.stopPropagation();
     const position = chatUserMenuPosition(event.clientX, event.clientY);
@@ -2081,9 +2178,13 @@ function SiteReplayChat({
   return (
     <aside className="site-replay-chat">
       <div className="site-replay-chat-head">
-        <div><strong>Чат записи</strong></div>
-        <span>{hasChat ? `${messageCount.toLocaleString("ru-RU")} сообщений` : "Чат не записан"}</span>
+        <div className="site-replay-chat-tabs" role="tablist" aria-label="Режим чата">
+          <button type="button" className={chatMode === "recording" ? "is-active" : ""} onClick={() => setChatMode("recording")}>Чат записи</button>
+          <button type="button" className={chatMode === "live" ? "is-active" : ""} onClick={() => setChatMode("live")}>Сейчас</button>
+        </div>
+        <span>{chatMode === "recording" ? (hasChat ? `${messageCount.toLocaleString("ru-RU")} сообщений` : "Чат не записан") : (watchSession ? `${roomMessages.length} в чате` : "Подключение…")}</span>
       </div>
+      {chatMode === "recording" ? (
       <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onPointerDown={handleChatPointerDown} onPointerUp={handleChatPointerEnd} onPointerCancel={handleChatPointerEnd} onTouchMove={handleChatTouchMove} onKeyDown={handleChatKeyDown} tabIndex={0}>
         {visible.length === 0 ? (
           hasChat && nextMessagePlayerMs != null ? (
@@ -2151,10 +2252,47 @@ function SiteReplayChat({
           );
         })}
       </div>
-      {!following && visible.length > 0 ? (
+      ) : (
+        <div className="site-room-chat">
+          <div className="site-room-chat-list" ref={roomListRef}>
+            {!watchSession ? <div className="site-replay-chat-empty">Подключаем комнату…</div> : null}
+            {watchSession && roomMessages.length === 0 ? <div className="site-replay-chat-empty">В комнате пока никто не писал.</div> : null}
+            {roomMessages.map((message) => (
+              <div className="site-room-chat-message" key={message.id}>
+                <div className="site-room-chat-avatar">
+                  {message.user.avatar_url ? <img src={apiUrl(message.user.avatar_url)} alt="" /> : message.user.nickname.slice(0, 1).toUpperCase()}
+                </div>
+                <div>
+                  <div className="site-room-chat-meta"><strong>{message.user.nickname}</strong><small>@{message.user.login}</small><time>{new Date(message.created_at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</time></div>
+                  <p>{message.body}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="site-room-chat-compose">
+            {authUser ? (
+              <>
+                <input
+                  value={roomDraft}
+                  maxLength={1000}
+                  placeholder="Сообщение в комнату…"
+                  disabled={!watchSession || roomSending}
+                  onChange={(event) => setRoomDraft(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendRoomMessage(); } }}
+                />
+                <button type="button" disabled={!watchSession || !roomDraft.trim() || roomSending} onClick={() => void sendRoomMessage()}>{roomSending ? "…" : "→"}</button>
+              </>
+            ) : (
+              <button className="site-room-chat-login" type="button" onClick={onLogin}>Войти, чтобы писать</button>
+            )}
+            {roomNotice ? <span>{roomNotice}</span> : null}
+          </div>
+        </div>
+      )}
+      {chatMode === "recording" && !following && visible.length > 0 ? (
         <button className="site-chat-follow" type="button" onClick={followCurrent}>↓ К текущему моменту</button>
       ) : null}
-      {userMenu ? (
+      {chatMode === "recording" && userMenu ? (
         <SiteChatUserContext
           eventId={eventId}
           user={userMenu.user}
@@ -2824,14 +2962,12 @@ function SiteWatchSessionsPanel({
   busyId,
   notice,
   onJoin,
-  onCreate,
 }: {
   sessions: SiteWatchSession[];
   current: SiteWatchSession | null;
   busyId: string | null;
   notice: string;
   onJoin: (session: SiteWatchSession) => void;
-  onCreate: () => void;
 }) {
   return (
     <section className="streamvault-watch-sessions" aria-labelledby="streamvaultWatchSessionsTitle">
@@ -2840,9 +2976,6 @@ function SiteWatchSessionsPanel({
           <strong id="streamvaultWatchSessionsTitle">Совместный просмотр</strong>
           <span>play / pause / перемотка синхронизируются для всей комнаты</span>
         </div>
-        <button type="button" disabled={busyId === "new"} onClick={onCreate}>
-          {busyId === "new" ? "Создаём…" : "+ Новая сессия"}
-        </button>
       </div>
       {notice ? <div className="streamvault-watch-sessions-notice">{notice}</div> : null}
       <div className="streamvault-watch-sessions-list">
@@ -3165,6 +3298,8 @@ function App() {
   const [videoSegments, setVideoSegments] = useState<VideoSegment[]>([]);
   const [videoSessions, setVideoSessions] = useState<VideoSession[]>([]);
   const [videoParts, setVideoParts] = useState<VideoPart[]>([]);
+  const [segmentReplacementPartId, setSegmentReplacementPartId] = useState<string | null>(null);
+  const [segmentReplacementDirectory, setSegmentReplacementDirectory] = useState("");
   const [partMode, setPartMode] = useState<"manual" | "target" | "count">("manual");
   const [partFromSegment, setPartFromSegment] = useState(1);
   const [partToSegment, setPartToSegment] = useState(1);
@@ -3327,7 +3462,9 @@ function App() {
     setSiteWatchNotice("");
     const timer = window.setTimeout(() => {
       if (cancelled) return;
-      void createSiteWatchSession(event.id);
+      const requestedRoomId = new URLSearchParams(window.location.search).get("room");
+      if (requestedRoomId) void joinSiteWatchSessionById(requestedRoomId, event.id, true);
+      else void createSiteWatchSession(event.id);
     }, 180);
     return () => {
       cancelled = true;
@@ -3735,6 +3872,14 @@ function App() {
     return url.toString();
   }
 
+  function setSiteRoomInUrl(eventId: string, roomId: string | null) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("site_event", eventId);
+    if (roomId) url.searchParams.set("room", roomId);
+    else url.searchParams.delete("room");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  }
+
   function openSiteEvent(event: SiteEvent) {
     window.location.assign(siteEventUrl(event.id));
   }
@@ -3760,6 +3905,7 @@ function App() {
     const url = new URL(window.location.href);
     if (url.searchParams.has("site_event")) {
       url.searchParams.delete("site_event");
+      url.searchParams.delete("room");
       window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
     }
   }
@@ -3810,6 +3956,7 @@ function App() {
       siteWatchCurrentRef.current = next;
       siteWatchLastAppliedVersionRef.current = next.state_version || 0;
       setSiteWatchSession(next);
+      setSiteRoomInUrl(eventId, null);
       await loadSiteWatchSessions(eventId);
     } catch (error) {
       setSiteWatchNotice(`Не удалось создать сессию: ${error instanceof Error ? error.message : String(error)}`);
@@ -3818,14 +3965,14 @@ function App() {
     }
   }
 
-  async function joinSiteWatchSession(target: SiteWatchSession) {
-    if (siteWatchCurrentRef.current?.id === target.id) return;
-    setSiteWatchBusyId(target.id);
+  async function joinSiteWatchSessionById(sessionId: string, eventId: string, fallbackToOwn = false) {
+    if (siteWatchCurrentRef.current?.id === sessionId) return;
+    setSiteWatchBusyId(sessionId);
     setSiteWatchNotice("");
     try {
       const previous = siteWatchCurrentRef.current;
       if (previous) await leaveSiteWatchSession(previous);
-      const res = await fetch(`${API}/api/v1/site/watch-sessions/${target.id}/join`, {
+      const res = await fetch(`${API}/api/v1/site/watch-sessions/${sessionId}/join`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
@@ -3834,15 +3981,31 @@ function App() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
       const next = data.session as SiteWatchSession;
+      if (next.event_id !== eventId) {
+        await leaveSiteWatchSession(next);
+        throw new Error("Комната относится к другому событию");
+      }
       siteWatchCurrentRef.current = next;
       siteWatchLastAppliedVersionRef.current = 0;
       setSiteWatchSession(next);
-      if (selectedSiteEvent?.id) await loadSiteWatchSessions(selectedSiteEvent.id);
+      setSiteRoomInUrl(eventId, next.id);
+      await loadSiteWatchSessions(eventId);
     } catch (error) {
-      setSiteWatchNotice(`Не удалось присоединиться: ${error instanceof Error ? error.message : String(error)}`);
+      if (fallbackToOwn) {
+        setSiteRoomInUrl(eventId, null);
+        await createSiteWatchSession(eventId);
+      } else {
+        setSiteWatchNotice(`Не удалось присоединиться: ${error instanceof Error ? error.message : String(error)}`);
+      }
     } finally {
       setSiteWatchBusyId(null);
     }
+  }
+
+  async function joinSiteWatchSession(target: SiteWatchSession) {
+    const eventId = selectedSiteEvent?.id;
+    if (!eventId) return;
+    await joinSiteWatchSessionById(target.id, eventId);
   }
 
   async function publishSiteWatchState() {
@@ -4233,6 +4396,8 @@ function App() {
     setSelectedVideo(session);
     setPartPlan(null);
     setPartPlanAll(null);
+    setSegmentReplacementPartId(null);
+    setSegmentReplacementDirectory("");
     try {
       const [detailRes, runsRes, segmentsRes, partsRes] = await Promise.all([
         fetch(`${API}/api/v1/video-sessions/${session.id}`, { cache: "no-store" }),
@@ -4398,6 +4563,50 @@ function App() {
       if (!res.ok) throw new Error(await res.text());
       await loadVideoParts(selectedVideo.id);
       setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPartAction(false);
+    }
+  }
+
+  async function unlinkLocalPart(part: VideoPart) {
+    if (!selectedVideo) return;
+    if (!window.confirm(`Удалить локальный файл Part #${part.part_no}? Запись Part и Telegram linkage останутся в Video Manager.`)) return;
+    setPartAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-parts/${part.id}/unlink-local`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadVideoParts(selectedVideo.id);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPartAction(false);
+    }
+  }
+
+  async function replacePartSegments(part: VideoPart) {
+    if (!selectedVideo) return;
+    const copyDirectory = segmentReplacementDirectory.trim();
+    if (!copyDirectory) {
+      setError("Укажите каталог, содержащий проверенные копии segments.");
+      return;
+    }
+    if (!window.confirm(`Проверить копии segments Part #${part.part_no} в указанном каталоге и удалить оригиналы из output? Метаданные segments останутся со статусом replaced.`)) return;
+    setPartAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-parts/${part.id}/replace-segments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ copy_directory: copyDirectory }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const result = await res.json() as { cleanup_pending?: number; replaced_segments?: number };
+      await openVideoSession(selectedVideo);
+      setSegmentReplacementPartId(null);
+      setSegmentReplacementDirectory("");
+      setError(result.cleanup_pending ? `Segments помечены replaced, но ${result.cleanup_pending} quarantine-файлов требуют повторной очистки.` : null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -4915,6 +5124,9 @@ function App() {
                   <div className="streamvault-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
                 )}
               </div>
+              {selectedSiteEvent.playable ? (
+                <div className="streamvault-room-presence">С вами в комнате: <strong>{Math.max(0, (siteWatchSession?.participant_count || 1) - 1)}</strong> чел.</div>
+              ) : null}
               <SiteEventTimecodes items={selectedSiteEvent.timecodes || []} videoRef={siteVideoRef} />
               {selectedSiteEvent.playable ? (
                 <SiteWatchSessionsPanel
@@ -4923,7 +5135,6 @@ function App() {
                   busyId={siteWatchBusyId}
                   notice={siteWatchNotice}
                   onJoin={(session) => void joinSiteWatchSession(session)}
-                  onCreate={() => void createSiteWatchSession()}
                 />
               ) : null}
               <section className="streamvault-watch-meta">
@@ -5025,6 +5236,10 @@ function App() {
               hasChat={selectedSiteEvent.has_chat}
               messageCount={selectedSiteEvent.chat_message_count || 0}
               videoRef={siteVideoRef}
+              watchSession={siteWatchSession}
+              watchClientId={siteWatchClientIdRef.current}
+              authUser={authUser}
+              onLogin={() => setAuthModalOpen(true)}
               onMention={mentionSiteComment}
             />
           </div>
@@ -5417,6 +5632,11 @@ function App() {
                     )}
                     {part.sha256 && <div className="muted small hash-line">sha256 <code>{part.sha256}</code></div>}
                     <div className="muted small path-cell"><code>{part.relative_path}</code></div>
+                    <div className={`part-local-status part-local-status-${part.local_file_state || "present"}`}>
+                      Local Part: <strong>{part.local_file_state === "unlinked" ? "deleted" : part.local_file_state || "present"}</strong>
+                      {part.local_unlinked_at_utc && <> · {new Date(part.local_unlinked_at_utc).toLocaleString()}</>}
+                    </div>
+                    {part.local_unlink_error && <div className="inline-error small">{part.local_unlink_error}</div>}
                     {part.status === "ready" && (
                       <div className={`telegram-part-status telegram-part-status-${telegram?.status || "missing"}`}>
                         Telegram: <strong>{telegram?.status || "missing"}</strong>
@@ -5429,8 +5649,33 @@ function App() {
                       {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}
                       {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && <button disabled={partAction} onClick={() => partActionRequest(part, "cancel")}>Cancel</button>}
                       <button onClick={() => copyPartPath(part)}>Copy path</button>
-                      {["ready", "failed", "cancelled"].includes(part.status) && <button className="danger subtle" disabled={partAction} onClick={() => partActionRequest(part, "delete")}>Delete</button>}
+                      {part.status === "ready" && telegram?.status === "linked" && part.local_file_state !== "unlinked" && (
+                        <button className="danger subtle" disabled={partAction} onClick={() => void unlinkLocalPart(part)}>Unlink Part</button>
+                      )}
+                      {part.status === "ready" && telegram?.status === "linked" && (
+                        <button disabled={partAction} onClick={() => { setSegmentReplacementPartId((current) => current === part.id ? null : part.id); setSegmentReplacementDirectory(""); }}>Replace segments</button>
+                      )}
+                      {(part.status === "failed" || part.status === "cancelled") && <button className="danger subtle" disabled={partAction} onClick={() => partActionRequest(part, "delete")}>Delete reservation</button>}
                     </div>
+                    {segmentReplacementPartId === part.id && (
+                      <div className="segment-replacement-form">
+                        <label>
+                          <span>Каталог с копиями segments</span>
+                          <input
+                            type="text"
+                            value={segmentReplacementDirectory}
+                            onChange={(event) => setSegmentReplacementDirectory(event.target.value)}
+                            placeholder="E:\\StreamHub\\backup\\segments"
+                            autoFocus
+                          />
+                        </label>
+                        <p className="muted small">Каталог должен быть внутри подключённого VIDEO_OUTPUT_ROOT. Перед удалением проверяются имя, размер и SHA-256 каждого segment.</p>
+                        <div className="actions">
+                          <button disabled={partAction || !segmentReplacementDirectory.trim()} onClick={() => void replacePartSegments(part)}>Verify & replace</button>
+                          <button disabled={partAction} onClick={() => { setSegmentReplacementPartId(null); setSegmentReplacementDirectory(""); }}>Отмена</button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -5447,8 +5692,12 @@ function App() {
                 <td>{fmtMs(segment.timeline_start_ms)}–{fmtMs(segment.timeline_end_ms)}</td>
                 <td>{fmtMs(segment.duration_ms)}</td><td>{fmtBytes(segment.bytes)}</td>
                 <td>{segment.storage_state}</td><td>{segment.integrity_state}</td>
-                <td>{segment.archived_at_utc ? new Date(segment.archived_at_utc).toLocaleString() : "—"}</td>
-                <td className="path-cell">{segment.archive_last_error ? <span className="inline-error">{segment.archive_last_error}</span> : <code>{segment.relative_path}</code>}</td>
+                <td>{segment.replaced_at_utc ? `replaced ${new Date(segment.replaced_at_utc).toLocaleString()}` : segment.archived_at_utc ? new Date(segment.archived_at_utc).toLocaleString() : "—"}</td>
+                <td className="path-cell">
+                  {segment.archive_last_error ? <span className="inline-error">{segment.archive_last_error}</span> : segment.storage_state === "replaced" ? (
+                    <><code>{segment.replacement_path || segment.replacement_directory || "replacement verified"}</code><div className="muted small">original: {segment.relative_path}</div></>
+                  ) : <code>{segment.relative_path}</code>}
+                </td>
               </tr>)}
             </tbody></table></div>
           )}

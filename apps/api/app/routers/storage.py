@@ -176,9 +176,9 @@ async def create_storage_migration(
                 select(
                     VideoSegment.video_session_id,
                     func.count(VideoSegment.id),
-                    func.coalesce(func.sum(VideoSegment.bytes), 0),
+                    func.coalesce(func.sum(case((VideoSegment.storage_state == "archive_ready", VideoSegment.bytes), else_=0)), 0),
                     func.coalesce(
-                        func.sum(case((VideoSegment.storage_state != "archive_ready", 1), else_=0)),
+                        func.sum(case((VideoSegment.storage_state.notin_({"archive_ready", "replaced"}), 1), else_=0)),
                         0,
                     ),
                 )
@@ -203,6 +203,7 @@ async def create_storage_migration(
                 .where(
                     VideoPart.video_session_id.in_(source_ids),
                     VideoPart.status == "ready",
+                    VideoPart.local_file_state == "present",
                 )
                 .group_by(VideoPart.video_session_id)
             )

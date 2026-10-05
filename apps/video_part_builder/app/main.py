@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, or_, select, update
 
 from streamhub_common.db import SessionLocal
@@ -19,6 +20,7 @@ from streamhub_common.models import (
     VideoPart,
     VideoPartBuildJob,
     VideoPartSegment,
+    TelegramVideoPartBinding,
     VideoSegment,
     VideoSession,
 )
@@ -40,6 +42,109 @@ INSTANCE_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 class BuildCancelled(RuntimeError):
     pass
+
+
+class SegmentReplacementPayload(BaseModel):
+    copy_directory: str = Field(min_length=1, max_length=1024)
+
+
+def _telegram_channel_id() -> int:
+    raw = str(settings.telegram_channel_id or "").strip()
+    if not raw:
+        raise HTTPException(409, "Telegram channel is not configured")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise HTTPException(409, "TELEGRAM_CHANNEL_ID must be numeric") from exc
+
+
+def _normalize_path_text(value: str) -> str:
+    return value.strip().replace("\\", "/").rstrip("/")
+
+
+def resolve_copy_directory(raw_directory: str) -> tuple[Path, str]:
+    raw = raw_directory.strip()
+    if not raw:
+        raise HTTPException(400, "copy_directory is required")
+    normalized = _normalize_path_text(raw)
+    mappings: list[tuple[Path, str | None]] = [
+        (Path(settings.video_output_root_1).resolve(), os.getenv("VIDEO_OUTPUT_ROOT_1_HOST")),
+        (Path(settings.video_output_root_2).resolve(), os.getenv("VIDEO_OUTPUT_ROOT_2_HOST")),
+    ]
+    if settings.video_output_root_3_enabled:
+        mappings.append((Path(settings.video_output_root_3).resolve(), os.getenv("VIDEO_OUTPUT_ROOT_3_HOST")))
+
+    direct = Path(raw)
+    if direct.is_absolute():
+        resolved = direct.resolve()
+        for container_root, _host_root in mappings:
+            try:
+                resolved.relative_to(container_root)
+                if not resolved.is_dir():
+                    raise HTTPException(409, f"copy directory does not exist: {raw}")
+                return resolved, raw
+            except ValueError:
+                continue
+
+    lowered = normalized.casefold()
+    for container_root, host_root in mappings:
+        if not host_root:
+            continue
+        host_normalized = _normalize_path_text(host_root)
+        host_lowered = host_normalized.casefold()
+        if lowered != host_lowered and not lowered.startswith(host_lowered + "/"):
+            continue
+        suffix = normalized[len(host_normalized):].lstrip("/")
+        resolved = (container_root / Path(suffix)).resolve()
+        try:
+            resolved.relative_to(container_root)
+        except ValueError as exc:
+            raise HTTPException(400, "copy_directory escapes configured output root") from exc
+        if not resolved.is_dir():
+            raise HTTPException(409, f"copy directory does not exist: {raw}")
+        return resolved, raw
+
+    raise HTTPException(409, "copy_directory must be inside a configured VIDEO_OUTPUT_ROOT_1/2/3 host directory")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def unlink_with_retries(path: Path, *, attempts: int = 6) -> str | None:
+    for attempt in range(attempts):
+        try:
+            path.unlink()
+            return None
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if attempt >= attempts - 1:
+                return f"{type(exc).__name__}: {exc}"
+            await asyncio.sleep(0.15 * (attempt + 1))
+    return "unlink failed"
+
+
+async def require_linked_ready_part(db, part_id: uuid.UUID) -> tuple[VideoPart, VideoSession]:
+    part = await db.get(VideoPart, part_id)
+    if part is None:
+        raise HTTPException(404, "part not found")
+    if part.status != "ready":
+        raise HTTPException(409, "part must be ready")
+    binding = await db.get(TelegramVideoPartBinding, part_id)
+    if binding is None or int(binding.channel_id) != _telegram_channel_id():
+        raise HTTPException(409, "part must be Telegram: linked")
+    session = await db.get(VideoSession, part.video_session_id)
+    if session is None:
+        raise HTTPException(409, "video session is missing")
+    return part, session
 
 
 class CaptureGate:
@@ -641,6 +746,156 @@ async def cancel_part(part_id: uuid.UUID) -> dict:
     await gate.request_cancel(part_id)
     wakeup.set()
     return {"ok": True, "part_id": str(part_id)}
+
+
+@app.post("/internal/v1/parts/{part_id}/unlink-local", dependencies=[Depends(require_internal_token)])
+async def unlink_local_part(part_id: uuid.UUID) -> dict:
+    if part_id in gate.active_parts:
+        raise HTTPException(409, "part is currently building")
+    quarantine: Path | None = None
+    final_path: Path | None = None
+    async with SessionLocal() as db:
+        part, session = await require_linked_ready_part(db, part_id)
+        job = await db.scalar(select(VideoPartBuildJob).where(VideoPartBuildJob.part_id == part_id))
+        if job is not None and job.status in BUILDING_JOB_STATUSES:
+            raise HTTPException(409, "part build must be idle before unlink")
+        metadata = session.metadata_json or {}
+        root = configured_output_root(str(metadata.get("output_root_key") or "root1"))
+        final_path = safe_child(root, part.relative_path)
+        stale_errors: list[str] = []
+        for stale in final_path.parent.glob(f"{final_path.name}.unlink-*"):
+            error = await unlink_with_retries(stale)
+            if error:
+                stale_errors.append(f"{stale.name}: {error}")
+        if stale_errors:
+            part.local_file_state = "cleanup_pending"
+            part.local_unlink_error = "; ".join(stale_errors)[:4000]
+            await db.commit()
+            raise HTTPException(409, "previous part unlink cleanup is still pending")
+        if final_path.exists():
+            quarantine = final_path.with_name(f"{final_path.name}.unlink-{uuid.uuid4().hex}")
+            os.replace(final_path, quarantine)
+            fsync_directory(final_path.parent)
+        part.local_file_state = "unlinked"
+        part.local_unlinked_at_utc = now_utc_naive()
+        part.local_unlink_error = None
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            if quarantine is not None and quarantine.exists() and final_path is not None:
+                os.replace(quarantine, final_path)
+                fsync_directory(final_path.parent)
+            raise
+    cleanup_error = await unlink_with_retries(quarantine) if quarantine is not None else None
+    if cleanup_error:
+        async with SessionLocal() as db:
+            part = await db.get(VideoPart, part_id)
+            if part is not None:
+                part.local_file_state = "cleanup_pending"
+                part.local_unlink_error = cleanup_error
+                await db.commit()
+        return {"ok": True, "part_id": str(part_id), "local_file_state": "cleanup_pending", "cleanup_error": cleanup_error}
+    return {"ok": True, "part_id": str(part_id), "local_file_state": "unlinked"}
+
+
+@app.post("/internal/v1/parts/{part_id}/replace-segments", dependencies=[Depends(require_internal_token)])
+async def replace_part_segments(part_id: uuid.UUID, payload: SegmentReplacementPayload) -> dict:
+    if part_id in gate.active_parts:
+        raise HTTPException(409, "part is currently building")
+    copy_root, stored_directory = resolve_copy_directory(payload.copy_directory)
+    quarantines: list[tuple[Path, Path, int]] = []
+    replaced_count = 0
+    async with SessionLocal() as db:
+        part, session = await require_linked_ready_part(db, part_id)
+        job = await db.scalar(select(VideoPartBuildJob).where(VideoPartBuildJob.part_id == part_id))
+        if job is not None and job.status in BUILDING_JOB_STATUSES:
+            raise HTTPException(409, "part build must be idle before replacing segments")
+        pairs = (
+            await db.execute(
+                select(VideoPartSegment, VideoSegment)
+                .join(VideoSegment, VideoSegment.id == VideoPartSegment.segment_id)
+                .where(VideoPartSegment.part_id == part_id)
+                .order_by(VideoPartSegment.segment_no)
+            )
+        ).all()
+        if not pairs:
+            raise HTTPException(409, "part has no source segments")
+
+        metadata = session.metadata_json or {}
+        output_root = configured_output_root(str(metadata.get("output_root_key") or "root1"))
+        verified: list[tuple[VideoSegment, Path]] = []
+        for _link, segment in pairs:
+            copy_path = (copy_root / segment.file_name).resolve()
+            try:
+                copy_path.relative_to(copy_root)
+            except ValueError as exc:
+                raise HTTPException(400, f"invalid segment filename: {segment.file_name}") from exc
+            source_path = safe_child(output_root, segment.relative_path)
+            if copy_path == source_path.resolve():
+                raise HTTPException(409, f"copy directory points to the original segment #{segment.segment_no}; a separate copy is required")
+            if not copy_path.is_file():
+                raise HTTPException(409, f"copy is missing for segment #{segment.segment_no}: {segment.file_name}")
+            actual_size = copy_path.stat().st_size
+            if actual_size != int(segment.bytes):
+                raise HTTPException(409, f"copy size mismatch for segment #{segment.segment_no}: {actual_size} != {segment.bytes}")
+            if not segment.sha256:
+                raise HTTPException(409, f"segment #{segment.segment_no} has no SHA-256 and cannot be replaced safely")
+            actual_sha256 = await asyncio.to_thread(file_sha256, copy_path)
+            if actual_sha256.lower() != segment.sha256.lower():
+                raise HTTPException(409, f"copy SHA-256 mismatch for segment #{segment.segment_no}")
+            verified.append((segment, copy_path))
+        try:
+            for segment, copy_path in verified:
+                if segment.storage_state == "replaced":
+                    continue
+                if segment.storage_state != "archive_ready":
+                    raise HTTPException(409, f"segment #{segment.segment_no} is in storage state {segment.storage_state}")
+                final_path = safe_child(output_root, segment.relative_path)
+                for stale in final_path.parent.glob(f"{final_path.name}.replace-*"):
+                    error = await unlink_with_retries(stale)
+                    if error:
+                        raise HTTPException(409, f"previous cleanup pending for segment #{segment.segment_no}: {error}")
+                if not final_path.is_file():
+                    raise HTTPException(409, f"local segment is missing: {segment.relative_path}")
+                quarantine = final_path.with_name(f"{final_path.name}.replace-{uuid.uuid4().hex}")
+                os.replace(final_path, quarantine)
+                fsync_directory(final_path.parent)
+                quarantines.append((quarantine, final_path, segment.id))
+                segment.storage_state = "replaced"
+                segment.replacement_directory = stored_directory
+                segment.replacement_path = f"{stored_directory.rstrip('/\\')}\\{segment.file_name}"
+                segment.replaced_at_utc = now_utc_naive()
+                segment.archive_last_error = None
+                replaced_count += 1
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            for quarantine, final_path, _segment_id in reversed(quarantines):
+                if quarantine.exists() and not final_path.exists():
+                    os.replace(quarantine, final_path)
+                    fsync_directory(final_path.parent)
+            raise
+
+    cleanup_errors: list[tuple[int, str]] = []
+    for quarantine, _final_path, segment_id in quarantines:
+        error = await unlink_with_retries(quarantine)
+        if error:
+            cleanup_errors.append((segment_id, error))
+    if cleanup_errors:
+        async with SessionLocal() as db:
+            for segment_id, error in cleanup_errors:
+                segment = await db.get(VideoSegment, segment_id)
+                if segment is not None:
+                    segment.archive_last_error = f"replacement cleanup pending: {error}"
+            await db.commit()
+    return {
+        "ok": True,
+        "part_id": str(part_id),
+        "replaced_segments": replaced_count,
+        "copy_directory": stored_directory,
+        "cleanup_pending": len(cleanup_errors),
+    }
 
 
 @app.delete("/internal/v1/parts/{part_id}", dependencies=[Depends(require_internal_token)])

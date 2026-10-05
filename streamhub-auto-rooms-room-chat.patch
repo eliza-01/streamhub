@@ -1,0 +1,585 @@
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+index 76505a8..dc3f8ed 100644
+--- a/apps/api/app/routers/site.py
++++ b/apps/api/app/routers/site.py
+@@ -28,6 +28,7 @@ from streamhub_common.models import (
+     SiteComment,
+     SiteCommentReaction,
+     SiteEventTimecode,
++    SiteWatchMessage,
+     SiteWatchParticipant,
+     SiteWatchSession,
+     TelegramVideoPartBinding,
+@@ -110,6 +111,10 @@ class SiteWatchStateRequest(SiteWatchClientRequest):
+     is_playing: bool
+ 
+ 
++class SiteWatchMessageCreateRequest(SiteWatchClientRequest):
++    body: str = Field(min_length=1, max_length=1000)
++
++
+ def _event_title(event: MediaEvent) -> str:
+     return event.display_title or event.title or event.channel_display_name or event.channel_login or event.external_key
+ 
+@@ -845,6 +850,29 @@ async def _watch_session_payload(db: AsyncSession, session: SiteWatchSession, *,
+     }
+ 
+ 
++def _watch_message_user_payload(user: User) -> dict:
++    avatar_url = None
++    if user.avatar_path:
++        version = int(user.updated_at.timestamp()) if user.updated_at else 0
++        avatar_url = f"/api/v1/user-auth/users/{user.id}/avatar?v={version}"
++    return {
++        "id": str(user.id),
++        "nickname": user.nickname,
++        "login": user.login,
++        "avatar_url": avatar_url,
++    }
++
++
++def _watch_message_payload(message: SiteWatchMessage, user: User) -> dict:
++    return {
++        "id": int(message.id),
++        "session_id": str(message.session_id),
++        "body": message.body,
++        "created_at": message.created_at.isoformat() if message.created_at else None,
++        "user": _watch_message_user_payload(user),
++    }
++
++
+ async def _require_active_watch_session(db: AsyncSession, session_id: uuid.UUID) -> SiteWatchSession:
+     session = await db.get(SiteWatchSession, session_id)
+     now = datetime.utcnow()
+@@ -985,6 +1013,63 @@ async def update_site_watch_session_state(
+     }
+ 
+ 
++@router.get("/watch-sessions/{session_id}/messages")
++async def site_watch_session_messages(
++    session_id: uuid.UUID,
++    after_id: int | None = Query(default=None, ge=0),
++    page_size: int = Query(default=100, ge=1, le=200),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    session = await _require_active_watch_session(db, session_id)
++    query = (
++        select(SiteWatchMessage, User)
++        .join(User, User.id == SiteWatchMessage.user_id)
++        .where(SiteWatchMessage.session_id == session.id)
++    )
++    if after_id is not None:
++        query = query.where(SiteWatchMessage.id > after_id)
++    rows = (
++        await db.execute(query.order_by(SiteWatchMessage.id.asc()).limit(page_size))
++    ).all()
++    return {
++        "session_id": str(session.id),
++        "items": [_watch_message_payload(message, user) for message, user in rows],
++    }
++
++
++@router.post("/watch-sessions/{session_id}/messages", status_code=201)
++async def create_site_watch_session_message(
++    session_id: uuid.UUID,
++    payload: SiteWatchMessageCreateRequest,
++    viewer: User = Depends(require_current_user),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    session = await _require_active_watch_session(db, session_id)
++    participant = (
++        await db.execute(
++            select(SiteWatchParticipant).where(
++                SiteWatchParticipant.session_id == session.id,
++                SiteWatchParticipant.client_id == payload.client_id,
++            )
++        )
++    ).scalar_one_or_none()
++    if participant is None:
++        raise HTTPException(409, "Сначала присоединитесь к комнате")
++    body = payload.body.strip()
++    if not body:
++        raise HTTPException(422, "Сообщение пустое")
++    now = datetime.utcnow()
++    participant.last_seen_at = now
++    participant.user_id = viewer.id
++    participant.display_name = viewer.nickname[:64]
++    session.last_activity_at = now
++    message = SiteWatchMessage(session_id=session.id, user_id=viewer.id, body=body, created_at=now)
++    db.add(message)
++    await db.commit()
++    await db.refresh(message)
++    return {"message": _watch_message_payload(message, viewer)}
++
++
+ @router.post("/watch-sessions/{session_id}/leave")
+ async def leave_site_watch_session(
+     session_id: uuid.UUID,
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 7ba7c7f..896d24c 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -443,6 +443,14 @@ type SiteWatchSession = {
+   created_at?: string | null;
+ };
+ 
++type SiteWatchMessage = {
++  id: number;
++  session_id: string;
++  body: string;
++  created_at: string;
++  user: { id: string; nickname: string; login: string; avatar_url?: string | null };
++};
++
+ type SiteCommentReactionName = "like" | "dislike" | "heart" | "broken_heart" | "fire" | "cry" | "laugh" | "poop";
+ 
+ type SiteUserComment = {
+@@ -1684,12 +1692,20 @@ function SiteReplayChat({
+   hasChat,
+   messageCount,
+   videoRef,
++  watchSession,
++  watchClientId,
++  authUser,
++  onLogin,
+   onMention,
+ }: {
+   eventId: string;
+   hasChat: boolean;
+   messageCount: number;
+   videoRef: { current: HTMLVideoElement | null };
++  watchSession: SiteWatchSession | null;
++  watchClientId: string;
++  authUser: AuthUser | null;
++  onLogin: () => void;
+   onMention?: (mention: string) => void;
+ }) {
+   const [messages, setMessages] = useState<SiteChatMessage[]>([]);
+@@ -1699,6 +1715,12 @@ function SiteReplayChat({
+   const [chatStatus, setChatStatus] = useState(hasChat ? "Загрузка…" : "Чат не записан");
+   const [following, setFollowing] = useState(true);
+   const [userMenu, setUserMenu] = useState<{ user: SiteChatUserIdentity; x: number; y: number } | null>(null);
++  const [chatMode, setChatMode] = useState<"recording" | "live">("recording");
++  const [roomMessages, setRoomMessages] = useState<SiteWatchMessage[]>([]);
++  const [roomDraft, setRoomDraft] = useState("");
++  const [roomSending, setRoomSending] = useState(false);
++  const [roomNotice, setRoomNotice] = useState("");
++  const roomListRef = useRef<HTMLDivElement | null>(null);
+   const listRef = useRef<HTMLDivElement | null>(null);
+   const loadedRangeRef = useRef<{ from: number; to: number } | null>(null);
+   const smoothFollowRef = useRef(false);
+@@ -2072,6 +2094,75 @@ function SiteReplayChat({
+     setFollowing(true);
+   }
+ 
++  useEffect(() => {
++    setRoomMessages([]);
++    setRoomDraft("");
++    setRoomNotice("");
++    const sessionId = watchSession?.id;
++    if (!sessionId) return;
++    let disposed = false;
++    let inFlight = false;
++    let lastId = 0;
++    const load = async () => {
++      if (inFlight || disposed) return;
++      inFlight = true;
++      try {
++        const params = lastId ? `?after_id=${lastId}&page_size=200` : "?page_size=200";
++        const res = await fetch(apiUrl(`/api/v1/site/watch-sessions/${sessionId}/messages${params}`), { cache: "no-store" });
++        if (!res.ok) throw new Error(await res.text());
++        const data = await res.json() as { items?: SiteWatchMessage[] };
++        const incoming = data.items || [];
++        if (disposed || !incoming.length) return;
++        lastId = Math.max(lastId, ...incoming.map((item) => item.id));
++        setRoomMessages((current) => {
++          const seen = new Set(current.map((item) => item.id));
++          return [...current, ...incoming.filter((item) => !seen.has(item.id))].slice(-500);
++        });
++      } catch (error) {
++        if (!disposed) setRoomNotice(`Чат комнаты недоступен: ${error instanceof Error ? error.message : String(error)}`);
++      } finally {
++        inFlight = false;
++      }
++    };
++    void load();
++    const timer = window.setInterval(load, 1000);
++    return () => { disposed = true; window.clearInterval(timer); };
++  }, [watchSession?.id]);
++
++  useEffect(() => {
++    if (chatMode !== "live") return;
++    const node = roomListRef.current;
++    if (!node) return;
++    const frame = window.requestAnimationFrame(() => { node.scrollTop = node.scrollHeight; });
++    return () => window.cancelAnimationFrame(frame);
++  }, [chatMode, roomMessages.length]);
++
++  async function sendRoomMessage() {
++    const sessionId = watchSession?.id;
++    const body = roomDraft.trim();
++    if (!sessionId || !body || roomSending) return;
++    if (!authUser) { onLogin(); return; }
++    setRoomSending(true);
++    setRoomNotice("");
++    try {
++      const res = await fetch(apiUrl(`/api/v1/site/watch-sessions/${sessionId}/messages`), {
++        method: "POST",
++        credentials: "include",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ client_id: watchClientId, body }),
++      });
++      const data = await res.json().catch(() => ({}));
++      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
++      const message = data.message as SiteWatchMessage;
++      setRoomMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message].slice(-500));
++      setRoomDraft("");
++    } catch (error) {
++      setRoomNotice(`Не удалось отправить: ${error instanceof Error ? error.message : String(error)}`);
++    } finally {
++      setRoomSending(false);
++    }
++  }
++
+   function openUserMenu(event: React.MouseEvent<HTMLElement>, message: SiteChatMessage) {
+     event.stopPropagation();
+     const position = chatUserMenuPosition(event.clientX, event.clientY);
+@@ -2081,9 +2172,13 @@ function SiteReplayChat({
+   return (
+     <aside className="site-replay-chat">
+       <div className="site-replay-chat-head">
+-        <div><strong>Чат записи</strong></div>
+-        <span>{hasChat ? `${messageCount.toLocaleString("ru-RU")} сообщений` : "Чат не записан"}</span>
++        <div className="site-replay-chat-tabs" role="tablist" aria-label="Режим чата">
++          <button type="button" className={chatMode === "recording" ? "is-active" : ""} onClick={() => setChatMode("recording")}>Чат записи</button>
++          <button type="button" className={chatMode === "live" ? "is-active" : ""} onClick={() => setChatMode("live")}>Сейчас</button>
++        </div>
++        <span>{chatMode === "recording" ? (hasChat ? `${messageCount.toLocaleString("ru-RU")} сообщений` : "Чат не записан") : (watchSession ? `${roomMessages.length} в чате` : "Подключение…")}</span>
+       </div>
++      {chatMode === "recording" ? (
+       <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onPointerDown={handleChatPointerDown} onPointerUp={handleChatPointerEnd} onPointerCancel={handleChatPointerEnd} onTouchMove={handleChatTouchMove} onKeyDown={handleChatKeyDown} tabIndex={0}>
+         {visible.length === 0 ? (
+           hasChat && nextMessagePlayerMs != null ? (
+@@ -2151,10 +2246,47 @@ function SiteReplayChat({
+           );
+         })}
+       </div>
+-      {!following && visible.length > 0 ? (
++      ) : (
++        <div className="site-room-chat">
++          <div className="site-room-chat-list" ref={roomListRef}>
++            {!watchSession ? <div className="site-replay-chat-empty">Подключаем комнату…</div> : null}
++            {watchSession && roomMessages.length === 0 ? <div className="site-replay-chat-empty">В комнате пока никто не писал.</div> : null}
++            {roomMessages.map((message) => (
++              <div className="site-room-chat-message" key={message.id}>
++                <div className="site-room-chat-avatar">
++                  {message.user.avatar_url ? <img src={apiUrl(message.user.avatar_url)} alt="" /> : message.user.nickname.slice(0, 1).toUpperCase()}
++                </div>
++                <div>
++                  <div className="site-room-chat-meta"><strong>{message.user.nickname}</strong><small>@{message.user.login}</small><time>{new Date(message.created_at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</time></div>
++                  <p>{message.body}</p>
++                </div>
++              </div>
++            ))}
++          </div>
++          <div className="site-room-chat-compose">
++            {authUser ? (
++              <>
++                <input
++                  value={roomDraft}
++                  maxLength={1000}
++                  placeholder="Сообщение в комнату…"
++                  disabled={!watchSession || roomSending}
++                  onChange={(event) => setRoomDraft(event.target.value)}
++                  onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendRoomMessage(); } }}
++                />
++                <button type="button" disabled={!watchSession || !roomDraft.trim() || roomSending} onClick={() => void sendRoomMessage()}>{roomSending ? "…" : "→"}</button>
++              </>
++            ) : (
++              <button className="site-room-chat-login" type="button" onClick={onLogin}>Войти, чтобы писать</button>
++            )}
++            {roomNotice ? <span>{roomNotice}</span> : null}
++          </div>
++        </div>
++      )}
++      {chatMode === "recording" && !following && visible.length > 0 ? (
+         <button className="site-chat-follow" type="button" onClick={followCurrent}>↓ К текущему моменту</button>
+       ) : null}
+-      {userMenu ? (
++      {chatMode === "recording" && userMenu ? (
+         <SiteChatUserContext
+           eventId={eventId}
+           user={userMenu.user}
+@@ -2824,14 +2956,12 @@ function SiteWatchSessionsPanel({
+   busyId,
+   notice,
+   onJoin,
+-  onCreate,
+ }: {
+   sessions: SiteWatchSession[];
+   current: SiteWatchSession | null;
+   busyId: string | null;
+   notice: string;
+   onJoin: (session: SiteWatchSession) => void;
+-  onCreate: () => void;
+ }) {
+   return (
+     <section className="streamvault-watch-sessions" aria-labelledby="streamvaultWatchSessionsTitle">
+@@ -2840,9 +2970,6 @@ function SiteWatchSessionsPanel({
+           <strong id="streamvaultWatchSessionsTitle">Совместный просмотр</strong>
+           <span>play / pause / перемотка синхронизируются для всей комнаты</span>
+         </div>
+-        <button type="button" disabled={busyId === "new"} onClick={onCreate}>
+-          {busyId === "new" ? "Создаём…" : "+ Новая сессия"}
+-        </button>
+       </div>
+       {notice ? <div className="streamvault-watch-sessions-notice">{notice}</div> : null}
+       <div className="streamvault-watch-sessions-list">
+@@ -3327,7 +3454,9 @@ function App() {
+     setSiteWatchNotice("");
+     const timer = window.setTimeout(() => {
+       if (cancelled) return;
+-      void createSiteWatchSession(event.id);
++      const requestedRoomId = new URLSearchParams(window.location.search).get("room");
++      if (requestedRoomId) void joinSiteWatchSessionById(requestedRoomId, event.id, true);
++      else void createSiteWatchSession(event.id);
+     }, 180);
+     return () => {
+       cancelled = true;
+@@ -3735,6 +3864,14 @@ function App() {
+     return url.toString();
+   }
+ 
++  function setSiteRoomInUrl(eventId: string, roomId: string | null) {
++    const url = new URL(window.location.href);
++    url.searchParams.set("site_event", eventId);
++    if (roomId) url.searchParams.set("room", roomId);
++    else url.searchParams.delete("room");
++    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
++  }
++
+   function openSiteEvent(event: SiteEvent) {
+     window.location.assign(siteEventUrl(event.id));
+   }
+@@ -3760,6 +3897,7 @@ function App() {
+     const url = new URL(window.location.href);
+     if (url.searchParams.has("site_event")) {
+       url.searchParams.delete("site_event");
++      url.searchParams.delete("room");
+       window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+     }
+   }
+@@ -3810,6 +3948,7 @@ function App() {
+       siteWatchCurrentRef.current = next;
+       siteWatchLastAppliedVersionRef.current = next.state_version || 0;
+       setSiteWatchSession(next);
++      setSiteRoomInUrl(eventId, null);
+       await loadSiteWatchSessions(eventId);
+     } catch (error) {
+       setSiteWatchNotice(`Не удалось создать сессию: ${error instanceof Error ? error.message : String(error)}`);
+@@ -3818,14 +3957,14 @@ function App() {
+     }
+   }
+ 
+-  async function joinSiteWatchSession(target: SiteWatchSession) {
+-    if (siteWatchCurrentRef.current?.id === target.id) return;
+-    setSiteWatchBusyId(target.id);
++  async function joinSiteWatchSessionById(sessionId: string, eventId: string, fallbackToOwn = false) {
++    if (siteWatchCurrentRef.current?.id === sessionId) return;
++    setSiteWatchBusyId(sessionId);
+     setSiteWatchNotice("");
+     try {
+       const previous = siteWatchCurrentRef.current;
+       if (previous) await leaveSiteWatchSession(previous);
+-      const res = await fetch(`${API}/api/v1/site/watch-sessions/${target.id}/join`, {
++      const res = await fetch(`${API}/api/v1/site/watch-sessions/${sessionId}/join`, {
+         method: "POST",
+         credentials: "include",
+         headers: { "Content-Type": "application/json" },
+@@ -3834,17 +3973,33 @@ function App() {
+       const data = await res.json().catch(() => ({}));
+       if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+       const next = data.session as SiteWatchSession;
++      if (next.event_id !== eventId) {
++        await leaveSiteWatchSession(next);
++        throw new Error("Комната относится к другому событию");
++      }
+       siteWatchCurrentRef.current = next;
+       siteWatchLastAppliedVersionRef.current = 0;
+       setSiteWatchSession(next);
+-      if (selectedSiteEvent?.id) await loadSiteWatchSessions(selectedSiteEvent.id);
++      setSiteRoomInUrl(eventId, next.id);
++      await loadSiteWatchSessions(eventId);
+     } catch (error) {
+-      setSiteWatchNotice(`Не удалось присоединиться: ${error instanceof Error ? error.message : String(error)}`);
++      if (fallbackToOwn) {
++        setSiteRoomInUrl(eventId, null);
++        await createSiteWatchSession(eventId);
++      } else {
++        setSiteWatchNotice(`Не удалось присоединиться: ${error instanceof Error ? error.message : String(error)}`);
++      }
+     } finally {
+       setSiteWatchBusyId(null);
+     }
+   }
+ 
++  async function joinSiteWatchSession(target: SiteWatchSession) {
++    const eventId = selectedSiteEvent?.id;
++    if (!eventId) return;
++    await joinSiteWatchSessionById(target.id, eventId);
++  }
++
+   async function publishSiteWatchState() {
+     const session = siteWatchCurrentRef.current;
+     const video = siteVideoRef.current;
+@@ -4915,6 +5070,9 @@ function App() {
+                   <div className="streamvault-video-placeholder">Видео пока недоступно: нет связанного Telegram playback range.</div>
+                 )}
+               </div>
++              {selectedSiteEvent.playable ? (
++                <div className="streamvault-room-presence">С вами в комнате: <strong>{Math.max(0, (siteWatchSession?.participant_count || 1) - 1)}</strong> чел.</div>
++              ) : null}
+               <SiteEventTimecodes items={selectedSiteEvent.timecodes || []} videoRef={siteVideoRef} />
+               {selectedSiteEvent.playable ? (
+                 <SiteWatchSessionsPanel
+@@ -4923,7 +5081,6 @@ function App() {
+                   busyId={siteWatchBusyId}
+                   notice={siteWatchNotice}
+                   onJoin={(session) => void joinSiteWatchSession(session)}
+-                  onCreate={() => void createSiteWatchSession()}
+                 />
+               ) : null}
+               <section className="streamvault-watch-meta">
+@@ -5025,6 +5182,10 @@ function App() {
+               hasChat={selectedSiteEvent.has_chat}
+               messageCount={selectedSiteEvent.chat_message_count || 0}
+               videoRef={siteVideoRef}
++              watchSession={siteWatchSession}
++              watchClientId={siteWatchClientIdRef.current}
++              authUser={authUser}
++              onLogin={() => setAuthModalOpen(true)}
+               onMention={mentionSiteComment}
+             />
+           </div>
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index ad4f371..c10966c 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -1283,3 +1283,30 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+   .streamvault-frame-overlay-nav.is-next { right: 8px; }
+   .streamvault-watch-sessions-head { align-items: flex-start; flex-direction: column; }
+ }
++
++
++/* automatic watch rooms + per-room live chat */
++.streamvault-watch-sessions-head { align-items: flex-start; }
++.streamvault-watch-sessions-head > button { display: none; }
++.streamvault-room-presence { margin-top: 8px; color: #77838d; font-size: 10px; }
++.streamvault-room-presence strong { color: #dbe1e6; font-variant-numeric: tabular-nums; }
++.site-replay-chat-tabs { display: inline-flex !important; grid-auto-flow: column; align-items: center; gap: 4px !important; }
++.site-replay-chat-tabs button { min-height: 27px; padding: 4px 8px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #727f8a; font-size: 10px; font-weight: 850; }
++.site-replay-chat-tabs button:hover { border-color: #303b45; color: #d6dde3; }
++.site-replay-chat-tabs button.is-active { border-color: rgba(255,120,24,.4); background: rgba(255,120,24,.09); color: var(--sv-orange-2); }
++.site-room-chat { min-height: 0; display: grid; grid-template-rows: minmax(0,1fr) auto; overflow: hidden; }
++.site-room-chat-list { min-height: 0; overflow-y: auto; padding: 9px 10px 12px; scrollbar-width: thin; scrollbar-color: #33404d transparent; }
++.site-room-chat-message { display: grid; grid-template-columns: 30px minmax(0,1fr); gap: 8px; padding: 6px 3px; }
++.site-room-chat-avatar { width: 30px; height: 30px; display: grid; place-items: center; overflow: hidden; border-radius: 50%; background: rgba(255,120,24,.13); color: var(--sv-orange-2); font-size: 10px; font-weight: 900; }
++.site-room-chat-avatar img { width: 100%; height: 100%; object-fit: cover; }
++.site-room-chat-meta { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
++.site-room-chat-meta strong { overflow: hidden; color: #e2e8ed; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
++.site-room-chat-meta small { overflow: hidden; color: #65717b; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
++.site-room-chat-meta time { margin-left: auto; color: #56616a; font-size: 8px; font-variant-numeric: tabular-nums; }
++.site-room-chat-message p { margin: 3px 0 0; color: #cbd3da; font-size: 12px; line-height: 1.42; overflow-wrap: anywhere; white-space: pre-wrap; }
++.site-room-chat-compose { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px; padding: 9px 10px; border-top: 1px solid var(--sv-line-soft); }
++.site-room-chat-compose input { min-width: 0; height: 34px; padding: 0 10px; border: 1px solid #303b45; border-radius: 8px; outline: 0; background: #0d1318; color: #dce3e8; font-size: 11px; }
++.site-room-chat-compose input:focus { border-color: rgba(255,120,24,.55); }
++.site-room-chat-compose > button:not(.site-room-chat-login) { width: 36px; min-width: 36px; height: 34px; padding: 0; border-color: var(--sv-orange); background: var(--sv-orange); color: #1b1008; font-weight: 900; }
++.site-room-chat-compose > span { grid-column: 1 / -1; color: #b97f69; font-size: 9px; }
++.site-room-chat-login { grid-column: 1 / -1; justify-self: stretch; border-color: #394650; background: #11171d; color: #aeb8c0; font-size: 10px; font-weight: 800; }
+diff --git a/migrations/versions/0021_site_watch_room_chat.py b/migrations/versions/0021_site_watch_room_chat.py
+new file mode 100644
+index 0000000..a582bbf
+--- /dev/null
++++ b/migrations/versions/0021_site_watch_room_chat.py
+@@ -0,0 +1,52 @@
++"""site watch room chat
++
++Revision ID: 0021_site_watch_room_chat
++Revises: 0020_site_watch_sessions
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0021_site_watch_room_chat"
++down_revision = "0020_site_watch_sessions"
++branch_labels = None
++depends_on = None
++
++DT = mysql.DATETIME(fsp=6)
++UUID = mysql.BINARY(16)
++
++
++def _inspect():
++    return sa.inspect(op.get_bind())
++
++
++def _table_exists(name: str) -> bool:
++    return name in _inspect().get_table_names()
++
++
++def upgrade() -> None:
++    if _table_exists("site_watch_messages"):
++        return
++    op.create_table(
++        "site_watch_messages",
++        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
++        sa.Column("session_id", UUID, nullable=False),
++        sa.Column("user_id", UUID, nullable=False),
++        sa.Column("body", sa.Text(), nullable=False),
++        sa.Column("created_at", DT, nullable=False),
++        sa.ForeignKeyConstraint(["session_id"], ["site_watch_sessions.id"], ondelete="CASCADE"),
++        sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
++        sa.PrimaryKeyConstraint("id"),
++    )
++    op.create_index("ix_site_watch_messages_session_id", "site_watch_messages", ["session_id"])
++    op.create_index("ix_site_watch_messages_user_id", "site_watch_messages", ["user_id"])
++    op.create_index("ix_site_watch_messages_created_at", "site_watch_messages", ["created_at"])
++    op.create_index("ix_site_watch_messages_session_id_id", "site_watch_messages", ["session_id", "id"])
++    op.create_index("ix_site_watch_messages_user_id_created_at", "site_watch_messages", ["user_id", "created_at"])
++
++
++def downgrade() -> None:
++    if _table_exists("site_watch_messages"):
++        op.drop_table("site_watch_messages")
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index 1c7afac..6d46903 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -678,6 +678,24 @@ class SiteWatchParticipant(Base):
+     last_seen_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+ 
+ 
++class SiteWatchMessage(Base):
++    __tablename__ = "site_watch_messages"
++    __table_args__ = (
++        Index("ix_site_watch_messages_session_id_id", "session_id", "id"),
++        Index("ix_site_watch_messages_user_id_created_at", "user_id", "created_at"),
++    )
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    session_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("site_watch_sessions.id", ondelete="CASCADE"), nullable=False, index=True
++    )
++    user_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
++    )
++    body: Mapped[str] = mapped_column(Text)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
++
++
+ class SiteComment(Base):
+     __tablename__ = "site_comments"
+     __table_args__ = (

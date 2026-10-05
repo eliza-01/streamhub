@@ -773,7 +773,7 @@ async def maybe_cleanup_terminal_spool(session_id: uuid.UUID) -> None:
         pending = await db.scalar(
             select(func.count(VideoSegment.id)).where(
                 VideoSegment.video_session_id == session_id,
-                VideoSegment.storage_state != "archive_ready",
+                VideoSegment.storage_state.notin_({"archive_ready", "replaced"}),
             )
         )
         event_id = session.event_id
@@ -1114,7 +1114,7 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
         non_ready = await db.scalar(
             select(func.count(VideoSegment.id)).where(
                 VideoSegment.video_session_id == session_id,
-                VideoSegment.storage_state != "archive_ready",
+                VideoSegment.storage_state.notin_({"archive_ready", "replaced"}),
             )
         )
         if int(non_ready or 0) > 0:
@@ -1122,7 +1122,8 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
         segment_bytes = int(
             await db.scalar(
                 select(func.coalesce(func.sum(VideoSegment.bytes), 0)).where(
-                    VideoSegment.video_session_id == session_id
+                    VideoSegment.video_session_id == session_id,
+                    VideoSegment.storage_state == "archive_ready",
                 )
             )
             or 0
@@ -1132,6 +1133,7 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
                 select(func.coalesce(func.sum(VideoPart.final_bytes), 0)).where(
                     VideoPart.video_session_id == session_id,
                     VideoPart.status == "ready",
+                    VideoPart.local_file_state == "present",
                 )
             )
             or 0

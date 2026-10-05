@@ -362,6 +362,9 @@ class VideoSegment(Base):
     archive_attempts: Mapped[int] = mapped_column(Integer, default=0)
     archive_last_error: Mapped[str | None] = mapped_column(Text)
     archived_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    replacement_directory: Mapped[str | None] = mapped_column(String(1024))
+    replacement_path: Mapped[str | None] = mapped_column(String(1024))
+    replaced_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
     closed_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -400,6 +403,9 @@ class VideoPart(Base):
     relative_path: Mapped[str] = mapped_column(String(1024))
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     last_error: Mapped[str | None] = mapped_column(Text)
+    local_file_state: Mapped[str] = mapped_column(String(24), default="present", index=True)
+    local_unlinked_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    local_unlink_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -676,6 +682,24 @@ class SiteWatchParticipant(Base):
     display_name: Mapped[str] = mapped_column(String(64), nullable=False)
     joined_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+
+
+class SiteWatchMessage(Base):
+    __tablename__ = "site_watch_messages"
+    __table_args__ = (
+        Index("ix_site_watch_messages_session_id_id", "session_id", "id"),
+        Index("ix_site_watch_messages_user_id_created_at", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("site_watch_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
 
 
 class SiteComment(Base):

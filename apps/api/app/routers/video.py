@@ -18,6 +18,7 @@ from streamhub_common.models import (
     VideoPart,
     VideoPartBuildJob,
     VideoPartSegment,
+    TelegramVideoPartBinding,
     VideoRun,
     VideoSegment,
     VideoSession,
@@ -43,6 +44,10 @@ class PartPlanRequest(BaseModel):
 
 class PartCreateRequest(PartPlanRequest):
     pass
+
+
+class SegmentReplacementRequest(BaseModel):
+    copy_directory: str = Field(min_length=1, max_length=1024)
 
 
 async def part_builder_request(method: str, path: str, payload: dict | None = None, *, timeout: float = 30.0) -> dict:
@@ -88,6 +93,9 @@ def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
         "relative_path": part.relative_path,
         "status": part.status,
         "last_error": part.last_error,
+        "local_file_state": part.local_file_state,
+        "local_unlinked_at_utc": part.local_unlinked_at_utc,
+        "local_unlink_error": part.local_unlink_error,
         "created_at": part.created_at,
         "completed_at_utc": part.completed_at_utc,
         "job": None if job is None else {
@@ -711,6 +719,9 @@ async def list_video_segments(
                 "archive_attempts": segment.archive_attempts,
                 "archive_last_error": segment.archive_last_error,
                 "archived_at_utc": segment.archived_at_utc,
+                "replacement_directory": segment.replacement_directory,
+                "replacement_path": segment.replacement_path,
+                "replaced_at_utc": segment.replaced_at_utc,
                 "closed_at_utc": segment.closed_at_utc,
             }
             for segment, run_no in segment_rows
@@ -970,6 +981,47 @@ async def cancel_video_part(part_id: uuid.UUID, db: AsyncSession = Depends(get_d
     if row is None:
         raise HTTPException(404, "part not found")
     return part_dict(row[0], row[1])
+
+
+async def ensure_part_telegram_linked(db: AsyncSession, part_id: uuid.UUID) -> VideoPart:
+    part = await db.get(VideoPart, part_id)
+    if part is None:
+        raise HTTPException(404, "part not found")
+    if part.status != "ready":
+        raise HTTPException(409, "part must be ready before local media can be reclaimed")
+    binding = await db.get(TelegramVideoPartBinding, part_id)
+    if binding is None:
+        raise HTTPException(409, "part must be Telegram: linked before local media can be reclaimed")
+    raw_channel_id = str(settings.telegram_channel_id or "").strip()
+    if not raw_channel_id:
+        raise HTTPException(409, "Telegram channel is not configured")
+    try:
+        channel_id = int(raw_channel_id)
+    except ValueError as exc:
+        raise HTTPException(409, "TELEGRAM_CHANNEL_ID must be numeric") from exc
+    if int(binding.channel_id) != channel_id:
+        raise HTTPException(409, "part is linked to another Telegram channel")
+    return part
+
+
+@router.post("/video-parts/{part_id}/unlink-local")
+async def unlink_local_video_part(part_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    await ensure_part_telegram_linked(db, part_id)
+    return await part_builder_post(f"/internal/v1/parts/{part_id}/unlink-local", {}, timeout=120.0)
+
+
+@router.post("/video-parts/{part_id}/replace-segments")
+async def replace_video_part_segments(
+    part_id: uuid.UUID,
+    payload: SegmentReplacementRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await ensure_part_telegram_linked(db, part_id)
+    return await part_builder_post(
+        f"/internal/v1/parts/{part_id}/replace-segments",
+        {"copy_directory": payload.copy_directory.strip()},
+        timeout=600.0,
+    )
 
 
 @router.delete("/video-parts/{part_id}")

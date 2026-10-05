@@ -28,6 +28,7 @@ from streamhub_common.models import (
     SiteComment,
     SiteCommentReaction,
     SiteEventTimecode,
+    SiteWatchMessage,
     SiteWatchParticipant,
     SiteWatchSession,
     TelegramVideoPartBinding,
@@ -108,6 +109,10 @@ class SiteWatchCreateRequest(SiteWatchClientRequest):
 class SiteWatchStateRequest(SiteWatchClientRequest):
     position_ms: int = Field(ge=0, le=2_592_000_000)
     is_playing: bool
+
+
+class SiteWatchMessageCreateRequest(SiteWatchClientRequest):
+    body: str = Field(min_length=1, max_length=1000)
 
 
 def _event_title(event: MediaEvent) -> str:
@@ -845,6 +850,29 @@ async def _watch_session_payload(db: AsyncSession, session: SiteWatchSession, *,
     }
 
 
+def _watch_message_user_payload(user: User) -> dict:
+    avatar_url = None
+    if user.avatar_path:
+        version = int(user.updated_at.timestamp()) if user.updated_at else 0
+        avatar_url = f"/api/v1/user-auth/users/{user.id}/avatar?v={version}"
+    return {
+        "id": str(user.id),
+        "nickname": user.nickname,
+        "login": user.login,
+        "avatar_url": avatar_url,
+    }
+
+
+def _watch_message_payload(message: SiteWatchMessage, user: User) -> dict:
+    return {
+        "id": int(message.id),
+        "session_id": str(message.session_id),
+        "body": message.body,
+        "created_at": message.created_at.isoformat() if message.created_at else None,
+        "user": _watch_message_user_payload(user),
+    }
+
+
 async def _require_active_watch_session(db: AsyncSession, session_id: uuid.UUID) -> SiteWatchSession:
     session = await db.get(SiteWatchSession, session_id)
     now = datetime.utcnow()
@@ -983,6 +1011,63 @@ async def update_site_watch_session_state(
         "server_now_utc": now.isoformat(),
         "session": await _watch_session_payload(db, session, now=now),
     }
+
+
+@router.get("/watch-sessions/{session_id}/messages")
+async def site_watch_session_messages(
+    session_id: uuid.UUID,
+    after_id: int | None = Query(default=None, ge=0),
+    page_size: int = Query(default=100, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    session = await _require_active_watch_session(db, session_id)
+    query = (
+        select(SiteWatchMessage, User)
+        .join(User, User.id == SiteWatchMessage.user_id)
+        .where(SiteWatchMessage.session_id == session.id)
+    )
+    if after_id is not None:
+        query = query.where(SiteWatchMessage.id > after_id)
+    rows = (
+        await db.execute(query.order_by(SiteWatchMessage.id.asc()).limit(page_size))
+    ).all()
+    return {
+        "session_id": str(session.id),
+        "items": [_watch_message_payload(message, user) for message, user in rows],
+    }
+
+
+@router.post("/watch-sessions/{session_id}/messages", status_code=201)
+async def create_site_watch_session_message(
+    session_id: uuid.UUID,
+    payload: SiteWatchMessageCreateRequest,
+    viewer: User = Depends(require_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    session = await _require_active_watch_session(db, session_id)
+    participant = (
+        await db.execute(
+            select(SiteWatchParticipant).where(
+                SiteWatchParticipant.session_id == session.id,
+                SiteWatchParticipant.client_id == payload.client_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if participant is None:
+        raise HTTPException(409, "Сначала присоединитесь к комнате")
+    body = payload.body.strip()
+    if not body:
+        raise HTTPException(422, "Сообщение пустое")
+    now = datetime.utcnow()
+    participant.last_seen_at = now
+    participant.user_id = viewer.id
+    participant.display_name = viewer.nickname[:64]
+    session.last_activity_at = now
+    message = SiteWatchMessage(session_id=session.id, user_id=viewer.id, body=body, created_at=now)
+    db.add(message)
+    await db.commit()
+    await db.refresh(message)
+    return {"message": _watch_message_payload(message, viewer)}
 
 
 @router.post("/watch-sessions/{session_id}/leave")

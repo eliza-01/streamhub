@@ -1,0 +1,638 @@
+diff --git a/apps/api/app/routers/storage.py b/apps/api/app/routers/storage.py
+index 6d7c0b1..544674c 100644
+--- a/apps/api/app/routers/storage.py
++++ b/apps/api/app/routers/storage.py
+@@ -176,9 +176,9 @@ async def create_storage_migration(
+                 select(
+                     VideoSegment.video_session_id,
+                     func.count(VideoSegment.id),
+-                    func.coalesce(func.sum(VideoSegment.bytes), 0),
++                    func.coalesce(func.sum(case((VideoSegment.storage_state == "archive_ready", VideoSegment.bytes), else_=0)), 0),
+                     func.coalesce(
+-                        func.sum(case((VideoSegment.storage_state != "archive_ready", 1), else_=0)),
++                        func.sum(case((VideoSegment.storage_state.notin_({"archive_ready", "replaced"}), 1), else_=0)),
+                         0,
+                     ),
+                 )
+@@ -203,6 +203,7 @@ async def create_storage_migration(
+                 .where(
+                     VideoPart.video_session_id.in_(source_ids),
+                     VideoPart.status == "ready",
++                    VideoPart.local_file_state == "present",
+                 )
+                 .group_by(VideoPart.video_session_id)
+             )
+diff --git a/apps/api/app/routers/video.py b/apps/api/app/routers/video.py
+index 43c480c..4daef99 100644
+--- a/apps/api/app/routers/video.py
++++ b/apps/api/app/routers/video.py
+@@ -18,6 +18,7 @@ from streamhub_common.models import (
+     VideoPart,
+     VideoPartBuildJob,
+     VideoPartSegment,
++    TelegramVideoPartBinding,
+     VideoRun,
+     VideoSegment,
+     VideoSession,
+@@ -45,6 +46,10 @@ class PartCreateRequest(PartPlanRequest):
+     pass
+ 
+ 
++class SegmentReplacementRequest(BaseModel):
++    copy_directory: str = Field(min_length=1, max_length=1024)
++
++
+ async def part_builder_request(method: str, path: str, payload: dict | None = None, *, timeout: float = 30.0) -> dict:
+     headers = {"X-Internal-Service-Token": settings.internal_service_token}
+     try:
+@@ -88,6 +93,9 @@ def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
+         "relative_path": part.relative_path,
+         "status": part.status,
+         "last_error": part.last_error,
++        "local_file_state": part.local_file_state,
++        "local_unlinked_at_utc": part.local_unlinked_at_utc,
++        "local_unlink_error": part.local_unlink_error,
+         "created_at": part.created_at,
+         "completed_at_utc": part.completed_at_utc,
+         "job": None if job is None else {
+@@ -711,6 +719,9 @@ async def list_video_segments(
+                 "archive_attempts": segment.archive_attempts,
+                 "archive_last_error": segment.archive_last_error,
+                 "archived_at_utc": segment.archived_at_utc,
++                "replacement_directory": segment.replacement_directory,
++                "replacement_path": segment.replacement_path,
++                "replaced_at_utc": segment.replaced_at_utc,
+                 "closed_at_utc": segment.closed_at_utc,
+             }
+             for segment, run_no in segment_rows
+@@ -972,6 +983,47 @@ async def cancel_video_part(part_id: uuid.UUID, db: AsyncSession = Depends(get_d
+     return part_dict(row[0], row[1])
+ 
+ 
++async def ensure_part_telegram_linked(db: AsyncSession, part_id: uuid.UUID) -> VideoPart:
++    part = await db.get(VideoPart, part_id)
++    if part is None:
++        raise HTTPException(404, "part not found")
++    if part.status != "ready":
++        raise HTTPException(409, "part must be ready before local media can be reclaimed")
++    binding = await db.get(TelegramVideoPartBinding, part_id)
++    if binding is None:
++        raise HTTPException(409, "part must be Telegram: linked before local media can be reclaimed")
++    raw_channel_id = str(settings.telegram_channel_id or "").strip()
++    if not raw_channel_id:
++        raise HTTPException(409, "Telegram channel is not configured")
++    try:
++        channel_id = int(raw_channel_id)
++    except ValueError as exc:
++        raise HTTPException(409, "TELEGRAM_CHANNEL_ID must be numeric") from exc
++    if int(binding.channel_id) != channel_id:
++        raise HTTPException(409, "part is linked to another Telegram channel")
++    return part
++
++
++@router.post("/video-parts/{part_id}/unlink-local")
++async def unlink_local_video_part(part_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    await ensure_part_telegram_linked(db, part_id)
++    return await part_builder_post(f"/internal/v1/parts/{part_id}/unlink-local", {}, timeout=120.0)
++
++
++@router.post("/video-parts/{part_id}/replace-segments")
++async def replace_video_part_segments(
++    part_id: uuid.UUID,
++    payload: SegmentReplacementRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    await ensure_part_telegram_linked(db, part_id)
++    return await part_builder_post(
++        f"/internal/v1/parts/{part_id}/replace-segments",
++        {"copy_directory": payload.copy_directory.strip()},
++        timeout=600.0,
++    )
++
++
+ @router.delete("/video-parts/{part_id}")
+ async def delete_video_part(part_id: uuid.UUID) -> dict:
+     return await part_builder_delete(f"/internal/v1/parts/{part_id}", timeout=120.0)
+diff --git a/apps/video_part_builder/app/main.py b/apps/video_part_builder/app/main.py
+index b6d4802..0b77353 100644
+--- a/apps/video_part_builder/app/main.py
++++ b/apps/video_part_builder/app/main.py
+@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
+ 
+ from fastapi import Depends, FastAPI, HTTPException
++from pydantic import BaseModel, Field
+ from sqlalchemy import delete, or_, select, update
+ 
+ from streamhub_common.db import SessionLocal
+@@ -19,6 +20,7 @@ from streamhub_common.models import (
+     VideoPart,
+     VideoPartBuildJob,
+     VideoPartSegment,
++    TelegramVideoPartBinding,
+     VideoSegment,
+     VideoSession,
+ )
+@@ -42,6 +44,109 @@ class BuildCancelled(RuntimeError):
+     pass
+ 
+ 
++class SegmentReplacementPayload(BaseModel):
++    copy_directory: str = Field(min_length=1, max_length=1024)
++
++
++def _telegram_channel_id() -> int:
++    raw = str(settings.telegram_channel_id or "").strip()
++    if not raw:
++        raise HTTPException(409, "Telegram channel is not configured")
++    try:
++        return int(raw)
++    except ValueError as exc:
++        raise HTTPException(409, "TELEGRAM_CHANNEL_ID must be numeric") from exc
++
++
++def _normalize_path_text(value: str) -> str:
++    return value.strip().replace("\\", "/").rstrip("/")
++
++
++def resolve_copy_directory(raw_directory: str) -> tuple[Path, str]:
++    raw = raw_directory.strip()
++    if not raw:
++        raise HTTPException(400, "copy_directory is required")
++    normalized = _normalize_path_text(raw)
++    mappings: list[tuple[Path, str | None]] = [
++        (Path(settings.video_output_root_1).resolve(), os.getenv("VIDEO_OUTPUT_ROOT_1_HOST")),
++        (Path(settings.video_output_root_2).resolve(), os.getenv("VIDEO_OUTPUT_ROOT_2_HOST")),
++    ]
++    if settings.video_output_root_3_enabled:
++        mappings.append((Path(settings.video_output_root_3).resolve(), os.getenv("VIDEO_OUTPUT_ROOT_3_HOST")))
++
++    direct = Path(raw)
++    if direct.is_absolute():
++        resolved = direct.resolve()
++        for container_root, _host_root in mappings:
++            try:
++                resolved.relative_to(container_root)
++                if not resolved.is_dir():
++                    raise HTTPException(409, f"copy directory does not exist: {raw}")
++                return resolved, raw
++            except ValueError:
++                continue
++
++    lowered = normalized.casefold()
++    for container_root, host_root in mappings:
++        if not host_root:
++            continue
++        host_normalized = _normalize_path_text(host_root)
++        host_lowered = host_normalized.casefold()
++        if lowered != host_lowered and not lowered.startswith(host_lowered + "/"):
++            continue
++        suffix = normalized[len(host_normalized):].lstrip("/")
++        resolved = (container_root / Path(suffix)).resolve()
++        try:
++            resolved.relative_to(container_root)
++        except ValueError as exc:
++            raise HTTPException(400, "copy_directory escapes configured output root") from exc
++        if not resolved.is_dir():
++            raise HTTPException(409, f"copy directory does not exist: {raw}")
++        return resolved, raw
++
++    raise HTTPException(409, "copy_directory must be inside a configured VIDEO_OUTPUT_ROOT_1/2/3 host directory")
++
++
++def file_sha256(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        while True:
++            chunk = handle.read(1024 * 1024)
++            if not chunk:
++                break
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++async def unlink_with_retries(path: Path, *, attempts: int = 6) -> str | None:
++    for attempt in range(attempts):
++        try:
++            path.unlink()
++            return None
++        except FileNotFoundError:
++            return None
++        except OSError as exc:
++            if attempt >= attempts - 1:
++                return f"{type(exc).__name__}: {exc}"
++            await asyncio.sleep(0.15 * (attempt + 1))
++    return "unlink failed"
++
++
++async def require_linked_ready_part(db, part_id: uuid.UUID) -> tuple[VideoPart, VideoSession]:
++    part = await db.get(VideoPart, part_id)
++    if part is None:
++        raise HTTPException(404, "part not found")
++    if part.status != "ready":
++        raise HTTPException(409, "part must be ready")
++    binding = await db.get(TelegramVideoPartBinding, part_id)
++    if binding is None or int(binding.channel_id) != _telegram_channel_id():
++        raise HTTPException(409, "part must be Telegram: linked")
++    session = await db.get(VideoSession, part.video_session_id)
++    if session is None:
++        raise HTTPException(409, "video session is missing")
++    return part, session
++
++
+ class CaptureGate:
+     def __init__(self) -> None:
+         self._condition = asyncio.Condition()
+@@ -643,6 +748,156 @@ async def cancel_part(part_id: uuid.UUID) -> dict:
+     return {"ok": True, "part_id": str(part_id)}
+ 
+ 
++@app.post("/internal/v1/parts/{part_id}/unlink-local", dependencies=[Depends(require_internal_token)])
++async def unlink_local_part(part_id: uuid.UUID) -> dict:
++    if part_id in gate.active_parts:
++        raise HTTPException(409, "part is currently building")
++    quarantine: Path | None = None
++    final_path: Path | None = None
++    async with SessionLocal() as db:
++        part, session = await require_linked_ready_part(db, part_id)
++        job = await db.scalar(select(VideoPartBuildJob).where(VideoPartBuildJob.part_id == part_id))
++        if job is not None and job.status in BUILDING_JOB_STATUSES:
++            raise HTTPException(409, "part build must be idle before unlink")
++        metadata = session.metadata_json or {}
++        root = configured_output_root(str(metadata.get("output_root_key") or "root1"))
++        final_path = safe_child(root, part.relative_path)
++        stale_errors: list[str] = []
++        for stale in final_path.parent.glob(f"{final_path.name}.unlink-*"):
++            error = await unlink_with_retries(stale)
++            if error:
++                stale_errors.append(f"{stale.name}: {error}")
++        if stale_errors:
++            part.local_file_state = "cleanup_pending"
++            part.local_unlink_error = "; ".join(stale_errors)[:4000]
++            await db.commit()
++            raise HTTPException(409, "previous part unlink cleanup is still pending")
++        if final_path.exists():
++            quarantine = final_path.with_name(f"{final_path.name}.unlink-{uuid.uuid4().hex}")
++            os.replace(final_path, quarantine)
++            fsync_directory(final_path.parent)
++        part.local_file_state = "unlinked"
++        part.local_unlinked_at_utc = now_utc_naive()
++        part.local_unlink_error = None
++        try:
++            await db.commit()
++        except Exception:
++            await db.rollback()
++            if quarantine is not None and quarantine.exists() and final_path is not None:
++                os.replace(quarantine, final_path)
++                fsync_directory(final_path.parent)
++            raise
++    cleanup_error = await unlink_with_retries(quarantine) if quarantine is not None else None
++    if cleanup_error:
++        async with SessionLocal() as db:
++            part = await db.get(VideoPart, part_id)
++            if part is not None:
++                part.local_file_state = "cleanup_pending"
++                part.local_unlink_error = cleanup_error
++                await db.commit()
++        return {"ok": True, "part_id": str(part_id), "local_file_state": "cleanup_pending", "cleanup_error": cleanup_error}
++    return {"ok": True, "part_id": str(part_id), "local_file_state": "unlinked"}
++
++
++@app.post("/internal/v1/parts/{part_id}/replace-segments", dependencies=[Depends(require_internal_token)])
++async def replace_part_segments(part_id: uuid.UUID, payload: SegmentReplacementPayload) -> dict:
++    if part_id in gate.active_parts:
++        raise HTTPException(409, "part is currently building")
++    copy_root, stored_directory = resolve_copy_directory(payload.copy_directory)
++    quarantines: list[tuple[Path, Path, int]] = []
++    replaced_count = 0
++    async with SessionLocal() as db:
++        part, session = await require_linked_ready_part(db, part_id)
++        job = await db.scalar(select(VideoPartBuildJob).where(VideoPartBuildJob.part_id == part_id))
++        if job is not None and job.status in BUILDING_JOB_STATUSES:
++            raise HTTPException(409, "part build must be idle before replacing segments")
++        pairs = (
++            await db.execute(
++                select(VideoPartSegment, VideoSegment)
++                .join(VideoSegment, VideoSegment.id == VideoPartSegment.segment_id)
++                .where(VideoPartSegment.part_id == part_id)
++                .order_by(VideoPartSegment.segment_no)
++            )
++        ).all()
++        if not pairs:
++            raise HTTPException(409, "part has no source segments")
++
++        metadata = session.metadata_json or {}
++        output_root = configured_output_root(str(metadata.get("output_root_key") or "root1"))
++        verified: list[tuple[VideoSegment, Path]] = []
++        for _link, segment in pairs:
++            copy_path = (copy_root / segment.file_name).resolve()
++            try:
++                copy_path.relative_to(copy_root)
++            except ValueError as exc:
++                raise HTTPException(400, f"invalid segment filename: {segment.file_name}") from exc
++            source_path = safe_child(output_root, segment.relative_path)
++            if copy_path == source_path.resolve():
++                raise HTTPException(409, f"copy directory points to the original segment #{segment.segment_no}; a separate copy is required")
++            if not copy_path.is_file():
++                raise HTTPException(409, f"copy is missing for segment #{segment.segment_no}: {segment.file_name}")
++            actual_size = copy_path.stat().st_size
++            if actual_size != int(segment.bytes):
++                raise HTTPException(409, f"copy size mismatch for segment #{segment.segment_no}: {actual_size} != {segment.bytes}")
++            if not segment.sha256:
++                raise HTTPException(409, f"segment #{segment.segment_no} has no SHA-256 and cannot be replaced safely")
++            actual_sha256 = await asyncio.to_thread(file_sha256, copy_path)
++            if actual_sha256.lower() != segment.sha256.lower():
++                raise HTTPException(409, f"copy SHA-256 mismatch for segment #{segment.segment_no}")
++            verified.append((segment, copy_path))
++        try:
++            for segment, copy_path in verified:
++                if segment.storage_state == "replaced":
++                    continue
++                if segment.storage_state != "archive_ready":
++                    raise HTTPException(409, f"segment #{segment.segment_no} is in storage state {segment.storage_state}")
++                final_path = safe_child(output_root, segment.relative_path)
++                for stale in final_path.parent.glob(f"{final_path.name}.replace-*"):
++                    error = await unlink_with_retries(stale)
++                    if error:
++                        raise HTTPException(409, f"previous cleanup pending for segment #{segment.segment_no}: {error}")
++                if not final_path.is_file():
++                    raise HTTPException(409, f"local segment is missing: {segment.relative_path}")
++                quarantine = final_path.with_name(f"{final_path.name}.replace-{uuid.uuid4().hex}")
++                os.replace(final_path, quarantine)
++                fsync_directory(final_path.parent)
++                quarantines.append((quarantine, final_path, segment.id))
++                segment.storage_state = "replaced"
++                segment.replacement_directory = stored_directory
++                segment.replacement_path = f"{stored_directory.rstrip('/\\')}\\{segment.file_name}"
++                segment.replaced_at_utc = now_utc_naive()
++                segment.archive_last_error = None
++                replaced_count += 1
++            await db.commit()
++        except Exception:
++            await db.rollback()
++            for quarantine, final_path, _segment_id in reversed(quarantines):
++                if quarantine.exists() and not final_path.exists():
++                    os.replace(quarantine, final_path)
++                    fsync_directory(final_path.parent)
++            raise
++
++    cleanup_errors: list[tuple[int, str]] = []
++    for quarantine, _final_path, segment_id in quarantines:
++        error = await unlink_with_retries(quarantine)
++        if error:
++            cleanup_errors.append((segment_id, error))
++    if cleanup_errors:
++        async with SessionLocal() as db:
++            for segment_id, error in cleanup_errors:
++                segment = await db.get(VideoSegment, segment_id)
++                if segment is not None:
++                    segment.archive_last_error = f"replacement cleanup pending: {error}"
++            await db.commit()
++    return {
++        "ok": True,
++        "part_id": str(part_id),
++        "replaced_segments": replaced_count,
++        "copy_directory": stored_directory,
++        "cleanup_pending": len(cleanup_errors),
++    }
++
++
+ @app.delete("/internal/v1/parts/{part_id}", dependencies=[Depends(require_internal_token)])
+ async def delete_part(part_id: uuid.UUID) -> dict:
+     if part_id in gate.active_parts:
+diff --git a/apps/video_recorder/app/main.py b/apps/video_recorder/app/main.py
+index 4e3a00c..7a9ba8b 100644
+--- a/apps/video_recorder/app/main.py
++++ b/apps/video_recorder/app/main.py
+@@ -773,7 +773,7 @@ async def maybe_cleanup_terminal_spool(session_id: uuid.UUID) -> None:
+         pending = await db.scalar(
+             select(func.count(VideoSegment.id)).where(
+                 VideoSegment.video_session_id == session_id,
+-                VideoSegment.storage_state != "archive_ready",
++                VideoSegment.storage_state.notin_({"archive_ready", "replaced"}),
+             )
+         )
+         event_id = session.event_id
+@@ -1114,7 +1114,7 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
+         non_ready = await db.scalar(
+             select(func.count(VideoSegment.id)).where(
+                 VideoSegment.video_session_id == session_id,
+-                VideoSegment.storage_state != "archive_ready",
++                VideoSegment.storage_state.notin_({"archive_ready", "replaced"}),
+             )
+         )
+         if int(non_ready or 0) > 0:
+@@ -1122,7 +1122,8 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
+         segment_bytes = int(
+             await db.scalar(
+                 select(func.coalesce(func.sum(VideoSegment.bytes), 0)).where(
+-                    VideoSegment.video_session_id == session_id
++                    VideoSegment.video_session_id == session_id,
++                    VideoSegment.storage_state == "archive_ready",
+                 )
+             )
+             or 0
+@@ -1132,6 +1133,7 @@ async def migrate_storage_session(job_id: int, session_id: uuid.UUID) -> tuple[b
+                 select(func.coalesce(func.sum(VideoPart.final_bytes), 0)).where(
+                     VideoPart.video_session_id == session_id,
+                     VideoPart.status == "ready",
++                    VideoPart.local_file_state == "present",
+                 )
+             )
+             or 0
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 896d24c..6855002 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -97,6 +97,9 @@ type VideoPart = {
+   relative_path: string;
+   status: string;
+   last_error?: string | null;
++  local_file_state: string;
++  local_unlinked_at_utc?: string | null;
++  local_unlink_error?: string | null;
+   created_at: string;
+   completed_at_utc?: string | null;
+   job?: VideoPartJob | null;
+@@ -252,6 +255,9 @@ type VideoSegment = {
+   archive_attempts: number;
+   archive_last_error?: string | null;
+   archived_at_utc?: string | null;
++  replacement_directory?: string | null;
++  replacement_path?: string | null;
++  replaced_at_utc?: string | null;
+   closed_at_utc: string;
+ };
+ 
+@@ -3292,6 +3298,8 @@ function App() {
+   const [videoSegments, setVideoSegments] = useState<VideoSegment[]>([]);
+   const [videoSessions, setVideoSessions] = useState<VideoSession[]>([]);
+   const [videoParts, setVideoParts] = useState<VideoPart[]>([]);
++  const [segmentReplacementPartId, setSegmentReplacementPartId] = useState<string | null>(null);
++  const [segmentReplacementDirectory, setSegmentReplacementDirectory] = useState("");
+   const [partMode, setPartMode] = useState<"manual" | "target" | "count">("manual");
+   const [partFromSegment, setPartFromSegment] = useState(1);
+   const [partToSegment, setPartToSegment] = useState(1);
+@@ -4388,6 +4396,8 @@ function App() {
+     setSelectedVideo(session);
+     setPartPlan(null);
+     setPartPlanAll(null);
++    setSegmentReplacementPartId(null);
++    setSegmentReplacementDirectory("");
+     try {
+       const [detailRes, runsRes, segmentsRes, partsRes] = await Promise.all([
+         fetch(`${API}/api/v1/video-sessions/${session.id}`, { cache: "no-store" }),
+@@ -4560,6 +4570,50 @@ function App() {
+     }
+   }
+ 
++  async function unlinkLocalPart(part: VideoPart) {
++    if (!selectedVideo) return;
++    if (!window.confirm(`Удалить локальный файл Part #${part.part_no}? Запись Part и Telegram linkage останутся в Video Manager.`)) return;
++    setPartAction(true);
++    try {
++      const res = await fetch(`${API}/api/v1/video-parts/${part.id}/unlink-local`, { method: "POST" });
++      if (!res.ok) throw new Error(await res.text());
++      await loadVideoParts(selectedVideo.id);
++      setError(null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setPartAction(false);
++    }
++  }
++
++  async function replacePartSegments(part: VideoPart) {
++    if (!selectedVideo) return;
++    const copyDirectory = segmentReplacementDirectory.trim();
++    if (!copyDirectory) {
++      setError("Укажите каталог, содержащий проверенные копии segments.");
++      return;
++    }
++    if (!window.confirm(`Проверить копии segments Part #${part.part_no} в указанном каталоге и удалить оригиналы из output? Метаданные segments останутся со статусом replaced.`)) return;
++    setPartAction(true);
++    try {
++      const res = await fetch(`${API}/api/v1/video-parts/${part.id}/replace-segments`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ copy_directory: copyDirectory }),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      const result = await res.json() as { cleanup_pending?: number; replaced_segments?: number };
++      await openVideoSession(selectedVideo);
++      setSegmentReplacementPartId(null);
++      setSegmentReplacementDirectory("");
++      setError(result.cleanup_pending ? `Segments помечены replaced, но ${result.cleanup_pending} quarantine-файлов требуют повторной очистки.` : null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setPartAction(false);
++    }
++  }
++
+   async function copyPartPath(part: VideoPart) {
+     try {
+       await navigator.clipboard.writeText(part.relative_path);
+@@ -5578,6 +5632,11 @@ function App() {
+                     )}
+                     {part.sha256 && <div className="muted small hash-line">sha256 <code>{part.sha256}</code></div>}
+                     <div className="muted small path-cell"><code>{part.relative_path}</code></div>
++                    <div className={`part-local-status part-local-status-${part.local_file_state || "present"}`}>
++                      Local Part: <strong>{part.local_file_state === "unlinked" ? "deleted" : part.local_file_state || "present"}</strong>
++                      {part.local_unlinked_at_utc && <> · {new Date(part.local_unlinked_at_utc).toLocaleString()}</>}
++                    </div>
++                    {part.local_unlink_error && <div className="inline-error small">{part.local_unlink_error}</div>}
+                     {part.status === "ready" && (
+                       <div className={`telegram-part-status telegram-part-status-${telegram?.status || "missing"}`}>
+                         Telegram: <strong>{telegram?.status || "missing"}</strong>
+@@ -5590,8 +5649,33 @@ function App() {
+                       {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}
+                       {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && <button disabled={partAction} onClick={() => partActionRequest(part, "cancel")}>Cancel</button>}
+                       <button onClick={() => copyPartPath(part)}>Copy path</button>
+-                      {["ready", "failed", "cancelled"].includes(part.status) && <button className="danger subtle" disabled={partAction} onClick={() => partActionRequest(part, "delete")}>Delete</button>}
++                      {part.status === "ready" && telegram?.status === "linked" && part.local_file_state !== "unlinked" && (
++                        <button className="danger subtle" disabled={partAction} onClick={() => void unlinkLocalPart(part)}>Unlink Part</button>
++                      )}
++                      {part.status === "ready" && telegram?.status === "linked" && (
++                        <button disabled={partAction} onClick={() => { setSegmentReplacementPartId((current) => current === part.id ? null : part.id); setSegmentReplacementDirectory(""); }}>Replace segments</button>
++                      )}
++                      {(part.status === "failed" || part.status === "cancelled") && <button className="danger subtle" disabled={partAction} onClick={() => partActionRequest(part, "delete")}>Delete reservation</button>}
+                     </div>
++                    {segmentReplacementPartId === part.id && (
++                      <div className="segment-replacement-form">
++                        <label>
++                          <span>Каталог с копиями segments</span>
++                          <input
++                            type="text"
++                            value={segmentReplacementDirectory}
++                            onChange={(event) => setSegmentReplacementDirectory(event.target.value)}
++                            placeholder="E:\\StreamHub\\backup\\segments"
++                            autoFocus
++                          />
++                        </label>
++                        <p className="muted small">Каталог должен быть внутри подключённого VIDEO_OUTPUT_ROOT. Перед удалением проверяются имя, размер и SHA-256 каждого segment.</p>
++                        <div className="actions">
++                          <button disabled={partAction || !segmentReplacementDirectory.trim()} onClick={() => void replacePartSegments(part)}>Verify & replace</button>
++                          <button disabled={partAction} onClick={() => { setSegmentReplacementPartId(null); setSegmentReplacementDirectory(""); }}>Отмена</button>
++                        </div>
++                      </div>
++                    )}
+                   </div>
+                 );
+               })}
+@@ -5608,8 +5692,12 @@ function App() {
+                 <td>{fmtMs(segment.timeline_start_ms)}–{fmtMs(segment.timeline_end_ms)}</td>
+                 <td>{fmtMs(segment.duration_ms)}</td><td>{fmtBytes(segment.bytes)}</td>
+                 <td>{segment.storage_state}</td><td>{segment.integrity_state}</td>
+-                <td>{segment.archived_at_utc ? new Date(segment.archived_at_utc).toLocaleString() : "—"}</td>
+-                <td className="path-cell">{segment.archive_last_error ? <span className="inline-error">{segment.archive_last_error}</span> : <code>{segment.relative_path}</code>}</td>
++                <td>{segment.replaced_at_utc ? `replaced ${new Date(segment.replaced_at_utc).toLocaleString()}` : segment.archived_at_utc ? new Date(segment.archived_at_utc).toLocaleString() : "—"}</td>
++                <td className="path-cell">
++                  {segment.archive_last_error ? <span className="inline-error">{segment.archive_last_error}</span> : segment.storage_state === "replaced" ? (
++                    <><code>{segment.replacement_path || segment.replacement_directory || "replacement verified"}</code><div className="muted small">original: {segment.relative_path}</div></>
++                  ) : <code>{segment.relative_path}</code>}
++                </td>
+               </tr>)}
+             </tbody></table></div>
+           )}
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index c10966c..080b692 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -1310,3 +1310,12 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .site-room-chat-compose > button:not(.site-room-chat-login) { width: 36px; min-width: 36px; height: 34px; padding: 0; border-color: var(--sv-orange); background: var(--sv-orange); color: #1b1008; font-weight: 900; }
+ .site-room-chat-compose > span { grid-column: 1 / -1; color: #b97f69; font-size: 9px; }
+ .site-room-chat-login { grid-column: 1 / -1; justify-self: stretch; border-color: #394650; background: #11171d; color: #aeb8c0; font-size: 10px; font-weight: 800; }
++
++.part-local-status { margin-top: 6px; font-size: 12px; color: #9aa7b1; }
++.part-local-status strong { color: #d7e0e6; }
++.part-local-status-unlinked strong { color: #70c98b; }
++.part-local-status-cleanup_pending strong { color: #ffb25f; }
++.segment-replacement-form { margin-top: 10px; padding: 10px; border: 1px solid #28353f; border-radius: 8px; background: #10171c; }
++.segment-replacement-form label { display: grid; gap: 6px; }
++.segment-replacement-form label > span { color: #aeb9c1; font-size: 12px; }
++.segment-replacement-form input { width: 100%; box-sizing: border-box; }
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index 6d46903..a972a61 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -362,6 +362,9 @@ class VideoSegment(Base):
+     archive_attempts: Mapped[int] = mapped_column(Integer, default=0)
+     archive_last_error: Mapped[str | None] = mapped_column(Text)
+     archived_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
++    replacement_directory: Mapped[str | None] = mapped_column(String(1024))
++    replacement_path: Mapped[str | None] = mapped_column(String(1024))
++    replaced_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+     closed_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+@@ -400,6 +403,9 @@ class VideoPart(Base):
+     relative_path: Mapped[str] = mapped_column(String(1024))
+     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+     last_error: Mapped[str | None] = mapped_column(Text)
++    local_file_state: Mapped[str] = mapped_column(String(24), default="present", index=True)
++    local_unlinked_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
++    local_unlink_error: Mapped[str | None] = mapped_column(Text)
+     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+     completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
