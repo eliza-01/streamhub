@@ -151,7 +151,9 @@ def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
     assert 'function SiteChatStats(' in web
     assert '/chat/stats`' in web
     assert 'Последний стрим' in web
-    assert 'PREVIEW ${siteHeroFrame + 1}' in web
+    assert 'function SiteHeroPreviewVideo(' in web
+    assert 'streamvault-preview-loop-fade' in web
+    assert 'onActivate={() => openSiteEvent(latest)}' in web
     assert 'Чат записи' in web
     assert 'Все сообщения' in web
     assert 'Посмотреть профиль' in web
@@ -260,6 +262,21 @@ def test_site_user_comments_are_persisted_authenticated_and_rate_limited():
     assert 'UI v1 · пользовательские комментарии подключим после утверждения интерфейса.' not in web
 
 
+    reactions_migration = _read("migrations/versions/0019_comment_threads_reactions.py")
+    assert 'down_revision = "0018_twitch_registration_comment_color"' in reactions_migration
+    assert '"parent_comment_id"' in reactions_migration
+    assert '"is_underlined"' in reactions_migration
+    assert '"site_comment_reactions"' in reactions_migration
+    assert 'class SiteCommentReaction(Base):' in models
+    assert '@router.post("/comments/{comment_id}/reaction")' in route
+    assert 'parent_comment_id=parent_comment_id' in route
+    assert 'is_underlined=bool(payload.is_underlined)' in route
+    assert 'viewer_reaction' in route
+    assert 'streamvault-comment-underline' in web
+    assert 'streamvault-comment-reactions' in web
+    assert 'Ответить' in web
+
+
 def test_site_admin_assets_migration_keeps_source_title_and_persistent_asset_metadata():
     migration = _read("migrations/versions/0011_site_admin_assets.py")
     models = _read("packages/python_common/streamhub_common/models.py")
@@ -305,7 +322,8 @@ def test_site_admin_api_and_ui_manage_display_title_cover_and_four_manual_frames
     assert 'Отображаемое название' in web
     assert '["frame_4", "Кадр 4"]' in web
     assert 'src={latest.assets?.cover?.url}' in web
-    assert 'src={latest.assets?.frames?.[siteHeroFrame]?.url}' in web
+    assert 'latest.assets?.frames?.[frame]?.url || null' in web
+    assert '<SiteHeroPreviewVideo event={latest} onActivate={() => openSiteEvent(latest)} />' in web
     assert 'onPublish={() => void openSitePublisher()}' not in web
     assert '.site-admin-modal' in css
     assert '.streamvault-artwork.has-image' in css

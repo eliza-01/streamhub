@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 import uuid
+from typing import Literal
 
 import httpx
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, func, or_, select
@@ -25,7 +26,10 @@ from streamhub_common.models import (
     SiteEventAsset,
     SiteEventPublication,
     SiteComment,
+    SiteCommentReaction,
     SiteEventTimecode,
+    SiteWatchParticipant,
+    SiteWatchSession,
     TelegramVideoPartBinding,
     VideoPart,
     VideoPartSegment,
@@ -35,7 +39,7 @@ from streamhub_common.models import (
     User,
 )
 
-from .user_auth import require_current_user
+from .user_auth import optional_current_user, require_current_user
 
 from ..site_assets import (
     SITE_ASSET_SLOTS,
@@ -81,6 +85,29 @@ class SiteTimecodesRequest(BaseModel):
 class SiteCommentCreateRequest(BaseModel):
     body: str = Field(min_length=1, max_length=4000)
     text_color: str = Field(default="#ff9b37", min_length=7, max_length=7)
+    is_underlined: bool = False
+    parent_comment_id: int | None = Field(default=None, ge=1)
+
+
+SiteCommentReactionName = Literal["like", "dislike", "heart", "broken_heart", "fire", "cry", "laugh", "poop"]
+
+
+class SiteCommentReactionRequest(BaseModel):
+    reaction: SiteCommentReactionName
+
+
+class SiteWatchClientRequest(BaseModel):
+    client_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")
+
+
+class SiteWatchCreateRequest(SiteWatchClientRequest):
+    position_ms: int = Field(default=0, ge=0, le=2_592_000_000)
+    is_playing: bool = False
+
+
+class SiteWatchStateRequest(SiteWatchClientRequest):
+    position_ms: int = Field(ge=0, le=2_592_000_000)
+    is_playing: bool
 
 
 def _event_title(event: MediaEvent) -> str:
@@ -540,7 +567,13 @@ async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
     return (await _site_payloads(db, [row], include_timecodes=True))[0]
 
 
-def _site_comment_payload(comment: SiteComment, user: User) -> dict:
+def _site_comment_payload(
+    comment: SiteComment,
+    user: User,
+    *,
+    reactions: dict[str, int] | None = None,
+    viewer_reaction: str | None = None,
+) -> dict:
     avatar_url = None
     if user.avatar_path:
         version = int(user.updated_at.timestamp()) if user.updated_at else 0
@@ -548,9 +581,13 @@ def _site_comment_payload(comment: SiteComment, user: User) -> dict:
     return {
         "id": int(comment.id),
         "event_id": str(comment.event_id),
+        "parent_comment_id": int(comment.parent_comment_id) if comment.parent_comment_id is not None else None,
         "body": comment.body,
         "text_color": comment.text_color or "#ff9b37",
+        "is_underlined": bool(comment.is_underlined),
         "created_at": comment.created_at.isoformat() if comment.created_at else None,
+        "reactions": reactions or {},
+        "viewer_reaction": viewer_reaction,
         "user": {
             "id": str(user.id),
             "nickname": user.nickname,
@@ -560,10 +597,43 @@ def _site_comment_payload(comment: SiteComment, user: User) -> dict:
     }
 
 
+async def _comment_reaction_state(
+    db: AsyncSession,
+    comment_ids: list[int],
+    viewer_user_id: uuid.UUID | None,
+) -> tuple[dict[int, dict[str, int]], dict[int, str]]:
+    if not comment_ids:
+        return {}, {}
+    count_rows = (
+        await db.execute(
+            select(SiteCommentReaction.comment_id, SiteCommentReaction.reaction, func.count())
+            .where(SiteCommentReaction.comment_id.in_(comment_ids))
+            .group_by(SiteCommentReaction.comment_id, SiteCommentReaction.reaction)
+        )
+    ).all()
+    counts: dict[int, dict[str, int]] = defaultdict(dict)
+    for comment_id, reaction, count in count_rows:
+        counts[int(comment_id)][str(reaction)] = int(count)
+
+    viewer: dict[int, str] = {}
+    if viewer_user_id is not None:
+        viewer_rows = (
+            await db.execute(
+                select(SiteCommentReaction.comment_id, SiteCommentReaction.reaction).where(
+                    SiteCommentReaction.comment_id.in_(comment_ids),
+                    SiteCommentReaction.user_id == viewer_user_id,
+                )
+            )
+        ).all()
+        viewer = {int(comment_id): str(reaction) for comment_id, reaction in viewer_rows}
+    return counts, viewer
+
+
 @router.get("/events/{event_id}/comments")
 async def site_event_comments(
     event_id: uuid.UUID,
     page_size: int = Query(default=100, ge=1, le=200),
+    viewer: User | None = Depends(optional_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     await _require_public_event(db, event_id)
@@ -576,9 +646,19 @@ async def site_event_comments(
             .limit(page_size)
         )
     ).all()
+    comment_ids = [int(comment.id) for comment, _user in rows]
+    counts, viewer_reactions = await _comment_reaction_state(db, comment_ids, viewer.id if viewer else None)
     return {
         "event_id": str(event_id),
-        "items": [_site_comment_payload(comment, user) for comment, user in rows],
+        "items": [
+            _site_comment_payload(
+                comment,
+                user,
+                reactions=counts.get(int(comment.id), {}),
+                viewer_reaction=viewer_reactions.get(int(comment.id)),
+            )
+            for comment, user in rows
+        ],
     }
 
 
@@ -596,6 +676,12 @@ async def create_site_event_comment(
     text_color = payload.text_color.lower()
     if not _COMMENT_COLOR_RE.fullmatch(text_color):
         raise HTTPException(400, "Некорректный цвет комментария")
+
+    parent_comment_id = payload.parent_comment_id
+    if parent_comment_id is not None:
+        parent = await db.get(SiteComment, parent_comment_id)
+        if not parent or parent.event_id != event_id:
+            raise HTTPException(400, "Комментарий для ответа не найден")
 
     now = datetime.utcnow()
     # Serialize comment creation per user so concurrent clicks/tabs cannot bypass the 60s limit.
@@ -621,7 +707,15 @@ async def create_site_event_comment(
                 headers={"Retry-After": str(retry_after)},
             )
 
-    comment = SiteComment(event_id=event_id, user_id=user.id, body=body, text_color=text_color, created_at=now)
+    comment = SiteComment(
+        event_id=event_id,
+        user_id=user.id,
+        parent_comment_id=parent_comment_id,
+        body=body,
+        text_color=text_color,
+        is_underlined=bool(payload.is_underlined),
+        created_at=now,
+    )
     db.add(comment)
     await db.commit()
     await db.refresh(comment)
@@ -630,6 +724,292 @@ async def create_site_event_comment(
         "cooldown_seconds": 60,
         "next_allowed_at": (now + timedelta(seconds=60)).isoformat(),
     }
+
+
+@router.post("/comments/{comment_id}/reaction")
+async def toggle_site_comment_reaction(
+    comment_id: int,
+    payload: SiteCommentReactionRequest,
+    user: User = Depends(require_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    comment = await db.get(SiteComment, comment_id)
+    if not comment:
+        raise HTTPException(404, "Комментарий не найден")
+    await _require_public_event(db, comment.event_id)
+
+    existing = await db.get(SiteCommentReaction, {"comment_id": comment_id, "user_id": user.id})
+    viewer_reaction: str | None
+    if existing and existing.reaction == payload.reaction:
+        await db.delete(existing)
+        viewer_reaction = None
+    elif existing:
+        existing.reaction = payload.reaction
+        existing.updated_at = datetime.utcnow()
+        viewer_reaction = payload.reaction
+    else:
+        db.add(
+            SiteCommentReaction(
+                comment_id=comment_id,
+                user_id=user.id,
+                reaction=payload.reaction,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+        )
+        viewer_reaction = payload.reaction
+    await db.commit()
+    counts, _viewer = await _comment_reaction_state(db, [comment_id], user.id)
+    return {
+        "comment_id": comment_id,
+        "reactions": counts.get(comment_id, {}),
+        "viewer_reaction": viewer_reaction,
+    }
+
+
+_WATCH_SESSION_TTL = timedelta(seconds=60)
+_WATCH_PARTICIPANT_TTL = timedelta(seconds=15)
+
+
+def _watch_display_name(user: User | None, client_id: str) -> str:
+    if user is not None:
+        return user.nickname[:64]
+    compact = re.sub(r"[^A-Za-z0-9]", "", client_id)[-4:] or "guest"
+    return f"Гость {compact.upper()}"
+
+
+async def _touch_watch_participant(
+    db: AsyncSession,
+    session: SiteWatchSession,
+    *,
+    client_id: str,
+    user: User | None,
+) -> SiteWatchParticipant:
+    participant = (
+        await db.execute(
+            select(SiteWatchParticipant).where(
+                SiteWatchParticipant.session_id == session.id,
+                SiteWatchParticipant.client_id == client_id,
+            )
+        )
+    ).scalar_one_or_none()
+    now = datetime.utcnow()
+    if participant is None:
+        participant = SiteWatchParticipant(
+            session_id=session.id,
+            user_id=user.id if user else None,
+            client_id=client_id,
+            display_name=_watch_display_name(user, client_id),
+            joined_at=now,
+            last_seen_at=now,
+        )
+        db.add(participant)
+    else:
+        participant.user_id = user.id if user else participant.user_id
+        participant.display_name = _watch_display_name(user, client_id)
+        participant.last_seen_at = now
+    session.last_activity_at = now
+    return participant
+
+
+async def _watch_participant_count(db: AsyncSession, session_id: uuid.UUID, *, now: datetime | None = None) -> int:
+    now = now or datetime.utcnow()
+    cutoff = now - _WATCH_PARTICIPANT_TTL
+    return int(
+        (
+            await db.execute(
+                select(func.count(SiteWatchParticipant.id)).where(
+                    SiteWatchParticipant.session_id == session_id,
+                    SiteWatchParticipant.last_seen_at >= cutoff,
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+
+
+async def _watch_session_payload(db: AsyncSession, session: SiteWatchSession, *, now: datetime | None = None) -> dict:
+    now = now or datetime.utcnow()
+    return {
+        "id": str(session.id),
+        "event_id": str(session.event_id),
+        "owner_user_id": str(session.owner_user_id) if session.owner_user_id else None,
+        "owner_label": session.owner_label,
+        "participant_count": await _watch_participant_count(db, session.id, now=now),
+        "position_ms": int(session.position_ms or 0),
+        "is_playing": bool(session.is_playing),
+        "state_version": int(session.state_version or 0),
+        "state_updated_at": session.state_updated_at.isoformat() if session.state_updated_at else None,
+        "last_activity_at": session.last_activity_at.isoformat() if session.last_activity_at else None,
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+    }
+
+
+async def _require_active_watch_session(db: AsyncSession, session_id: uuid.UUID) -> SiteWatchSession:
+    session = await db.get(SiteWatchSession, session_id)
+    now = datetime.utcnow()
+    if (
+        session is None
+        or session.closed_at is not None
+        or session.last_activity_at < now - _WATCH_SESSION_TTL
+    ):
+        raise HTTPException(404, "Сессия совместного просмотра недоступна")
+    await _require_public_event(db, session.event_id)
+    return session
+
+
+@router.get("/events/{event_id}/watch-sessions")
+async def site_watch_sessions(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    await _require_public_event(db, event_id)
+    now = datetime.utcnow()
+    rows = (
+        await db.execute(
+            select(SiteWatchSession)
+            .where(
+                SiteWatchSession.event_id == event_id,
+                SiteWatchSession.closed_at.is_(None),
+                SiteWatchSession.last_activity_at >= now - _WATCH_SESSION_TTL,
+            )
+            .order_by(SiteWatchSession.last_activity_at.desc(), SiteWatchSession.created_at.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+    return {
+        "event_id": str(event_id),
+        "server_now_utc": now.isoformat(),
+        "items": [await _watch_session_payload(db, row, now=now) for row in rows],
+    }
+
+
+@router.post("/events/{event_id}/watch-sessions", status_code=201)
+async def create_site_watch_session(
+    event_id: uuid.UUID,
+    payload: SiteWatchCreateRequest,
+    viewer: User | None = Depends(optional_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await _require_public_event(db, event_id)
+    now = datetime.utcnow()
+    session = SiteWatchSession(
+        event_id=event_id,
+        owner_user_id=viewer.id if viewer else None,
+        owner_client_id=payload.client_id,
+        owner_label=_watch_display_name(viewer, payload.client_id),
+        position_ms=payload.position_ms,
+        is_playing=payload.is_playing,
+        state_version=1,
+        state_updated_at=now,
+        last_activity_at=now,
+        created_at=now,
+    )
+    db.add(session)
+    await db.flush()
+    await _touch_watch_participant(db, session, client_id=payload.client_id, user=viewer)
+    await db.commit()
+    await db.refresh(session)
+    return {
+        "server_now_utc": now.isoformat(),
+        "session": await _watch_session_payload(db, session, now=now),
+    }
+
+
+@router.post("/watch-sessions/{session_id}/join")
+async def join_site_watch_session(
+    session_id: uuid.UUID,
+    payload: SiteWatchClientRequest,
+    viewer: User | None = Depends(optional_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    session = await _require_active_watch_session(db, session_id)
+    now = datetime.utcnow()
+    await _touch_watch_participant(db, session, client_id=payload.client_id, user=viewer)
+    await db.commit()
+    await db.refresh(session)
+    return {
+        "server_now_utc": now.isoformat(),
+        "session": await _watch_session_payload(db, session, now=now),
+    }
+
+
+@router.post("/watch-sessions/{session_id}/heartbeat")
+async def heartbeat_site_watch_session(
+    session_id: uuid.UUID,
+    payload: SiteWatchClientRequest,
+    viewer: User | None = Depends(optional_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    session = await _require_active_watch_session(db, session_id)
+    now = datetime.utcnow()
+    await _touch_watch_participant(db, session, client_id=payload.client_id, user=viewer)
+    await db.commit()
+    await db.refresh(session)
+    return {
+        "server_now_utc": now.isoformat(),
+        "session": await _watch_session_payload(db, session, now=now),
+    }
+
+
+@router.put("/watch-sessions/{session_id}/state")
+async def update_site_watch_session_state(
+    session_id: uuid.UUID,
+    payload: SiteWatchStateRequest,
+    viewer: User | None = Depends(optional_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    session = await _require_active_watch_session(db, session_id)
+    participant = (
+        await db.execute(
+            select(SiteWatchParticipant).where(
+                SiteWatchParticipant.session_id == session.id,
+                SiteWatchParticipant.client_id == payload.client_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if participant is None:
+        raise HTTPException(409, "Сначала присоединитесь к сессии")
+    now = datetime.utcnow()
+    participant.last_seen_at = now
+    if viewer is not None:
+        participant.user_id = viewer.id
+        participant.display_name = viewer.nickname[:64]
+    session.position_ms = payload.position_ms
+    session.is_playing = payload.is_playing
+    session.state_version = int(session.state_version or 0) + 1
+    session.state_updated_at = now
+    session.last_activity_at = now
+    await db.commit()
+    await db.refresh(session)
+    return {
+        "server_now_utc": now.isoformat(),
+        "session": await _watch_session_payload(db, session, now=now),
+    }
+
+
+@router.post("/watch-sessions/{session_id}/leave")
+async def leave_site_watch_session(
+    session_id: uuid.UUID,
+    payload: SiteWatchClientRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    session = await db.get(SiteWatchSession, session_id)
+    if session is None:
+        return {"ok": True}
+    participant = (
+        await db.execute(
+            select(SiteWatchParticipant).where(
+                SiteWatchParticipant.session_id == session.id,
+                SiteWatchParticipant.client_id == payload.client_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if participant is not None:
+        await db.delete(participant)
+        await db.flush()
+    remaining = await _watch_participant_count(db, session.id)
+    if remaining == 0:
+        session.closed_at = datetime.utcnow()
+    await db.commit()
+    return {"ok": True, "closed": remaining == 0}
 
 
 def _naive_utc(value: datetime | None) -> datetime | None:

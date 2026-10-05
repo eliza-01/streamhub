@@ -634,6 +634,50 @@ class UserTwitchRegistration(Base):
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class SiteWatchSession(Base):
+    __tablename__ = "site_watch_sessions"
+    __table_args__ = (
+        Index("ix_site_watch_sessions_event_activity", "event_id", "last_activity_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    owner_client_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_label: Mapped[str] = mapped_column(String(64), nullable=False)
+    position_ms: Mapped[int] = mapped_column(BigInteger, default=0)
+    is_playing: Mapped[bool] = mapped_column(Boolean, default=False)
+    state_version: Mapped[int] = mapped_column(BigInteger, default=0)
+    state_updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    last_activity_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+
+
+class SiteWatchParticipant(Base):
+    __tablename__ = "site_watch_participants"
+    __table_args__ = (
+        Index("ix_site_watch_participants_session_seen", "session_id", "last_seen_at"),
+        UniqueConstraint("session_id", "client_id", name="uq_site_watch_participants_session_client"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("site_watch_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    client_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    joined_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+
+
 class SiteComment(Base):
     __tablename__ = "site_comments"
     __table_args__ = (
@@ -648,9 +692,30 @@ class SiteComment(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    parent_comment_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("site_comments.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     body: Mapped[str] = mapped_column(Text)
     text_color: Mapped[str] = mapped_column(String(7), default="#ff9b37")
+    is_underlined: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+
+
+class SiteCommentReaction(Base):
+    __tablename__ = "site_comment_reactions"
+    __table_args__ = (
+        Index("ix_site_comment_reactions_user_id", "user_id"),
+    )
+
+    comment_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("site_comments.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    reaction: Mapped[str] = mapped_column(String(24), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class AuditLog(Base):

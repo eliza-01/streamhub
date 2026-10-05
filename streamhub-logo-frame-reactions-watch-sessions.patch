@@ -1,0 +1,1208 @@
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+index dcb91ce..76505a8 100644
+--- a/apps/api/app/routers/site.py
++++ b/apps/api/app/routers/site.py
+@@ -28,6 +28,8 @@ from streamhub_common.models import (
+     SiteComment,
+     SiteCommentReaction,
+     SiteEventTimecode,
++    SiteWatchParticipant,
++    SiteWatchSession,
+     TelegramVideoPartBinding,
+     VideoPart,
+     VideoPartSegment,
+@@ -94,6 +96,20 @@ class SiteCommentReactionRequest(BaseModel):
+     reaction: SiteCommentReactionName
+ 
+ 
++class SiteWatchClientRequest(BaseModel):
++    client_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")
++
++
++class SiteWatchCreateRequest(SiteWatchClientRequest):
++    position_ms: int = Field(default=0, ge=0, le=2_592_000_000)
++    is_playing: bool = False
++
++
++class SiteWatchStateRequest(SiteWatchClientRequest):
++    position_ms: int = Field(ge=0, le=2_592_000_000)
++    is_playing: bool
++
++
+ def _event_title(event: MediaEvent) -> str:
+     return event.display_title or event.title or event.channel_display_name or event.channel_login or event.external_key
+ 
+@@ -751,6 +767,251 @@ async def toggle_site_comment_reaction(
+     }
+ 
+ 
++_WATCH_SESSION_TTL = timedelta(seconds=60)
++_WATCH_PARTICIPANT_TTL = timedelta(seconds=15)
++
++
++def _watch_display_name(user: User | None, client_id: str) -> str:
++    if user is not None:
++        return user.nickname[:64]
++    compact = re.sub(r"[^A-Za-z0-9]", "", client_id)[-4:] or "guest"
++    return f"Гость {compact.upper()}"
++
++
++async def _touch_watch_participant(
++    db: AsyncSession,
++    session: SiteWatchSession,
++    *,
++    client_id: str,
++    user: User | None,
++) -> SiteWatchParticipant:
++    participant = (
++        await db.execute(
++            select(SiteWatchParticipant).where(
++                SiteWatchParticipant.session_id == session.id,
++                SiteWatchParticipant.client_id == client_id,
++            )
++        )
++    ).scalar_one_or_none()
++    now = datetime.utcnow()
++    if participant is None:
++        participant = SiteWatchParticipant(
++            session_id=session.id,
++            user_id=user.id if user else None,
++            client_id=client_id,
++            display_name=_watch_display_name(user, client_id),
++            joined_at=now,
++            last_seen_at=now,
++        )
++        db.add(participant)
++    else:
++        participant.user_id = user.id if user else participant.user_id
++        participant.display_name = _watch_display_name(user, client_id)
++        participant.last_seen_at = now
++    session.last_activity_at = now
++    return participant
++
++
++async def _watch_participant_count(db: AsyncSession, session_id: uuid.UUID, *, now: datetime | None = None) -> int:
++    now = now or datetime.utcnow()
++    cutoff = now - _WATCH_PARTICIPANT_TTL
++    return int(
++        (
++            await db.execute(
++                select(func.count(SiteWatchParticipant.id)).where(
++                    SiteWatchParticipant.session_id == session_id,
++                    SiteWatchParticipant.last_seen_at >= cutoff,
++                )
++            )
++        ).scalar_one()
++        or 0
++    )
++
++
++async def _watch_session_payload(db: AsyncSession, session: SiteWatchSession, *, now: datetime | None = None) -> dict:
++    now = now or datetime.utcnow()
++    return {
++        "id": str(session.id),
++        "event_id": str(session.event_id),
++        "owner_user_id": str(session.owner_user_id) if session.owner_user_id else None,
++        "owner_label": session.owner_label,
++        "participant_count": await _watch_participant_count(db, session.id, now=now),
++        "position_ms": int(session.position_ms or 0),
++        "is_playing": bool(session.is_playing),
++        "state_version": int(session.state_version or 0),
++        "state_updated_at": session.state_updated_at.isoformat() if session.state_updated_at else None,
++        "last_activity_at": session.last_activity_at.isoformat() if session.last_activity_at else None,
++        "created_at": session.created_at.isoformat() if session.created_at else None,
++    }
++
++
++async def _require_active_watch_session(db: AsyncSession, session_id: uuid.UUID) -> SiteWatchSession:
++    session = await db.get(SiteWatchSession, session_id)
++    now = datetime.utcnow()
++    if (
++        session is None
++        or session.closed_at is not None
++        or session.last_activity_at < now - _WATCH_SESSION_TTL
++    ):
++        raise HTTPException(404, "Сессия совместного просмотра недоступна")
++    await _require_public_event(db, session.event_id)
++    return session
++
++
++@router.get("/events/{event_id}/watch-sessions")
++async def site_watch_sessions(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    await _require_public_event(db, event_id)
++    now = datetime.utcnow()
++    rows = (
++        await db.execute(
++            select(SiteWatchSession)
++            .where(
++                SiteWatchSession.event_id == event_id,
++                SiteWatchSession.closed_at.is_(None),
++                SiteWatchSession.last_activity_at >= now - _WATCH_SESSION_TTL,
++            )
++            .order_by(SiteWatchSession.last_activity_at.desc(), SiteWatchSession.created_at.desc())
++            .limit(50)
++        )
++    ).scalars().all()
++    return {
++        "event_id": str(event_id),
++        "server_now_utc": now.isoformat(),
++        "items": [await _watch_session_payload(db, row, now=now) for row in rows],
++    }
++
++
++@router.post("/events/{event_id}/watch-sessions", status_code=201)
++async def create_site_watch_session(
++    event_id: uuid.UUID,
++    payload: SiteWatchCreateRequest,
++    viewer: User | None = Depends(optional_current_user),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    await _require_public_event(db, event_id)
++    now = datetime.utcnow()
++    session = SiteWatchSession(
++        event_id=event_id,
++        owner_user_id=viewer.id if viewer else None,
++        owner_client_id=payload.client_id,
++        owner_label=_watch_display_name(viewer, payload.client_id),
++        position_ms=payload.position_ms,
++        is_playing=payload.is_playing,
++        state_version=1,
++        state_updated_at=now,
++        last_activity_at=now,
++        created_at=now,
++    )
++    db.add(session)
++    await db.flush()
++    await _touch_watch_participant(db, session, client_id=payload.client_id, user=viewer)
++    await db.commit()
++    await db.refresh(session)
++    return {
++        "server_now_utc": now.isoformat(),
++        "session": await _watch_session_payload(db, session, now=now),
++    }
++
++
++@router.post("/watch-sessions/{session_id}/join")
++async def join_site_watch_session(
++    session_id: uuid.UUID,
++    payload: SiteWatchClientRequest,
++    viewer: User | None = Depends(optional_current_user),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    session = await _require_active_watch_session(db, session_id)
++    now = datetime.utcnow()
++    await _touch_watch_participant(db, session, client_id=payload.client_id, user=viewer)
++    await db.commit()
++    await db.refresh(session)
++    return {
++        "server_now_utc": now.isoformat(),
++        "session": await _watch_session_payload(db, session, now=now),
++    }
++
++
++@router.post("/watch-sessions/{session_id}/heartbeat")
++async def heartbeat_site_watch_session(
++    session_id: uuid.UUID,
++    payload: SiteWatchClientRequest,
++    viewer: User | None = Depends(optional_current_user),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    session = await _require_active_watch_session(db, session_id)
++    now = datetime.utcnow()
++    await _touch_watch_participant(db, session, client_id=payload.client_id, user=viewer)
++    await db.commit()
++    await db.refresh(session)
++    return {
++        "server_now_utc": now.isoformat(),
++        "session": await _watch_session_payload(db, session, now=now),
++    }
++
++
++@router.put("/watch-sessions/{session_id}/state")
++async def update_site_watch_session_state(
++    session_id: uuid.UUID,
++    payload: SiteWatchStateRequest,
++    viewer: User | None = Depends(optional_current_user),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    session = await _require_active_watch_session(db, session_id)
++    participant = (
++        await db.execute(
++            select(SiteWatchParticipant).where(
++                SiteWatchParticipant.session_id == session.id,
++                SiteWatchParticipant.client_id == payload.client_id,
++            )
++        )
++    ).scalar_one_or_none()
++    if participant is None:
++        raise HTTPException(409, "Сначала присоединитесь к сессии")
++    now = datetime.utcnow()
++    participant.last_seen_at = now
++    if viewer is not None:
++        participant.user_id = viewer.id
++        participant.display_name = viewer.nickname[:64]
++    session.position_ms = payload.position_ms
++    session.is_playing = payload.is_playing
++    session.state_version = int(session.state_version or 0) + 1
++    session.state_updated_at = now
++    session.last_activity_at = now
++    await db.commit()
++    await db.refresh(session)
++    return {
++        "server_now_utc": now.isoformat(),
++        "session": await _watch_session_payload(db, session, now=now),
++    }
++
++
++@router.post("/watch-sessions/{session_id}/leave")
++async def leave_site_watch_session(
++    session_id: uuid.UUID,
++    payload: SiteWatchClientRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    session = await db.get(SiteWatchSession, session_id)
++    if session is None:
++        return {"ok": True}
++    participant = (
++        await db.execute(
++            select(SiteWatchParticipant).where(
++                SiteWatchParticipant.session_id == session.id,
++                SiteWatchParticipant.client_id == payload.client_id,
++            )
++        )
++    ).scalar_one_or_none()
++    if participant is not None:
++        await db.delete(participant)
++        await db.flush()
++    remaining = await _watch_participant_count(db, session.id)
++    if remaining == 0:
++        session.closed_at = datetime.utcnow()
++    await db.commit()
++    return {"ok": True, "closed": remaining == 0}
++
++
+ def _naive_utc(value: datetime | None) -> datetime | None:
+     if value is None:
+         return None
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 59f5d3d..7ba7c7f 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -429,6 +429,20 @@ type SiteEvent = {
+   playable: boolean;
+ };
+ 
++type SiteWatchSession = {
++  id: string;
++  event_id: string;
++  owner_user_id?: string | null;
++  owner_label: string;
++  participant_count: number;
++  position_ms: number;
++  is_playing: boolean;
++  state_version: number;
++  state_updated_at?: string | null;
++  last_activity_at?: string | null;
++  created_at?: string | null;
++};
++
+ type SiteCommentReactionName = "like" | "dislike" | "heart" | "broken_heart" | "fire" | "cry" | "laugh" | "poop";
+ 
+ type SiteUserComment = {
+@@ -573,20 +587,20 @@ const STREAMVAULT_LOGO_FRAMES = [0, 1, 2, 3, 4, 5].map(
+ 
+ const STREAMVAULT_LOGO_FRAME_SEQUENCE: Array<[number, number]> = [
+   [0, 0],
+-  [280, 1],
+-  [420, 2],
+-  [560, 3],
+-  [700, 4],
+-  [840, 5],
+-  [965, 0],
+-  [1090, 0],
+-  [1230, 1],
+-  [1370, 2],
+-  [1510, 3],
+-  [1650, 4],
+-  [1790, 5],
++  [205, 1],
++  [310, 2],
++  [415, 3],
++  [520, 4],
++  [625, 5],
++  [720, 0],
++  [815, 0],
++  [920, 1],
++  [1025, 2],
++  [1130, 3],
++  [1235, 4],
++  [1340, 5],
+ ];
+-const STREAMVAULT_LOGO_ANIMATION_MS = 2040;
++const STREAMVAULT_LOGO_ANIMATION_MS = 1500;
+ 
+ function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
+   const [frame, setFrame] = useState(5);
+@@ -612,7 +626,7 @@ function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
+       setFrame(5);
+       setAnimating(false);
+       timersRef.current = [];
+-    }, 2520));
++    }, STREAMVAULT_LOGO_ANIMATION_MS));
+   }, [clearTimers]);
+ 
+   useEffect(() => {
+@@ -682,6 +696,7 @@ const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
+ const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
+ const EVENT_TITLE_MODE_KEY = "streamhub.events.titleMode";
+ const SITE_COMMENT_COLOR_KEY = "streamhub.site.commentColor";
++const SITE_WATCH_CLIENT_ID_KEY = "streamhub.site.watchClientId";
+ const SITE_COMMENT_REACTIONS: Array<{ key: SiteCommentReactionName; label: string; emoji: string; image: string }> = [
+   { key: "like", label: "Нравится", emoji: "👍", image: "https://em-content.zobj.net/source/apple/419/thumbs-up_1f44d.png" },
+   { key: "dislike", label: "Не нравится", emoji: "👎", image: "https://em-content.zobj.net/source/apple/419/thumbs-down_1f44e.png" },
+@@ -694,6 +709,20 @@ const SITE_COMMENT_REACTIONS: Array<{ key: SiteCommentReactionName; label: strin
+ ];
+ type EventTitleMode = "display" | "source";
+ 
++function storedSiteWatchClientId() {
++  try {
++    const existing = window.localStorage.getItem(SITE_WATCH_CLIENT_ID_KEY);
++    if (existing && /^[A-Za-z0-9._:-]{8,64}$/.test(existing)) return existing;
++    const generated = typeof crypto?.randomUUID === "function"
++      ? crypto.randomUUID()
++      : `watch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
++    window.localStorage.setItem(SITE_WATCH_CLIENT_ID_KEY, generated);
++    return generated;
++  } catch {
++    return `watch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
++  }
++}
++
+ function storedSiteCommentColor() {
+   try {
+     const value = window.localStorage.getItem(SITE_COMMENT_COLOR_KEY) || "";
+@@ -2789,6 +2818,57 @@ function SiteEventTimecodes({
+   );
+ }
+ 
++function SiteWatchSessionsPanel({
++  sessions,
++  current,
++  busyId,
++  notice,
++  onJoin,
++  onCreate,
++}: {
++  sessions: SiteWatchSession[];
++  current: SiteWatchSession | null;
++  busyId: string | null;
++  notice: string;
++  onJoin: (session: SiteWatchSession) => void;
++  onCreate: () => void;
++}) {
++  return (
++    <section className="streamvault-watch-sessions" aria-labelledby="streamvaultWatchSessionsTitle">
++      <div className="streamvault-watch-sessions-head">
++        <div>
++          <strong id="streamvaultWatchSessionsTitle">Совместный просмотр</strong>
++          <span>play / pause / перемотка синхронизируются для всей комнаты</span>
++        </div>
++        <button type="button" disabled={busyId === "new"} onClick={onCreate}>
++          {busyId === "new" ? "Создаём…" : "+ Новая сессия"}
++        </button>
++      </div>
++      {notice ? <div className="streamvault-watch-sessions-notice">{notice}</div> : null}
++      <div className="streamvault-watch-sessions-list">
++        {sessions.length ? sessions.map((session) => {
++          const isCurrent = current?.id === session.id;
++          return (
++            <button
++              type="button"
++              key={session.id}
++              className={isCurrent ? "is-current" : ""}
++              disabled={isCurrent || busyId === session.id}
++              onClick={() => onJoin(session)}
++            >
++              <span className="streamvault-watch-session-main">
++                <strong>{session.owner_label}</strong>
++                <small>{session.participant_count} {session.participant_count === 1 ? "зритель" : "зрителей"} · {session.is_playing ? `▶ ${fmtMs(session.position_ms)}` : `Ⅱ ${fmtMs(session.position_ms)}`}</small>
++              </span>
++              <span className="streamvault-watch-session-action">{isCurrent ? "Вы здесь" : busyId === session.id ? "Подключаем…" : "Присоединиться"}</span>
++            </button>
++          );
++        }) : <div className="streamvault-watch-sessions-empty">Активных сессий пока нет.</div>}
++      </div>
++    </section>
++  );
++}
++
+ function SiteAdminPanel({
+   events,
+   drafts,
+@@ -3132,12 +3212,13 @@ function App() {
+   const [sitePublishEventId, setSitePublishEventId] = useState("");
+   const [sitePublishCategories, setSitePublishCategories] = useState<string[]>([]);
+   const [siteAction, setSiteAction] = useState(false);
+-  const [sitePreviewOverlay, setSitePreviewOverlay] = useState<{ src: string; label: string } | null>(null);
++  const [sitePreviewOverlay, setSitePreviewOverlay] = useState<{ items: Array<{ src: string; label: string }>; index: number } | null>(null);
+   const [siteCommentDraft, setSiteCommentDraft] = useState("");
+   const [siteCommentColor, setSiteCommentColor] = useState(storedSiteCommentColor);
+   const [siteCommentUnderlined, setSiteCommentUnderlined] = useState(false);
+   const [siteCommentReplyTo, setSiteCommentReplyTo] = useState<{ id: number; nickname: string; login: string } | null>(null);
+   const [siteCommentReactionSending, setSiteCommentReactionSending] = useState<number | null>(null);
++  const [siteCommentReactionPickerId, setSiteCommentReactionPickerId] = useState<number | null>(null);
+   const [siteCommentNotice, setSiteCommentNotice] = useState("");
+   const [siteComments, setSiteComments] = useState<SiteUserComment[]>([]);
+   const [siteCommentsLoading, setSiteCommentsLoading] = useState(false);
+@@ -3145,6 +3226,15 @@ function App() {
+   const [siteCommentCooldownUntil, setSiteCommentCooldownUntil] = useState(0);
+   const [siteCommentClock, setSiteCommentClock] = useState(() => Date.now());
+   const siteCommentRef = useRef<HTMLTextAreaElement | null>(null);
++  const siteWatchClientIdRef = useRef(storedSiteWatchClientId());
++  const [siteWatchSessions, setSiteWatchSessions] = useState<SiteWatchSession[]>([]);
++  const [siteWatchSession, setSiteWatchSession] = useState<SiteWatchSession | null>(null);
++  const [siteWatchBusyId, setSiteWatchBusyId] = useState<string | null>(null);
++  const [siteWatchNotice, setSiteWatchNotice] = useState("");
++  const siteWatchApplyingRemoteRef = useRef(false);
++  const siteWatchLastAppliedVersionRef = useRef(0);
++  const siteWatchPublishInFlightRef = useRef(false);
++  const siteWatchCurrentRef = useRef<SiteWatchSession | null>(null);
+   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+   const [authModalOpen, setAuthModalOpen] = useState(false);
+ 
+@@ -3168,7 +3258,18 @@ function App() {
+     if (!sitePreviewOverlay) return;
+     const previousOverflow = document.body.style.overflow;
+     const onKeyDown = (event: KeyboardEvent) => {
+-      if (event.key === "Escape") setSitePreviewOverlay(null);
++      if (event.key === "Escape") {
++        setSitePreviewOverlay(null);
++        return;
++      }
++      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
++        event.preventDefault();
++        setSitePreviewOverlay((current) => {
++          if (!current || current.items.length < 2) return current;
++          const delta = event.key === "ArrowLeft" ? -1 : 1;
++          return { ...current, index: (current.index + delta + current.items.length) % current.items.length };
++        });
++      }
+     };
+     document.body.style.overflow = "hidden";
+     window.addEventListener("keydown", onKeyDown);
+@@ -3205,6 +3306,110 @@ function App() {
+     return () => controller.abort();
+   }, [selectedSiteEvent?.id]);
+ 
++  useEffect(() => {
++    siteWatchCurrentRef.current = siteWatchSession;
++  }, [siteWatchSession]);
++
++  useEffect(() => {
++    const event = selectedSiteEvent;
++    if (!event?.playable || !event.playback_url) {
++      siteWatchCurrentRef.current = null;
++      setSiteWatchSession(null);
++      setSiteWatchSessions([]);
++      setSiteWatchNotice("");
++      return;
++    }
++    let cancelled = false;
++    setSiteWatchSessions([]);
++    setSiteWatchSession(null);
++    siteWatchCurrentRef.current = null;
++    siteWatchLastAppliedVersionRef.current = 0;
++    setSiteWatchNotice("");
++    const timer = window.setTimeout(() => {
++      if (cancelled) return;
++      void createSiteWatchSession(event.id);
++    }, 180);
++    return () => {
++      cancelled = true;
++      window.clearTimeout(timer);
++    };
++    // Event changes should create a fresh room. Auth changes only affect the display name on the next heartbeat/create.
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [selectedSiteEvent?.id, selectedSiteEvent?.playable, selectedSiteEvent?.playback_url]);
++
++  useEffect(() => {
++    const eventId = selectedSiteEvent?.id;
++    if (!eventId) return;
++    const controller = new AbortController();
++    const load = () => {
++      void loadSiteWatchSessions(eventId, controller.signal).catch((error) => {
++        if (!(error instanceof DOMException && error.name === "AbortError")) console.warn("watch session list failed", error);
++      });
++    };
++    load();
++    const timer = window.setInterval(load, 3000);
++    return () => {
++      controller.abort();
++      window.clearInterval(timer);
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [selectedSiteEvent?.id]);
++
++  useEffect(() => {
++    const session = siteWatchSession;
++    if (!session) return;
++    let disposed = false;
++    const heartbeat = async () => {
++      try {
++        const res = await fetch(`${API}/api/v1/site/watch-sessions/${session.id}/heartbeat`, {
++          method: "POST",
++          credentials: "include",
++          headers: { "Content-Type": "application/json" },
++          body: JSON.stringify({ client_id: siteWatchClientIdRef.current }),
++        });
++        const data = await res.json().catch(() => ({}));
++        if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
++        if (disposed) return;
++        const next = data.session as SiteWatchSession;
++        applySiteWatchState(next, data.server_now_utc || null);
++        siteWatchCurrentRef.current = next;
++        setSiteWatchSession(next);
++      } catch (error) {
++        if (!disposed) setSiteWatchNotice(`Синхронизация приостановлена: ${error instanceof Error ? error.message : String(error)}`);
++      }
++    };
++    void heartbeat();
++    const timer = window.setInterval(heartbeat, 700);
++    return () => {
++      disposed = true;
++      window.clearInterval(timer);
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [siteWatchSession?.id]);
++
++  useEffect(() => {
++    if (!siteWatchSession) return;
++    const video = siteVideoRef.current;
++    if (!video) return;
++    const onLocalControl = () => {
++      if (siteWatchApplyingRemoteRef.current) return;
++      void publishSiteWatchState();
++    };
++    video.addEventListener("play", onLocalControl);
++    video.addEventListener("pause", onLocalControl);
++    video.addEventListener("seeked", onLocalControl);
++    const timer = window.setInterval(() => {
++      if (!video.paused && !video.ended) void publishSiteWatchState();
++    }, 2500);
++    return () => {
++      video.removeEventListener("play", onLocalControl);
++      video.removeEventListener("pause", onLocalControl);
++      video.removeEventListener("seeked", onLocalControl);
++      window.clearInterval(timer);
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [siteWatchSession?.id]);
++
+   useEffect(() => {
+     if (siteCommentCooldownUntil <= Date.now()) {
+       setSiteCommentClock(Date.now());
+@@ -3538,7 +3743,19 @@ function App() {
+     window.open(siteEventUrl(event.id), "_blank", "noopener,noreferrer");
+   }
+ 
++  function openSitePreviewFrame(event: SiteEvent, frameIndex: number) {
++    const items = (event.assets?.frames || []).flatMap((frame, index) => frame?.url ? [{ src: frame.url, label: `${event.title} · кадр ${index + 1}` }] : []);
++    if (!items.length) return;
++    const targetUrl = event.assets?.frames?.[frameIndex]?.url || "";
++    const index = Math.max(0, items.findIndex((item) => item.src === targetUrl));
++    setSitePreviewOverlay({ items, index });
++  }
++
+   function closeSiteEvent() {
++    void leaveSiteWatchSession(siteWatchCurrentRef.current);
++    siteWatchCurrentRef.current = null;
++    setSiteWatchSession(null);
++    setSiteWatchSessions([]);
+     setSelectedSiteEvent(null);
+     const url = new URL(window.location.href);
+     if (url.searchParams.has("site_event")) {
+@@ -3547,6 +3764,139 @@ function App() {
+     }
+   }
+ 
++  async function loadSiteWatchSessions(eventId: string, signal?: AbortSignal) {
++    const res = await fetch(`${API}/api/v1/site/events/${eventId}/watch-sessions`, { cache: "no-store", signal });
++    if (!res.ok) throw new Error(await res.text());
++    const data = await res.json() as { items?: SiteWatchSession[] };
++    setSiteWatchSessions(data.items || []);
++  }
++
++  async function leaveSiteWatchSession(session: SiteWatchSession | null) {
++    if (!session) return;
++    try {
++      await fetch(`${API}/api/v1/site/watch-sessions/${session.id}/leave`, {
++        method: "POST",
++        credentials: "include",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ client_id: siteWatchClientIdRef.current }),
++        keepalive: true,
++      });
++    } catch {
++      // Session expiry is also handled server-side, so leaving is best-effort.
++    }
++  }
++
++  async function createSiteWatchSession(eventId = selectedSiteEvent?.id || "") {
++    if (!eventId) return;
++    const previous = siteWatchCurrentRef.current;
++    setSiteWatchBusyId("new");
++    setSiteWatchNotice("");
++    try {
++      if (previous) await leaveSiteWatchSession(previous);
++      const video = siteVideoRef.current;
++      const res = await fetch(`${API}/api/v1/site/events/${eventId}/watch-sessions`, {
++        method: "POST",
++        credentials: "include",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          client_id: siteWatchClientIdRef.current,
++          position_ms: Math.max(0, Math.round((video?.currentTime || 0) * 1000)),
++          is_playing: Boolean(video && !video.paused && !video.ended),
++        }),
++      });
++      const data = await res.json().catch(() => ({}));
++      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
++      const next = data.session as SiteWatchSession;
++      siteWatchCurrentRef.current = next;
++      siteWatchLastAppliedVersionRef.current = next.state_version || 0;
++      setSiteWatchSession(next);
++      await loadSiteWatchSessions(eventId);
++    } catch (error) {
++      setSiteWatchNotice(`Не удалось создать сессию: ${error instanceof Error ? error.message : String(error)}`);
++    } finally {
++      setSiteWatchBusyId(null);
++    }
++  }
++
++  async function joinSiteWatchSession(target: SiteWatchSession) {
++    if (siteWatchCurrentRef.current?.id === target.id) return;
++    setSiteWatchBusyId(target.id);
++    setSiteWatchNotice("");
++    try {
++      const previous = siteWatchCurrentRef.current;
++      if (previous) await leaveSiteWatchSession(previous);
++      const res = await fetch(`${API}/api/v1/site/watch-sessions/${target.id}/join`, {
++        method: "POST",
++        credentials: "include",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ client_id: siteWatchClientIdRef.current }),
++      });
++      const data = await res.json().catch(() => ({}));
++      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
++      const next = data.session as SiteWatchSession;
++      siteWatchCurrentRef.current = next;
++      siteWatchLastAppliedVersionRef.current = 0;
++      setSiteWatchSession(next);
++      if (selectedSiteEvent?.id) await loadSiteWatchSessions(selectedSiteEvent.id);
++    } catch (error) {
++      setSiteWatchNotice(`Не удалось присоединиться: ${error instanceof Error ? error.message : String(error)}`);
++    } finally {
++      setSiteWatchBusyId(null);
++    }
++  }
++
++  async function publishSiteWatchState() {
++    const session = siteWatchCurrentRef.current;
++    const video = siteVideoRef.current;
++    if (!session || !video || siteWatchApplyingRemoteRef.current || siteWatchPublishInFlightRef.current) return;
++    siteWatchPublishInFlightRef.current = true;
++    try {
++      const res = await fetch(`${API}/api/v1/site/watch-sessions/${session.id}/state`, {
++        method: "PUT",
++        credentials: "include",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          client_id: siteWatchClientIdRef.current,
++          position_ms: Math.max(0, Math.round(video.currentTime * 1000)),
++          is_playing: !video.paused && !video.ended,
++        }),
++      });
++      const data = await res.json().catch(() => ({}));
++      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
++      const next = data.session as SiteWatchSession;
++      siteWatchCurrentRef.current = next;
++      siteWatchLastAppliedVersionRef.current = Math.max(siteWatchLastAppliedVersionRef.current, next.state_version || 0);
++      setSiteWatchSession(next);
++    } catch (error) {
++      console.warn("watch session state publish failed", error);
++    } finally {
++      siteWatchPublishInFlightRef.current = false;
++    }
++  }
++
++  function applySiteWatchState(session: SiteWatchSession, serverNowUtc?: string | null) {
++    const video = siteVideoRef.current;
++    if (!video || siteWatchPublishInFlightRef.current) return;
++    const isNewVersion = session.state_version > siteWatchLastAppliedVersionRef.current;
++    if (isNewVersion) siteWatchLastAppliedVersionRef.current = session.state_version;
++    const serverNow = serverNowUtc ? Date.parse(serverNowUtc) : NaN;
++    const stateUpdated = session.state_updated_at ? Date.parse(session.state_updated_at) : NaN;
++    const elapsedMs = session.is_playing && Number.isFinite(serverNow) && Number.isFinite(stateUpdated)
++      ? Math.max(0, serverNow - stateUpdated)
++      : 0;
++    const targetSeconds = Math.max(0, (session.position_ms + elapsedMs) / 1000);
++    const drift = Math.abs(video.currentTime - targetSeconds);
++    if (!isNewVersion && drift < 1.25 && session.is_playing === (!video.paused && !video.ended)) return;
++    siteWatchApplyingRemoteRef.current = true;
++    if (drift > (isNewVersion ? 0.75 : 1.25) && Number.isFinite(targetSeconds)) video.currentTime = targetSeconds;
++    if (session.is_playing) {
++      if (video.paused || video.ended) void video.play().catch(() => undefined);
++    } else if (!video.paused) {
++      video.pause();
++    }
++    window.setTimeout(() => { siteWatchApplyingRemoteRef.current = false; }, 350);
++  }
++
+   function updateSiteCoverMotion(event: React.PointerEvent<HTMLButtonElement>) {
+     const rect = event.currentTarget.getBoundingClientRect();
+     if (!rect.width || !rect.height) return;
+@@ -3663,6 +4013,7 @@ function App() {
+         reactions: data.reactions || {},
+         viewer_reaction: data.viewer_reaction || null,
+       } : item));
++      setSiteCommentReactionPickerId(null);
+     } catch (error) {
+       setSiteCommentNotice(error instanceof Error ? error.message : String(error));
+     } finally {
+@@ -4443,6 +4794,10 @@ function App() {
+   }
+   const siteRootComments = siteComments.filter((comment) => !comment.parent_comment_id || !siteCommentById.has(comment.parent_comment_id));
+ 
++  const sitePreviewOverlayItem = sitePreviewOverlay
++    ? sitePreviewOverlay.items[sitePreviewOverlay.index] || null
++    : null;
++
+   function renderSiteComment(comment: SiteUserComment, depth = 0): React.ReactNode {
+     const replies = siteCommentChildren.get(comment.id) || [];
+     return (
+@@ -4460,7 +4815,7 @@ function App() {
+             <p className={comment.is_underlined ? "is-underlined" : ""} style={{ color: comment.text_color || "#ff9b37" }}>{comment.body}</p>
+             <div className="streamvault-comment-footer">
+               <div className="streamvault-comment-reactions" aria-label="Реакции на комментарий">
+-                {SITE_COMMENT_REACTIONS.map((reaction) => {
++                {SITE_COMMENT_REACTIONS.filter((reaction) => Number(comment.reactions?.[reaction.key] || 0) > 0).map((reaction) => {
+                   const count = Number(comment.reactions?.[reaction.key] || 0);
+                   const selectedReaction = comment.viewer_reaction === reaction.key;
+                   return (
+@@ -4469,7 +4824,7 @@ function App() {
+                       type="button"
+                       className={selectedReaction ? "is-selected" : ""}
+                       aria-pressed={selectedReaction}
+-                      aria-label={`${reaction.label}${count ? `: ${count}` : ""}`}
++                      aria-label={`${reaction.label}: ${count}`}
+                       title={reaction.label}
+                       disabled={siteCommentReactionSending === comment.id}
+                       onClick={() => void toggleSiteCommentReaction(comment, reaction.key)}
+@@ -4478,10 +4833,42 @@ function App() {
+                         <span>{reaction.emoji}</span>
+                         <img src={reaction.image} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                       </span>
+-                      {count > 0 ? <span className="streamvault-comment-reaction-count">{count}</span> : null}
++                      <span className="streamvault-comment-reaction-count">{count}</span>
+                     </button>
+                   );
+                 })}
++                <div className="streamvault-comment-reaction-picker-wrap">
++                  <button
++                    type="button"
++                    className={`streamvault-comment-reaction-add${siteCommentReactionPickerId === comment.id ? " is-open" : ""}`}
++                    aria-label="Выбрать реакцию"
++                    aria-expanded={siteCommentReactionPickerId === comment.id}
++                    onClick={() => {
++                      if (!authUser) { setAuthModalOpen(true); return; }
++                      setSiteCommentReactionPickerId((current) => current === comment.id ? null : comment.id);
++                    }}
++                  >☺+</button>
++                  {siteCommentReactionPickerId === comment.id ? (
++                    <div className="streamvault-comment-reaction-picker" role="menu" aria-label="Выбор реакции">
++                      {SITE_COMMENT_REACTIONS.map((reaction) => (
++                        <button
++                          type="button"
++                          key={reaction.key}
++                          className={comment.viewer_reaction === reaction.key ? "is-selected" : ""}
++                          title={reaction.label}
++                          aria-label={reaction.label}
++                          disabled={siteCommentReactionSending === comment.id}
++                          onClick={() => void toggleSiteCommentReaction(comment, reaction.key)}
++                        >
++                          <span className="streamvault-comment-reaction-emoji" aria-hidden="true">
++                            <span>{reaction.emoji}</span>
++                            <img src={reaction.image} alt="" loading="lazy" referrerPolicy="no-referrer" />
++                          </span>
++                        </button>
++                      ))}
++                    </div>
++                  ) : null}
++                </div>
+               </div>
+               <button className="streamvault-comment-reply" type="button" onClick={() => replyToSiteComment(comment)}>Ответить</button>
+             </div>
+@@ -4529,6 +4916,16 @@ function App() {
+                 )}
+               </div>
+               <SiteEventTimecodes items={selectedSiteEvent.timecodes || []} videoRef={siteVideoRef} />
++              {selectedSiteEvent.playable ? (
++                <SiteWatchSessionsPanel
++                  sessions={siteWatchSessions}
++                  current={siteWatchSession}
++                  busyId={siteWatchBusyId}
++                  notice={siteWatchNotice}
++                  onJoin={(session) => void joinSiteWatchSession(session)}
++                  onCreate={() => void createSiteWatchSession()}
++                />
++              ) : null}
+               <section className="streamvault-watch-meta">
+                 <div className="streamvault-watch-title-row">
+                   <div>
+@@ -4670,16 +5067,33 @@ function App() {
+           onLogout={() => void logoutUser()}
+         />
+         {authModalOpen ? <AuthModal onClose={() => setAuthModalOpen(false)} onAuthenticated={setAuthUser} /> : null}
+-        {sitePreviewOverlay ? (
++        {sitePreviewOverlay && sitePreviewOverlayItem ? (
+           <div
+             className="streamvault-frame-overlay"
+             role="dialog"
+             aria-modal="true"
+-            aria-label={sitePreviewOverlay.label}
++            aria-label={sitePreviewOverlayItem.label}
+             onMouseDown={(event) => { if (event.currentTarget === event.target) setSitePreviewOverlay(null); }}
+           >
+             <button type="button" className="streamvault-frame-overlay-close" onClick={() => setSitePreviewOverlay(null)} aria-label="Закрыть просмотр кадра">×</button>
+-            <img src={apiUrl(sitePreviewOverlay.src)} alt={sitePreviewOverlay.label} />
++            {sitePreviewOverlay.items.length > 1 ? (
++              <button
++                type="button"
++                className="streamvault-frame-overlay-nav is-prev"
++                onClick={() => setSitePreviewOverlay((current) => current ? { ...current, index: (current.index - 1 + current.items.length) % current.items.length } : current)}
++                aria-label="Предыдущий кадр"
++              >←</button>
++            ) : null}
++            <img src={apiUrl(sitePreviewOverlayItem.src)} alt={sitePreviewOverlayItem.label} />
++            {sitePreviewOverlay.items.length > 1 ? (
++              <button
++                type="button"
++                className="streamvault-frame-overlay-nav is-next"
++                onClick={() => setSitePreviewOverlay((current) => current ? { ...current, index: (current.index + 1) % current.items.length } : current)}
++                aria-label="Следующий кадр"
++              >→</button>
++            ) : null}
++            <div className="streamvault-frame-overlay-counter">{sitePreviewOverlay.index + 1} / {sitePreviewOverlay.items.length}</div>
+           </div>
+         ) : null}
+ 
+@@ -4738,7 +5152,7 @@ function App() {
+                             key={frame}
+                             type="button"
+                             disabled={!src}
+-                            onClick={() => src && setSitePreviewOverlay({ src, label: `${latest.title} · кадр ${frame + 1}` })}
++                            onClick={() => src && openSitePreviewFrame(latest, frame)}
+                             aria-label={`Открыть кадр ${frame + 1}`}
+                           >
+                             <SiteArtwork event={latest} wide label={`#${frame + 1}`} src={src} />
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index 94df82a..ad4f371 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -374,10 +374,10 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+   filter: drop-shadow(0 7px 13px rgba(0,0,0,.5)) drop-shadow(0 0 11px rgba(255,120,24,.24));
+ }
+ .streamvault-brand-mark.is-animating .streamvault-brand-tilt {
+-  animation: streamvault-logo-tilt 2.04s linear both;
++  animation: streamvault-logo-tilt 1.5s linear both;
+ }
+ .streamvault-brand-mark.is-animating .streamvault-brand-scale {
+-  animation: streamvault-logo-scale 2.04s linear both;
++  animation: streamvault-logo-scale 1.5s linear both;
+ }
+ .streamvault-brand-copy {
+   display: inline-flex;
+@@ -402,20 +402,23 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ }
+ @keyframes streamvault-logo-tilt {
+   0% { transform: rotate(0deg); }
+-  2.4% { transform: rotate(-6deg); }
+-  4.8% { transform: rotate(5deg); }
+-  6.86% { transform: rotate(-18deg); }
+-  41.18% { transform: rotate(-18deg); }
+-  53.43% { transform: rotate(8deg); }
+-  87.75% { transform: rotate(8deg); }
++  2% { transform: rotate(-7deg); }
++  4% { transform: rotate(7deg); }
++  6% { transform: rotate(-6deg); }
++  8% { transform: rotate(5deg); }
++  10% { transform: rotate(-4deg); }
++  12% { transform: rotate(0deg); }
++  14% { transform: rotate(-18deg); }
++  42% { transform: rotate(-18deg); }
++  54% { transform: rotate(8deg); }
++  88% { transform: rotate(8deg); }
+   100% { transform: rotate(0deg); }
+ }
+ @keyframes streamvault-logo-scale {
+-  0% { transform: scale(1); animation-timing-function: ease-out; }
+-  6.86% { transform: scale(1); animation-timing-function: cubic-bezier(.17,.67,.24,1); }
+-  41.18% { transform: scale(1.5); animation-timing-function: cubic-bezier(.2,.8,.25,1); }
+-  53.43% { transform: scale(1); animation-timing-function: cubic-bezier(.17,.67,.24,1); }
+-  87.75% { transform: scale(1.5); animation-timing-function: cubic-bezier(.2,.8,.25,1); }
++  0%, 12% { transform: scale(1); animation-timing-function: cubic-bezier(.17,.67,.24,1); }
++  42% { transform: scale(1.5); animation-timing-function: cubic-bezier(.2,.8,.25,1); }
++  54% { transform: scale(1); animation-timing-function: cubic-bezier(.17,.67,.24,1); }
++  88% { transform: scale(1.5); animation-timing-function: cubic-bezier(.2,.8,.25,1); }
+   100% { transform: scale(1); }
+ }
+ @media (prefers-reduced-motion: reduce) {
+@@ -1176,3 +1179,107 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ @media (max-width: 900px) {
+   .streamvault-header-actions .streamvault-header-button.primary { display: inline-flex; align-items: center; }
+ }
++
++/* frame lightbox navigation */
++.streamvault-frame-overlay-nav {
++  position: fixed;
++  z-index: 221;
++  top: 50%;
++  width: 52px;
++  height: 64px;
++  display: grid;
++  place-items: center;
++  padding: 0;
++  transform: translateY(-50%);
++  border: 1px solid #4b565f;
++  border-radius: 13px;
++  background: rgba(13,18,22,.9);
++  color: #f2f4f6;
++  font-size: 30px;
++  line-height: 1;
++  cursor: pointer;
++  backdrop-filter: blur(8px);
++}
++.streamvault-frame-overlay-nav.is-prev { left: 22px; }
++.streamvault-frame-overlay-nav.is-next { right: 22px; }
++.streamvault-frame-overlay-nav:hover { border-color: var(--sv-orange); color: var(--sv-orange-2); }
++.streamvault-frame-overlay-counter {
++  position: fixed;
++  z-index: 221;
++  left: 50%;
++  bottom: 18px;
++  transform: translateX(-50%);
++  padding: 5px 9px;
++  border: 1px solid #394650;
++  border-radius: 999px;
++  background: rgba(13,18,22,.88);
++  color: #a9b3bc;
++  font-size: 10px;
++  font-weight: 800;
++  font-variant-numeric: tabular-nums;
++}
++
++/* compact reaction picker */
++.streamvault-comment-reaction-picker-wrap { position: relative; }
++.streamvault-comment-reaction-add { min-width: 32px !important; padding: 2px 7px !important; color: #7c8790 !important; font-size: 12px; font-weight: 900; }
++.streamvault-comment-reaction-add.is-open { border-color: rgba(255,155,55,.5) !important; color: var(--sv-orange-2) !important; background: rgba(255,120,24,.1) !important; }
++.streamvault-comment-reaction-picker {
++  position: absolute;
++  z-index: 24;
++  left: 0;
++  bottom: calc(100% + 7px);
++  display: grid;
++  grid-template-columns: repeat(4, 34px);
++  gap: 4px;
++  padding: 7px;
++  border: 1px solid #303b44;
++  border-radius: 11px;
++  background: rgba(13,18,22,.98);
++  box-shadow: 0 16px 45px rgba(0,0,0,.55);
++}
++.streamvault-comment-reaction-picker button { width: 34px; min-width: 34px; height: 34px; padding: 5px; }
++
++/* synchronized watch rooms */
++.streamvault-watch-sessions {
++  margin-top: 14px;
++  padding: 13px;
++  border: 1px solid var(--sv-line-soft);
++  border-radius: 13px;
++  background: rgba(15,21,27,.72);
++}
++.streamvault-watch-sessions-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
++.streamvault-watch-sessions-head > div { display: grid; gap: 2px; }
++.streamvault-watch-sessions-head strong { color: #e7edf1; font-size: 13px; }
++.streamvault-watch-sessions-head span { color: #6f7a84; font-size: 9px; }
++.streamvault-watch-sessions-head > button { border-color: #3b4751; background: #11171d; color: #cbd3da; font-size: 10px; font-weight: 800; }
++.streamvault-watch-sessions-head > button:hover:not(:disabled) { border-color: var(--sv-orange); color: var(--sv-orange-2); }
++.streamvault-watch-sessions-notice { margin-top: 9px; color: #d9a16c; font-size: 10px; }
++.streamvault-watch-sessions-list { display: grid; gap: 6px; margin-top: 10px; }
++.streamvault-watch-sessions-list > button {
++  width: 100%;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++  padding: 9px 10px;
++  border: 1px solid #26313a;
++  border-radius: 9px;
++  background: #10161b;
++  color: #cbd3da;
++  text-align: left;
++}
++.streamvault-watch-sessions-list > button:hover:not(:disabled) { border-color: #465461; background: #131b21; }
++.streamvault-watch-sessions-list > button.is-current { border-color: rgba(255,120,24,.52); background: rgba(255,120,24,.075); }
++.streamvault-watch-session-main { min-width: 0; display: grid; gap: 2px; }
++.streamvault-watch-session-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e6ebef; font-size: 11px; }
++.streamvault-watch-session-main small { color: #6f7a84; font-size: 9px; font-variant-numeric: tabular-nums; }
++.streamvault-watch-session-action { flex: 0 0 auto; color: var(--sv-orange-2); font-size: 9px; font-weight: 850; }
++.streamvault-watch-sessions-empty { padding: 9px 2px 2px; color: #65717b; font-size: 10px; }
++
++@media (max-width: 700px) {
++  .streamvault-frame-overlay { padding: 56px 12px 70px; }
++  .streamvault-frame-overlay-nav { width: 42px; height: 52px; font-size: 24px; }
++  .streamvault-frame-overlay-nav.is-prev { left: 8px; }
++  .streamvault-frame-overlay-nav.is-next { right: 8px; }
++  .streamvault-watch-sessions-head { align-items: flex-start; flex-direction: column; }
++}
+diff --git a/migrations/versions/0020_site_watch_sessions.py b/migrations/versions/0020_site_watch_sessions.py
+new file mode 100644
+index 0000000..6964760
+--- /dev/null
++++ b/migrations/versions/0020_site_watch_sessions.py
+@@ -0,0 +1,80 @@
++"""site watch sessions
++
++Revision ID: 0020_site_watch_sessions
++Revises: 0019_comment_threads_reactions
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0020_site_watch_sessions"
++down_revision = "0019_comment_threads_reactions"
++branch_labels = None
++depends_on = None
++
++DT = mysql.DATETIME(fsp=6)
++UUID = mysql.BINARY(16)
++
++
++def _inspect():
++    return sa.inspect(op.get_bind())
++
++
++def _table_exists(name: str) -> bool:
++    return name in _inspect().get_table_names()
++
++
++def upgrade() -> None:
++    if not _table_exists("site_watch_sessions"):
++        op.create_table(
++            "site_watch_sessions",
++            sa.Column("id", UUID, nullable=False),
++            sa.Column("event_id", UUID, nullable=False),
++            sa.Column("owner_user_id", UUID, nullable=True),
++            sa.Column("owner_client_id", sa.String(length=64), nullable=False),
++            sa.Column("owner_label", sa.String(length=64), nullable=False),
++            sa.Column("position_ms", sa.BigInteger(), nullable=False, server_default="0"),
++            sa.Column("is_playing", sa.Boolean(), nullable=False, server_default=sa.false()),
++            sa.Column("state_version", sa.BigInteger(), nullable=False, server_default="0"),
++            sa.Column("state_updated_at", DT, nullable=False),
++            sa.Column("last_activity_at", DT, nullable=False),
++            sa.Column("closed_at", DT, nullable=True),
++            sa.Column("created_at", DT, nullable=False),
++            sa.ForeignKeyConstraint(["event_id"], ["media_events.id"], ondelete="CASCADE"),
++            sa.ForeignKeyConstraint(["owner_user_id"], ["users.id"], ondelete="SET NULL"),
++            sa.PrimaryKeyConstraint("id"),
++        )
++        op.create_index("ix_site_watch_sessions_event_id", "site_watch_sessions", ["event_id"])
++        op.create_index("ix_site_watch_sessions_owner_user_id", "site_watch_sessions", ["owner_user_id"])
++        op.create_index("ix_site_watch_sessions_last_activity_at", "site_watch_sessions", ["last_activity_at"])
++        op.create_index("ix_site_watch_sessions_closed_at", "site_watch_sessions", ["closed_at"])
++        op.create_index("ix_site_watch_sessions_event_activity", "site_watch_sessions", ["event_id", "last_activity_at"])
++
++    if not _table_exists("site_watch_participants"):
++        op.create_table(
++            "site_watch_participants",
++            sa.Column("id", UUID, nullable=False),
++            sa.Column("session_id", UUID, nullable=False),
++            sa.Column("user_id", UUID, nullable=True),
++            sa.Column("client_id", sa.String(length=64), nullable=False),
++            sa.Column("display_name", sa.String(length=64), nullable=False),
++            sa.Column("joined_at", DT, nullable=False),
++            sa.Column("last_seen_at", DT, nullable=False),
++            sa.ForeignKeyConstraint(["session_id"], ["site_watch_sessions.id"], ondelete="CASCADE"),
++            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="SET NULL"),
++            sa.PrimaryKeyConstraint("id"),
++            sa.UniqueConstraint("session_id", "client_id", name="uq_site_watch_participants_session_client"),
++        )
++        op.create_index("ix_site_watch_participants_session_id", "site_watch_participants", ["session_id"])
++        op.create_index("ix_site_watch_participants_user_id", "site_watch_participants", ["user_id"])
++        op.create_index("ix_site_watch_participants_last_seen_at", "site_watch_participants", ["last_seen_at"])
++        op.create_index("ix_site_watch_participants_session_seen", "site_watch_participants", ["session_id", "last_seen_at"])
++
++
++def downgrade() -> None:
++    if _table_exists("site_watch_participants"):
++        op.drop_table("site_watch_participants")
++    if _table_exists("site_watch_sessions"):
++        op.drop_table("site_watch_sessions")
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index e06766d..1c7afac 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -634,6 +634,50 @@ class UserTwitchRegistration(Base):
+     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+ 
+ 
++class SiteWatchSession(Base):
++    __tablename__ = "site_watch_sessions"
++    __table_args__ = (
++        Index("ix_site_watch_sessions_event_activity", "event_id", "last_activity_at"),
++    )
++
++    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
++    event_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), nullable=False, index=True
++    )
++    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
++        UUIDBinary(), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
++    )
++    owner_client_id: Mapped[str] = mapped_column(String(64), nullable=False)
++    owner_label: Mapped[str] = mapped_column(String(64), nullable=False)
++    position_ms: Mapped[int] = mapped_column(BigInteger, default=0)
++    is_playing: Mapped[bool] = mapped_column(Boolean, default=False)
++    state_version: Mapped[int] = mapped_column(BigInteger, default=0)
++    state_updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    last_activity_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
++    closed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++
++
++class SiteWatchParticipant(Base):
++    __tablename__ = "site_watch_participants"
++    __table_args__ = (
++        Index("ix_site_watch_participants_session_seen", "session_id", "last_seen_at"),
++        UniqueConstraint("session_id", "client_id", name="uq_site_watch_participants_session_client"),
++    )
++
++    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
++    session_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("site_watch_sessions.id", ondelete="CASCADE"), nullable=False, index=True
++    )
++    user_id: Mapped[uuid.UUID | None] = mapped_column(
++        UUIDBinary(), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
++    )
++    client_id: Mapped[str] = mapped_column(String(64), nullable=False)
++    display_name: Mapped[str] = mapped_column(String(64), nullable=False)
++    joined_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    last_seen_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
++
++
+ class SiteComment(Base):
+     __tablename__ = "site_comments"
+     __table_args__ = (

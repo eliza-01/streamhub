@@ -1,0 +1,946 @@
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+index 7082621..dcb91ce 100644
+--- a/apps/api/app/routers/site.py
++++ b/apps/api/app/routers/site.py
+@@ -2,12 +2,13 @@ from __future__ import annotations
+ 
+ import re
+ import uuid
++from typing import Literal
+ 
+ import httpx
+ from collections import defaultdict
+ from datetime import UTC, datetime, timedelta
+ 
+-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
++from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+ from fastapi.responses import FileResponse
+ from pydantic import BaseModel, Field
+ from sqlalchemy import and_, delete, func, or_, select
+@@ -25,6 +26,7 @@ from streamhub_common.models import (
+     SiteEventAsset,
+     SiteEventPublication,
+     SiteComment,
++    SiteCommentReaction,
+     SiteEventTimecode,
+     TelegramVideoPartBinding,
+     VideoPart,
+@@ -35,7 +37,7 @@ from streamhub_common.models import (
+     User,
+ )
+ 
+-from .user_auth import require_current_user
++from .user_auth import optional_current_user, require_current_user
+ 
+ from ..site_assets import (
+     SITE_ASSET_SLOTS,
+@@ -81,6 +83,15 @@ class SiteTimecodesRequest(BaseModel):
+ class SiteCommentCreateRequest(BaseModel):
+     body: str = Field(min_length=1, max_length=4000)
+     text_color: str = Field(default="#ff9b37", min_length=7, max_length=7)
++    is_underlined: bool = False
++    parent_comment_id: int | None = Field(default=None, ge=1)
++
++
++SiteCommentReactionName = Literal["like", "dislike", "heart", "broken_heart", "fire", "cry", "laugh", "poop"]
++
++
++class SiteCommentReactionRequest(BaseModel):
++    reaction: SiteCommentReactionName
+ 
+ 
+ def _event_title(event: MediaEvent) -> str:
+@@ -540,7 +551,13 @@ async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
+     return (await _site_payloads(db, [row], include_timecodes=True))[0]
+ 
+ 
+-def _site_comment_payload(comment: SiteComment, user: User) -> dict:
++def _site_comment_payload(
++    comment: SiteComment,
++    user: User,
++    *,
++    reactions: dict[str, int] | None = None,
++    viewer_reaction: str | None = None,
++) -> dict:
+     avatar_url = None
+     if user.avatar_path:
+         version = int(user.updated_at.timestamp()) if user.updated_at else 0
+@@ -548,9 +565,13 @@ def _site_comment_payload(comment: SiteComment, user: User) -> dict:
+     return {
+         "id": int(comment.id),
+         "event_id": str(comment.event_id),
++        "parent_comment_id": int(comment.parent_comment_id) if comment.parent_comment_id is not None else None,
+         "body": comment.body,
+         "text_color": comment.text_color or "#ff9b37",
++        "is_underlined": bool(comment.is_underlined),
+         "created_at": comment.created_at.isoformat() if comment.created_at else None,
++        "reactions": reactions or {},
++        "viewer_reaction": viewer_reaction,
+         "user": {
+             "id": str(user.id),
+             "nickname": user.nickname,
+@@ -560,10 +581,43 @@ def _site_comment_payload(comment: SiteComment, user: User) -> dict:
+     }
+ 
+ 
++async def _comment_reaction_state(
++    db: AsyncSession,
++    comment_ids: list[int],
++    viewer_user_id: uuid.UUID | None,
++) -> tuple[dict[int, dict[str, int]], dict[int, str]]:
++    if not comment_ids:
++        return {}, {}
++    count_rows = (
++        await db.execute(
++            select(SiteCommentReaction.comment_id, SiteCommentReaction.reaction, func.count())
++            .where(SiteCommentReaction.comment_id.in_(comment_ids))
++            .group_by(SiteCommentReaction.comment_id, SiteCommentReaction.reaction)
++        )
++    ).all()
++    counts: dict[int, dict[str, int]] = defaultdict(dict)
++    for comment_id, reaction, count in count_rows:
++        counts[int(comment_id)][str(reaction)] = int(count)
++
++    viewer: dict[int, str] = {}
++    if viewer_user_id is not None:
++        viewer_rows = (
++            await db.execute(
++                select(SiteCommentReaction.comment_id, SiteCommentReaction.reaction).where(
++                    SiteCommentReaction.comment_id.in_(comment_ids),
++                    SiteCommentReaction.user_id == viewer_user_id,
++                )
++            )
++        ).all()
++        viewer = {int(comment_id): str(reaction) for comment_id, reaction in viewer_rows}
++    return counts, viewer
++
++
+ @router.get("/events/{event_id}/comments")
+ async def site_event_comments(
+     event_id: uuid.UUID,
+     page_size: int = Query(default=100, ge=1, le=200),
++    viewer: User | None = Depends(optional_current_user),
+     db: AsyncSession = Depends(get_db),
+ ) -> dict:
+     await _require_public_event(db, event_id)
+@@ -576,9 +630,19 @@ async def site_event_comments(
+             .limit(page_size)
+         )
+     ).all()
++    comment_ids = [int(comment.id) for comment, _user in rows]
++    counts, viewer_reactions = await _comment_reaction_state(db, comment_ids, viewer.id if viewer else None)
+     return {
+         "event_id": str(event_id),
+-        "items": [_site_comment_payload(comment, user) for comment, user in rows],
++        "items": [
++            _site_comment_payload(
++                comment,
++                user,
++                reactions=counts.get(int(comment.id), {}),
++                viewer_reaction=viewer_reactions.get(int(comment.id)),
++            )
++            for comment, user in rows
++        ],
+     }
+ 
+ 
+@@ -597,6 +661,12 @@ async def create_site_event_comment(
+     if not _COMMENT_COLOR_RE.fullmatch(text_color):
+         raise HTTPException(400, "Некорректный цвет комментария")
+ 
++    parent_comment_id = payload.parent_comment_id
++    if parent_comment_id is not None:
++        parent = await db.get(SiteComment, parent_comment_id)
++        if not parent or parent.event_id != event_id:
++            raise HTTPException(400, "Комментарий для ответа не найден")
++
+     now = datetime.utcnow()
+     # Serialize comment creation per user so concurrent clicks/tabs cannot bypass the 60s limit.
+     await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+@@ -621,7 +691,15 @@ async def create_site_event_comment(
+                 headers={"Retry-After": str(retry_after)},
+             )
+ 
+-    comment = SiteComment(event_id=event_id, user_id=user.id, body=body, text_color=text_color, created_at=now)
++    comment = SiteComment(
++        event_id=event_id,
++        user_id=user.id,
++        parent_comment_id=parent_comment_id,
++        body=body,
++        text_color=text_color,
++        is_underlined=bool(payload.is_underlined),
++        created_at=now,
++    )
+     db.add(comment)
+     await db.commit()
+     await db.refresh(comment)
+@@ -632,6 +710,47 @@ async def create_site_event_comment(
+     }
+ 
+ 
++@router.post("/comments/{comment_id}/reaction")
++async def toggle_site_comment_reaction(
++    comment_id: int,
++    payload: SiteCommentReactionRequest,
++    user: User = Depends(require_current_user),
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    comment = await db.get(SiteComment, comment_id)
++    if not comment:
++        raise HTTPException(404, "Комментарий не найден")
++    await _require_public_event(db, comment.event_id)
++
++    existing = await db.get(SiteCommentReaction, {"comment_id": comment_id, "user_id": user.id})
++    viewer_reaction: str | None
++    if existing and existing.reaction == payload.reaction:
++        await db.delete(existing)
++        viewer_reaction = None
++    elif existing:
++        existing.reaction = payload.reaction
++        existing.updated_at = datetime.utcnow()
++        viewer_reaction = payload.reaction
++    else:
++        db.add(
++            SiteCommentReaction(
++                comment_id=comment_id,
++                user_id=user.id,
++                reaction=payload.reaction,
++                created_at=datetime.utcnow(),
++                updated_at=datetime.utcnow(),
++            )
++        )
++        viewer_reaction = payload.reaction
++    await db.commit()
++    counts, _viewer = await _comment_reaction_state(db, [comment_id], user.id)
++    return {
++        "comment_id": comment_id,
++        "reactions": counts.get(comment_id, {}),
++        "viewer_reaction": viewer_reaction,
++    }
++
++
+ def _naive_utc(value: datetime | None) -> datetime | None:
+     if value is None:
+         return None
+diff --git a/apps/api/app/routers/user_auth.py b/apps/api/app/routers/user_auth.py
+index 1b562a7..46130fd 100644
+--- a/apps/api/app/routers/user_auth.py
++++ b/apps/api/app/routers/user_auth.py
+@@ -210,6 +210,17 @@ async def require_current_user(request: Request, db: AsyncSession = Depends(get_
+     return await _load_user(db, user_id)
+ 
+ 
++async def optional_current_user(request: Request, db: AsyncSession = Depends(get_db)) -> User | None:
++    token = request.cookies.get(settings.auth_access_cookie_name)
++    if not token:
++        return None
++    try:
++        user_id = _decode_token(token, "access")
++        return await _load_user(db, user_id)
++    except HTTPException:
++        return None
++
++
+ def _require_internal_token(value: str | None) -> None:
+     expected = settings.internal_service_token.encode("utf-8")
+     actual = (value or "").encode("utf-8")
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 6ac8089..59f5d3d 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -429,12 +429,18 @@ type SiteEvent = {
+   playable: boolean;
+ };
+ 
++type SiteCommentReactionName = "like" | "dislike" | "heart" | "broken_heart" | "fire" | "cry" | "laugh" | "poop";
++
+ type SiteUserComment = {
+   id: number;
+   event_id: string;
++  parent_comment_id?: number | null;
+   body: string;
+   text_color?: string | null;
++  is_underlined?: boolean;
+   created_at: string;
++  reactions?: Partial<Record<SiteCommentReactionName, number>>;
++  viewer_reaction?: SiteCommentReactionName | null;
+   user: {
+     id: string;
+     nickname: string;
+@@ -676,6 +682,16 @@ const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
+ const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
+ const EVENT_TITLE_MODE_KEY = "streamhub.events.titleMode";
+ const SITE_COMMENT_COLOR_KEY = "streamhub.site.commentColor";
++const SITE_COMMENT_REACTIONS: Array<{ key: SiteCommentReactionName; label: string; emoji: string; image: string }> = [
++  { key: "like", label: "Нравится", emoji: "👍", image: "https://em-content.zobj.net/source/apple/419/thumbs-up_1f44d.png" },
++  { key: "dislike", label: "Не нравится", emoji: "👎", image: "https://em-content.zobj.net/source/apple/419/thumbs-down_1f44e.png" },
++  { key: "heart", label: "Сердце", emoji: "❤️", image: "https://em-content.zobj.net/source/apple/419/red-heart_2764-fe0f.png" },
++  { key: "broken_heart", label: "Разбитое сердце", emoji: "💔", image: "https://em-content.zobj.net/source/apple/419/broken-heart_1f494.png" },
++  { key: "fire", label: "Огонь", emoji: "🔥", image: "https://em-content.zobj.net/source/apple/419/fire_1f525.png" },
++  { key: "cry", label: "Рыдаю", emoji: "😭", image: "https://em-content.zobj.net/source/apple/419/loudly-crying-face_1f62d.png" },
++  { key: "laugh", label: "Смешно", emoji: "😂", image: "https://em-content.zobj.net/source/apple/419/face-with-tears-of-joy_1f602.png" },
++  { key: "poop", label: "Какашка", emoji: "💩", image: "https://em-content.zobj.net/source/apple/419/pile-of-poo_1f4a9.png" },
++];
+ type EventTitleMode = "display" | "source";
+ 
+ function storedSiteCommentColor() {
+@@ -2562,12 +2578,14 @@ function AuthModal({
+   );
+ }
+ 
+-function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
++function SiteHeroPreviewVideo({ event, onActivate }: { event: SiteEvent; onActivate?: () => void }) {
+   const videoRef = useRef<HTMLVideoElement | null>(null);
+-  const reverseTimerRef = useRef<number | null>(null);
+-  const directionRef = useRef<"forward" | "reverse">("forward");
++  const fadeTimerRef = useRef<number | null>(null);
++  const restartTimerRef = useRef<number | null>(null);
++  const restartingRef = useRef(false);
+   const [loading, setLoading] = useState(true);
+   const [failed, setFailed] = useState(false);
++  const [restarting, setRestarting] = useState(false);
+ 
+   useEffect(() => {
+     const video = videoRef.current;
+@@ -2583,18 +2601,18 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
+     let previewEnd = 10;
+     setLoading(true);
+     setFailed(false);
+-    directionRef.current = "forward";
+-
+-    const stopReverse = () => {
+-      if (reverseTimerRef.current == null) return;
+-      window.clearInterval(reverseTimerRef.current);
+-      reverseTimerRef.current = null;
++    restartingRef.current = false;
++    setRestarting(false);
++
++    const clearRestartTimers = () => {
++      if (fadeTimerRef.current != null) window.clearTimeout(fadeTimerRef.current);
++      if (restartTimerRef.current != null) window.clearTimeout(restartTimerRef.current);
++      fadeTimerRef.current = null;
++      restartTimerRef.current = null;
+     };
+ 
+     const playForward = async () => {
+       if (disposed) return;
+-      stopReverse();
+-      directionRef.current = "forward";
+       video.muted = true;
+       video.defaultMuted = true;
+       video.playbackRate = 1;
+@@ -2605,21 +2623,23 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
+       }
+     };
+ 
+-    const startReverse = () => {
+-      if (disposed || directionRef.current === "reverse") return;
+-      directionRef.current = "reverse";
++    const restartPreview = () => {
++      if (disposed || restartingRef.current) return;
++      restartingRef.current = true;
++      clearRestartTimers();
+       video.pause();
+-      stopReverse();
+-      reverseTimerRef.current = window.setInterval(() => {
+-        if (disposed || directionRef.current !== "reverse" || video.seeking) return;
+-        const next = Math.max(0, video.currentTime - 0.08);
+-        video.currentTime = next;
+-        if (next <= 0.04) {
+-          stopReverse();
+-          video.currentTime = 0;
+-          void playForward();
+-        }
+-      }, 80);
++      setRestarting(true);
++      fadeTimerRef.current = window.setTimeout(() => {
++        if (disposed) return;
++        video.currentTime = 0;
++        void playForward();
++        restartTimerRef.current = window.setTimeout(() => {
++          if (!disposed) {
++            restartingRef.current = false;
++            setRestarting(false);
++          }
++        }, 250);
++      }, 250);
+     };
+ 
+     const refreshPreviewEnd = () => {
+@@ -2634,20 +2654,19 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
+     };
+     const onCanPlay = () => {
+       setLoading(false);
+-      if (directionRef.current === "forward" && video.paused) void playForward();
++      if (!restartingRef.current && video.paused) void playForward();
+     };
+     const onTimeUpdate = () => {
+-      if (directionRef.current !== "forward") return;
+-      if (video.currentTime >= previewEnd - 0.05) {
+-        video.currentTime = previewEnd;
+-        startReverse();
+-      }
++      if (restartingRef.current) return;
++      if (video.currentTime >= previewEnd - 0.05) restartPreview();
+     };
+-    const onEnded = () => startReverse();
++    const onEnded = () => restartPreview();
+     const onError = () => {
+-      stopReverse();
++      clearRestartTimers();
+       setLoading(false);
+       setFailed(true);
++      restartingRef.current = false;
++      setRestarting(false);
+     };
+ 
+     video.addEventListener("loadedmetadata", onLoadedMetadata);
+@@ -2677,7 +2696,7 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
+ 
+     return () => {
+       disposed = true;
+-      stopReverse();
++      clearRestartTimers();
+       video.pause();
+       video.removeEventListener("loadedmetadata", onLoadedMetadata);
+       video.removeEventListener("loadeddata", onCanPlay);
+@@ -2692,13 +2711,34 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
+   }, [event.id, event.playable, event.playback_url]);
+ 
+   return (
+-    <div className="streamvault-preview-main" aria-label="Первые 10 секунд записи, воспроизведение вперёд и назад">
++    <div
++      className="streamvault-preview-main"
++      role={onActivate ? "link" : undefined}
++      tabIndex={onActivate ? 0 : undefined}
++      aria-label={onActivate ? `Открыть ${event.title}` : "Первые 10 секунд записи"}
++      onClick={onActivate}
++      onKeyDown={onActivate ? (keyEvent) => {
++        if (keyEvent.key === "Enter" || keyEvent.key === " ") {
++          keyEvent.preventDefault();
++          onActivate();
++        }
++      } : undefined}
++    >
+       {failed ? (
+         <SiteArtwork event={event} wide label="VIDEO PREVIEW" src={event.assets?.frames?.[0]?.url} />
+       ) : (
+         <video ref={videoRef} muted playsInline preload="auto" aria-hidden="true" />
+       )}
+-      {loading && !failed ? <span className="streamvault-preview-loading">Загрузка первых 10 сек…</span> : null}
++      {loading && !failed ? (
++        <div className="streamvault-video-loading" role="status" aria-live="polite" aria-label="Видео загружается">
++          <div className="streamvault-video-loading-card">
++            <span className="streamvault-video-loading-spinner" aria-hidden="true" />
++            <strong>Загрузка видео…</strong>
++            <small>Подготавливаем воспроизведение</small>
++          </div>
++        </div>
++      ) : null}
++      <span className={`streamvault-preview-loop-fade${restarting ? " is-active" : ""}`} aria-hidden="true" />
+     </div>
+   );
+ }
+@@ -3095,6 +3135,9 @@ function App() {
+   const [sitePreviewOverlay, setSitePreviewOverlay] = useState<{ src: string; label: string } | null>(null);
+   const [siteCommentDraft, setSiteCommentDraft] = useState("");
+   const [siteCommentColor, setSiteCommentColor] = useState(storedSiteCommentColor);
++  const [siteCommentUnderlined, setSiteCommentUnderlined] = useState(false);
++  const [siteCommentReplyTo, setSiteCommentReplyTo] = useState<{ id: number; nickname: string; login: string } | null>(null);
++  const [siteCommentReactionSending, setSiteCommentReactionSending] = useState<number | null>(null);
+   const [siteCommentNotice, setSiteCommentNotice] = useState("");
+   const [siteComments, setSiteComments] = useState<SiteUserComment[]>([]);
+   const [siteCommentsLoading, setSiteCommentsLoading] = useState(false);
+@@ -3147,6 +3190,7 @@ function App() {
+       try {
+         const res = await fetch(`${API}/api/v1/site/events/${selectedSiteEvent.id}/comments?page_size=100`, {
+           cache: "no-store",
++          credentials: "include",
+           signal: controller.signal,
+         });
+         if (!res.ok) throw new Error(await res.text());
+@@ -3486,6 +3530,10 @@ function App() {
+     return url.toString();
+   }
+ 
++  function openSiteEvent(event: SiteEvent) {
++    window.location.assign(siteEventUrl(event.id));
++  }
++
+   function openSiteEventNewTab(event: SiteEvent) {
+     window.open(siteEventUrl(event.id), "_blank", "noopener,noreferrer");
+   }
+@@ -3549,7 +3597,12 @@ function App() {
+         method: "POST",
+         credentials: "include",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ body: siteCommentDraft.trim(), text_color: siteCommentColor }),
++        body: JSON.stringify({
++          body: siteCommentDraft.trim(),
++          text_color: siteCommentColor,
++          is_underlined: siteCommentUnderlined,
++          parent_comment_id: siteCommentReplyTo?.id || null,
++        }),
+       });
+       const data = await res.json().catch(() => ({}));
+       if (res.status === 429) {
+@@ -3563,6 +3616,8 @@ function App() {
+       if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+       if (data.comment) setSiteComments((current) => [data.comment as SiteUserComment, ...current]);
+       setSiteCommentDraft("");
++      setSiteCommentUnderlined(false);
++      setSiteCommentReplyTo(null);
+       const seconds = Math.max(1, Number(data.cooldown_seconds || 60));
+       setSiteCommentCooldownUntil(Date.now() + seconds * 1000);
+       setSiteCommentClock(Date.now());
+@@ -3574,6 +3629,47 @@ function App() {
+     }
+   }
+ 
++  function replyToSiteComment(comment: SiteUserComment) {
++    if (!authUser) {
++      setAuthModalOpen(true);
++      return;
++    }
++    setSiteCommentReplyTo({ id: comment.id, nickname: comment.user.nickname, login: comment.user.login });
++    setSiteCommentNotice("");
++    window.setTimeout(() => {
++      siteCommentRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
++      siteCommentRef.current?.focus();
++    }, 0);
++  }
++
++  async function toggleSiteCommentReaction(comment: SiteUserComment, reaction: SiteCommentReactionName) {
++    if (!authUser) {
++      setAuthModalOpen(true);
++      return;
++    }
++    if (siteCommentReactionSending === comment.id) return;
++    setSiteCommentReactionSending(comment.id);
++    try {
++      const res = await fetch(`${API}/api/v1/site/comments/${comment.id}/reaction`, {
++        method: "POST",
++        credentials: "include",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ reaction }),
++      });
++      const data = await res.json().catch(() => ({}));
++      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
++      setSiteComments((current) => current.map((item) => item.id === comment.id ? {
++        ...item,
++        reactions: data.reactions || {},
++        viewer_reaction: data.viewer_reaction || null,
++      } : item));
++    } catch (error) {
++      setSiteCommentNotice(error instanceof Error ? error.message : String(error));
++    } finally {
++      setSiteCommentReactionSending(null);
++    }
++  }
++
+   async function loadSiteAdminEvents() {
+     const res = await fetch(`${API}/api/v1/site/admin/events`, { cache: "no-store" });
+     if (!res.ok) throw new Error(await res.text());
+@@ -4334,6 +4430,72 @@ function App() {
+     [messages, position]
+   );
+ 
++  const siteCommentById = new Map(siteComments.map((comment) => [comment.id, comment]));
++  const siteCommentChildren = new Map<number, SiteUserComment[]>();
++  for (const comment of siteComments) {
++    if (!comment.parent_comment_id || !siteCommentById.has(comment.parent_comment_id)) continue;
++    const children = siteCommentChildren.get(comment.parent_comment_id) || [];
++    children.push(comment);
++    siteCommentChildren.set(comment.parent_comment_id, children);
++  }
++  for (const children of siteCommentChildren.values()) {
++    children.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime() || a.id - b.id);
++  }
++  const siteRootComments = siteComments.filter((comment) => !comment.parent_comment_id || !siteCommentById.has(comment.parent_comment_id));
++
++  function renderSiteComment(comment: SiteUserComment, depth = 0): React.ReactNode {
++    const replies = siteCommentChildren.get(comment.id) || [];
++    return (
++      <div className={`streamvault-comment-thread${depth ? " is-reply" : ""}`} key={comment.id}>
++        <article className="streamvault-comment-item">
++          <div className="streamvault-comment-avatar">
++            {comment.user.avatar_url ? <img src={apiUrl(comment.user.avatar_url)} alt="" loading="lazy" /> : comment.user.nickname.slice(0, 1).toUpperCase()}
++          </div>
++          <div className="streamvault-comment-item-body">
++            <div className="streamvault-comment-meta">
++              <strong>{comment.user.nickname}</strong>
++              <small>@{comment.user.login}</small>
++              <time dateTime={comment.created_at}>{new Date(comment.created_at).toLocaleString("ru-RU")}</time>
++            </div>
++            <p className={comment.is_underlined ? "is-underlined" : ""} style={{ color: comment.text_color || "#ff9b37" }}>{comment.body}</p>
++            <div className="streamvault-comment-footer">
++              <div className="streamvault-comment-reactions" aria-label="Реакции на комментарий">
++                {SITE_COMMENT_REACTIONS.map((reaction) => {
++                  const count = Number(comment.reactions?.[reaction.key] || 0);
++                  const selectedReaction = comment.viewer_reaction === reaction.key;
++                  return (
++                    <button
++                      key={reaction.key}
++                      type="button"
++                      className={selectedReaction ? "is-selected" : ""}
++                      aria-pressed={selectedReaction}
++                      aria-label={`${reaction.label}${count ? `: ${count}` : ""}`}
++                      title={reaction.label}
++                      disabled={siteCommentReactionSending === comment.id}
++                      onClick={() => void toggleSiteCommentReaction(comment, reaction.key)}
++                    >
++                      <span className="streamvault-comment-reaction-emoji" aria-hidden="true">
++                        <span>{reaction.emoji}</span>
++                        <img src={reaction.image} alt="" loading="lazy" referrerPolicy="no-referrer" />
++                      </span>
++                      {count > 0 ? <span className="streamvault-comment-reaction-count">{count}</span> : null}
++                    </button>
++                  );
++                })}
++              </div>
++              <button className="streamvault-comment-reply" type="button" onClick={() => replyToSiteComment(comment)}>Ответить</button>
++            </div>
++          </div>
++        </article>
++        {replies.length ? (
++          <div className="streamvault-comment-replies">
++            {replies.map((reply) => renderSiteComment(reply, depth + 1))}
++          </div>
++        ) : null}
++      </div>
++    );
++  }
++
+   if (selectedSiteEvent) {
+     const eventDate = selectedSiteEvent.source_started_at_utc
+       ? new Date(selectedSiteEvent.source_started_at_utc).toLocaleString("ru-RU")
+@@ -4400,13 +4562,20 @@ function App() {
+                       {authUser.avatar_url ? <img src={apiUrl(authUser.avatar_url)} alt="" /> : authUser.nickname.slice(0, 1).toUpperCase()}
+                     </div>
+                     <div>
++                      {siteCommentReplyTo ? (
++                        <div className="streamvault-comment-replying">
++                          <span>Ответ для <strong>{siteCommentReplyTo.nickname}</strong> <small>@{siteCommentReplyTo.login}</small></span>
++                          <button type="button" onClick={() => setSiteCommentReplyTo(null)} aria-label="Отменить ответ">×</button>
++                        </div>
++                      ) : null}
+                       <textarea
+                         ref={siteCommentRef}
+                         value={siteCommentDraft}
+                         onChange={(event) => { setSiteCommentDraft(event.target.value); setSiteCommentNotice(""); }}
+                         rows={3}
+                         maxLength={4000}
+-                        placeholder="Написать комментарий…"
++                        placeholder={siteCommentReplyTo ? `Ответить ${siteCommentReplyTo.nickname}…` : "Написать комментарий…"}
++                        className={siteCommentUnderlined ? "is-underlined" : ""}
+                         style={{ color: siteCommentColor }}
+                       />
+                       <div className="streamvault-comment-actions">
+@@ -4423,6 +4592,13 @@ function App() {
+                           />
+                           <span>Цвет</span>
+                         </label>
++                        <button
++                          type="button"
++                          className={`streamvault-comment-underline${siteCommentUnderlined ? " is-active" : ""}`}
++                          aria-pressed={siteCommentUnderlined}
++                          title="Подчеркнуть текст"
++                          onClick={() => setSiteCommentUnderlined((value) => !value)}
++                        ><span>U</span></button>
+                         <span>{Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000)) > 0
+                           ? `Следующий комментарий через ${Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000))} сек.`
+                           : siteCommentNotice}</span>
+@@ -4430,7 +4606,7 @@ function App() {
+                           type="button"
+                           disabled={!siteCommentDraft.trim() || siteCommentSending || Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000)) > 0}
+                           onClick={() => void submitSiteComment()}
+-                        >{siteCommentSending ? "Отправляем…" : "Отправить"}</button>
++                        >{siteCommentSending ? "Отправляем…" : siteCommentReplyTo ? "Ответить" : "Отправить"}</button>
+                       </div>
+                     </div>
+                   </div>
+@@ -4443,21 +4619,7 @@ function App() {
+                 <div className="streamvault-comment-list">
+                   {siteCommentsLoading ? <div className="streamvault-comment-empty">Загрузка комментариев…</div> : null}
+                   {!siteCommentsLoading && siteComments.length === 0 ? <div className="streamvault-comment-empty">Комментариев пока нет.</div> : null}
+-                  {siteComments.map((comment) => (
+-                    <article className="streamvault-comment-item" key={comment.id}>
+-                      <div className="streamvault-comment-avatar">
+-                        {comment.user.avatar_url ? <img src={apiUrl(comment.user.avatar_url)} alt="" loading="lazy" /> : comment.user.nickname.slice(0, 1).toUpperCase()}
+-                      </div>
+-                      <div className="streamvault-comment-item-body">
+-                        <div className="streamvault-comment-meta">
+-                          <strong>{comment.user.nickname}</strong>
+-                          <small>@{comment.user.login}</small>
+-                          <time dateTime={comment.created_at}>{new Date(comment.created_at).toLocaleString("ru-RU")}</time>
+-                        </div>
+-                        <p style={{ color: comment.text_color || "#ff9b37" }}>{comment.body}</p>
+-                      </div>
+-                    </article>
+-                  ))}
++                  {siteRootComments.map((comment) => renderSiteComment(comment))}
+                 </div>
+               </section>
+             </div>
+@@ -4567,6 +4729,7 @@ function App() {
+                     <SiteArtwork event={latest} label="COVER" src={latest.assets?.cover?.url} />
+                   </button>
+                   <div className="streamvault-preview-stage">
++                    <SiteHeroPreviewVideo event={latest} onActivate={() => openSiteEvent(latest)} />
+                     <div className="streamvault-preview-rail" aria-label="Четыре preview-кадра">
+                       {[0, 1, 2, 3].map((frame) => {
+                         const src = latest.assets?.frames?.[frame]?.url || null;
+@@ -4583,7 +4746,6 @@ function App() {
+                         );
+                       })}
+                     </div>
+-                    <SiteHeroPreviewVideo event={latest} />
+                   </div>
+                 </div>
+                 <div className="streamvault-latest-copy">
+diff --git a/apps/web/src/styles.css b/apps/web/src/styles.css
+index e9e004e..94df82a 100644
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -565,10 +565,12 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+   text-align: left;
+ }
+ .streamvault-latest-cover { min-height: 280px; height: 100%; overflow: hidden; border-radius: 14px; }
+-.streamvault-preview-stage { min-width: 0; display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 12px; }
+-.streamvault-preview-main { min-height: 280px; position: relative; overflow: hidden; border-radius: 14px; background: #050708; }
++.streamvault-preview-stage { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 170px; gap: 12px; }
++.streamvault-preview-main { min-height: 280px; position: relative; overflow: hidden; border-radius: 14px; background: #050708; cursor: pointer; outline: 0; }
++.streamvault-preview-main:focus-visible { box-shadow: 0 0 0 2px var(--sv-orange); }
+ .streamvault-preview-main > video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #050708; }
+-.streamvault-preview-loading { position: absolute; left: 12px; bottom: 12px; z-index: 2; padding: 5px 8px; border-radius: 999px; background: rgba(5,7,8,.76); color: #cbd3da; font-size: 10px; font-weight: 800; letter-spacing: .02em; backdrop-filter: blur(5px); }
++.streamvault-preview-loop-fade { position: absolute; inset: 0; z-index: 4; background: #000; opacity: 0; pointer-events: none; transition: opacity .25s ease; }
++.streamvault-preview-loop-fade.is-active { opacity: 1; }
+ .streamvault-preview-transition { position: absolute; inset: 0; animation: streamvault-preview-in .34s cubic-bezier(.2,.75,.2,1) both; }
+ @keyframes streamvault-preview-in {
+   from { opacity: .1; transform: translate3d(10px,0,0) scale(1.018); filter: saturate(.75); }
+@@ -705,7 +707,8 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-comment-composer { display: grid; grid-template-columns: 40px minmax(0,1fr); gap: 10px; margin-top: 15px; }
+ .streamvault-comment-avatar { width: 38px; height: 38px; overflow: hidden; border-radius: 50%; display: grid; place-items: center; background: #202a33; color: #dbe1e5; font-size: 11px; font-weight: 850; }
+ .streamvault-comment-avatar img { width: 100%; height: 100%; display: block; object-fit: cover; }
+-.streamvault-comment-composer textarea { width: 100%; min-height: 76px; resize: vertical; border: 1px solid var(--sv-line); border-radius: 11px; background: #11171d; color: var(--sv-orange-2); padding: 11px 12px; outline: 0; font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; }
++.streamvault-comment-composer textarea { width: 100%; min-height: 76px; resize: vertical; border: 1px solid var(--sv-line); border-radius: 11px; background: #11171d; color: var(--sv-orange-2); padding: 11px 12px; outline: 0; font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: none; }
++.streamvault-comment-composer textarea.is-underlined { text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+ .streamvault-comment-composer textarea:focus { border-color: #465461; }
+ .streamvault-comment-actions { min-height: 38px; display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 8px; }
+ .streamvault-comment-actions > span { margin-right: auto; color: #7d8790; font-size: 11px; }
+@@ -714,16 +717,38 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
+ .streamvault-comment-color input::-webkit-color-swatch-wrapper { padding: 2px; }
+ .streamvault-comment-color input::-webkit-color-swatch { border: 0; border-radius: 4px; }
+ .streamvault-comment-actions button { border: 1px solid var(--sv-orange); background: var(--sv-orange); color: #181008; font-weight: 800; }
++.streamvault-comment-underline { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border-color: #394650 !important; border-radius: 7px; background: #11171d !important; color: #cbd3da !important; }
++.streamvault-comment-underline span { text-decoration: underline; text-underline-offset: 2px; font-weight: 900; }
++.streamvault-comment-underline.is-active { border-color: var(--sv-orange) !important; color: var(--sv-orange-2) !important; background: rgba(255,120,24,.12) !important; }
++.streamvault-comment-replying { margin: 0 0 7px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px; border: 1px solid var(--sv-line-soft); border-radius: 8px; background: rgba(255,255,255,.025); color: #89949e; font-size: 10px; }
++.streamvault-comment-replying strong { color: #dce2e7; }
++.streamvault-comment-replying small { color: #68737d; }
++.streamvault-comment-replying button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; background: transparent; color: #7d8790; font-size: 18px; }
+ .streamvault-comment-login { min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 15px; padding: 10px 12px; border: 1px solid var(--sv-line-soft); border-radius: 11px; background: rgba(15,21,27,.62); color: #89949e; font-size: 11px; }
+ .streamvault-comment-login button { border-color: var(--sv-orange); background: transparent; color: var(--sv-orange-2); font-weight: 800; }
+ .streamvault-comment-list { display: grid; gap: 0; margin-top: 18px; border-top: 1px solid var(--sv-line-soft); }
++.streamvault-comment-thread { min-width: 0; }
++.streamvault-comment-thread.is-reply { margin-left: 38px; border-left: 1px solid #26313a; padding-left: 10px; }
+ .streamvault-comment-item { display: grid; grid-template-columns: 40px minmax(0,1fr); gap: 10px; padding: 14px 2px; border-bottom: 1px solid var(--sv-line-soft); }
+ .streamvault-comment-item-body { min-width: 0; }
+ .streamvault-comment-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+ .streamvault-comment-meta strong { color: #e6ebef; font-size: 12px; }
+ .streamvault-comment-meta small, .streamvault-comment-meta time { color: #68737d; font-size: 9px; }
+ .streamvault-comment-meta time { margin-left: auto; }
+-.streamvault-comment-item p { margin: 6px 0 0; color: var(--sv-orange-2); font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; overflow-wrap: anywhere; white-space: pre-wrap; }
++.streamvault-comment-item p { margin: 6px 0 0; color: var(--sv-orange-2); font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: none; overflow-wrap: anywhere; white-space: pre-wrap; }
++.streamvault-comment-item p.is-underlined { text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; }
++.streamvault-comment-footer { margin-top: 9px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
++.streamvault-comment-reactions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
++.streamvault-comment-reactions button { min-width: 29px; height: 27px; display: inline-flex; align-items: center; justify-content: center; gap: 3px; padding: 2px 5px; border: 1px solid transparent; border-radius: 999px; background: transparent; color: #7c8790; cursor: pointer; }
++.streamvault-comment-reactions button:hover { background: rgba(255,255,255,.045); border-color: #303b44; }
++.streamvault-comment-reactions button.is-selected { background: rgba(255,120,24,.12); border-color: rgba(255,155,55,.5); color: var(--sv-orange-2); }
++.streamvault-comment-reaction-emoji { position: relative; width: 20px; height: 20px; display: inline-grid; place-items: center; font-family: "Apple Color Emoji", "Segoe UI Emoji", sans-serif; font-size: 17px; line-height: 1; }
++.streamvault-comment-reaction-emoji > span { display: block; }
++.streamvault-comment-reaction-emoji > img { position: absolute; inset: 0; width: 20px; height: 20px; object-fit: contain; }
++.streamvault-comment-reaction-count { font-size: 9px; font-weight: 850; font-variant-numeric: tabular-nums; }
++.streamvault-comment-reply { border: 0; background: transparent; color: #77828c; padding: 3px 5px; font-size: 10px; font-weight: 800; cursor: pointer; }
++.streamvault-comment-reply:hover { color: var(--sv-orange-2); }
++.streamvault-comment-replies { min-width: 0; }
+ .streamvault-comment-empty { padding: 18px 2px; color: #68737d; font-size: 11px; }
+ 
+ .streamvault-app .site-replay-chat { height: min(72vh, 690px); min-height: 430px; border-color: var(--sv-line); border-radius: 14px; background: rgba(15,21,27,.96); box-shadow: 0 24px 80px rgba(0,0,0,.35); position: sticky; top: 88px; }
+diff --git a/migrations/versions/0019_comment_threads_reactions.py b/migrations/versions/0019_comment_threads_reactions.py
+new file mode 100644
+index 0000000..b58a0df
+--- /dev/null
++++ b/migrations/versions/0019_comment_threads_reactions.py
+@@ -0,0 +1,86 @@
++"""comment replies, underline and reactions
++
++Revision ID: 0019_comment_threads_reactions
++Revises: 0018_twitch_registration_comment_color
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0019_comment_threads_reactions"
++down_revision = "0018_twitch_registration_comment_color"
++branch_labels = None
++depends_on = None
++
++DT = mysql.DATETIME(fsp=6)
++UUID = mysql.BINARY(16)
++
++
++def _inspect():
++    return sa.inspect(op.get_bind())
++
++
++def _table_exists(name: str) -> bool:
++    return name in _inspect().get_table_names()
++
++
++def _column_names(table: str) -> set[str]:
++    return {column["name"] for column in _inspect().get_columns(table)}
++
++
++def _index_names(table: str) -> set[str]:
++    return {index["name"] for index in _inspect().get_indexes(table)}
++
++
++def _foreign_key_names(table: str) -> set[str]:
++    return {item["name"] for item in _inspect().get_foreign_keys(table) if item.get("name")}
++
++
++def upgrade() -> None:
++    columns = _column_names("site_comments")
++    if "parent_comment_id" not in columns:
++        op.add_column("site_comments", sa.Column("parent_comment_id", sa.BigInteger(), nullable=True))
++    if "is_underlined" not in columns:
++        op.add_column(
++            "site_comments",
++            sa.Column("is_underlined", sa.Boolean(), nullable=False, server_default=sa.false()),
++        )
++
++    indexes = _index_names("site_comments")
++    if "ix_site_comments_parent_comment_id" not in indexes:
++        op.create_index("ix_site_comments_parent_comment_id", "site_comments", ["parent_comment_id"])
++    if "fk_site_comments_parent_comment_id" not in _foreign_key_names("site_comments"):
++        op.create_foreign_key(
++            "fk_site_comments_parent_comment_id",
++            "site_comments",
++            "site_comments",
++            ["parent_comment_id"],
++            ["id"],
++            ondelete="CASCADE",
++        )
++
++    if not _table_exists("site_comment_reactions"):
++        op.create_table(
++            "site_comment_reactions",
++            sa.Column("comment_id", sa.BigInteger(), nullable=False),
++            sa.Column("user_id", UUID, nullable=False),
++            sa.Column("reaction", sa.String(length=24), nullable=False),
++            sa.Column("created_at", DT, nullable=False),
++            sa.Column("updated_at", DT, nullable=False),
++            sa.ForeignKeyConstraint(["comment_id"], ["site_comments.id"], ondelete="CASCADE"),
++            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
++            sa.PrimaryKeyConstraint("comment_id", "user_id"),
++        )
++    reaction_indexes = _index_names("site_comment_reactions")
++    if "ix_site_comment_reactions_user_id" not in reaction_indexes:
++        op.create_index("ix_site_comment_reactions_user_id", "site_comment_reactions", ["user_id"])
++
++
++def downgrade() -> None:
++    op.drop_table("site_comment_reactions")
++    op.drop_constraint("fk_site_comments_parent_comment_id", "site_comments", type_="foreignkey")
++    op.drop_index("ix_site_comments_parent_comment_id", table_name="site_comments")
++    op.drop_column("site_comments", "is_underlined")
++    op.drop_column("site_comments", "parent_comment_id")
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index fcee8e4..e06766d 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -648,11 +648,32 @@ class SiteComment(Base):
+     user_id: Mapped[uuid.UUID] = mapped_column(
+         UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+     )
++    parent_comment_id: Mapped[int | None] = mapped_column(
++        BigInteger, ForeignKey("site_comments.id", ondelete="CASCADE"), nullable=True, index=True
++    )
+     body: Mapped[str] = mapped_column(Text)
+     text_color: Mapped[str] = mapped_column(String(7), default="#ff9b37")
++    is_underlined: Mapped[bool] = mapped_column(Boolean, default=False)
+     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+ 
+ 
++class SiteCommentReaction(Base):
++    __tablename__ = "site_comment_reactions"
++    __table_args__ = (
++        Index("ix_site_comment_reactions_user_id", "user_id"),
++    )
++
++    comment_id: Mapped[int] = mapped_column(
++        BigInteger, ForeignKey("site_comments.id", ondelete="CASCADE"), primary_key=True
++    )
++    user_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
++    )
++    reaction: Mapped[str] = mapped_column(String(24), nullable=False)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
+ class AuditLog(Base):
+     __tablename__ = "audit_log"
+ 
+diff --git a/tests/test_site_catalog.py b/tests/test_site_catalog.py
+index b3dbed4..da41f42 100644
+--- a/tests/test_site_catalog.py
++++ b/tests/test_site_catalog.py
+@@ -151,7 +151,9 @@ def test_public_site_v1_has_streamvault_shell_and_chat_user_context_menu():
+     assert 'function SiteChatStats(' in web
+     assert '/chat/stats`' in web
+     assert 'Последний стрим' in web
+-    assert 'PREVIEW ${siteHeroFrame + 1}' in web
++    assert 'function SiteHeroPreviewVideo(' in web
++    assert 'streamvault-preview-loop-fade' in web
++    assert 'onActivate={() => openSiteEvent(latest)}' in web
+     assert 'Чат записи' in web
+     assert 'Все сообщения' in web
+     assert 'Посмотреть профиль' in web
+@@ -260,6 +262,21 @@ def test_site_user_comments_are_persisted_authenticated_and_rate_limited():
+     assert 'UI v1 · пользовательские комментарии подключим после утверждения интерфейса.' not in web
+ 
+ 
++    reactions_migration = _read("migrations/versions/0019_comment_threads_reactions.py")
++    assert 'down_revision = "0018_twitch_registration_comment_color"' in reactions_migration
++    assert '"parent_comment_id"' in reactions_migration
++    assert '"is_underlined"' in reactions_migration
++    assert '"site_comment_reactions"' in reactions_migration
++    assert 'class SiteCommentReaction(Base):' in models
++    assert '@router.post("/comments/{comment_id}/reaction")' in route
++    assert 'parent_comment_id=parent_comment_id' in route
++    assert 'is_underlined=bool(payload.is_underlined)' in route
++    assert 'viewer_reaction' in route
++    assert 'streamvault-comment-underline' in web
++    assert 'streamvault-comment-reactions' in web
++    assert 'Ответить' in web
++
++
+ def test_site_admin_assets_migration_keeps_source_title_and_persistent_asset_metadata():
+     migration = _read("migrations/versions/0011_site_admin_assets.py")
+     models = _read("packages/python_common/streamhub_common/models.py")
+@@ -305,7 +322,8 @@ def test_site_admin_api_and_ui_manage_display_title_cover_and_four_manual_frames
+     assert 'Отображаемое название' in web
+     assert '["frame_4", "Кадр 4"]' in web
+     assert 'src={latest.assets?.cover?.url}' in web
+-    assert 'src={latest.assets?.frames?.[siteHeroFrame]?.url}' in web
++    assert 'latest.assets?.frames?.[frame]?.url || null' in web
++    assert '<SiteHeroPreviewVideo event={latest} onActivate={() => openSiteEvent(latest)} />' in web
+     assert 'onPublish={() => void openSitePublisher()}' not in web
+     assert '.site-admin-modal' in css
+     assert '.streamvault-artwork.has-image' in css

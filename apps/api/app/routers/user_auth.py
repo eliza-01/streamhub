@@ -210,6 +210,17 @@ async def require_current_user(request: Request, db: AsyncSession = Depends(get_
     return await _load_user(db, user_id)
 
 
+async def optional_current_user(request: Request, db: AsyncSession = Depends(get_db)) -> User | None:
+    token = request.cookies.get(settings.auth_access_cookie_name)
+    if not token:
+        return None
+    try:
+        user_id = _decode_token(token, "access")
+        return await _load_user(db, user_id)
+    except HTTPException:
+        return None
+
+
 def _require_internal_token(value: str | None) -> None:
     expected = settings.internal_service_token.encode("utf-8")
     actual = (value or "").encode("utf-8")

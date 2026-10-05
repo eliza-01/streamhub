@@ -429,12 +429,32 @@ type SiteEvent = {
   playable: boolean;
 };
 
+type SiteWatchSession = {
+  id: string;
+  event_id: string;
+  owner_user_id?: string | null;
+  owner_label: string;
+  participant_count: number;
+  position_ms: number;
+  is_playing: boolean;
+  state_version: number;
+  state_updated_at?: string | null;
+  last_activity_at?: string | null;
+  created_at?: string | null;
+};
+
+type SiteCommentReactionName = "like" | "dislike" | "heart" | "broken_heart" | "fire" | "cry" | "laugh" | "poop";
+
 type SiteUserComment = {
   id: number;
   event_id: string;
+  parent_comment_id?: number | null;
   body: string;
   text_color?: string | null;
+  is_underlined?: boolean;
   created_at: string;
+  reactions?: Partial<Record<SiteCommentReactionName, number>>;
+  viewer_reaction?: SiteCommentReactionName | null;
   user: {
     id: string;
     nickname: string;
@@ -567,20 +587,20 @@ const STREAMVAULT_LOGO_FRAMES = [0, 1, 2, 3, 4, 5].map(
 
 const STREAMVAULT_LOGO_FRAME_SEQUENCE: Array<[number, number]> = [
   [0, 0],
-  [280, 1],
-  [420, 2],
-  [560, 3],
-  [700, 4],
-  [840, 5],
-  [965, 0],
-  [1090, 0],
-  [1230, 1],
-  [1370, 2],
-  [1510, 3],
-  [1650, 4],
-  [1790, 5],
+  [205, 1],
+  [310, 2],
+  [415, 3],
+  [520, 4],
+  [625, 5],
+  [720, 0],
+  [815, 0],
+  [920, 1],
+  [1025, 2],
+  [1130, 3],
+  [1235, 4],
+  [1340, 5],
 ];
-const STREAMVAULT_LOGO_ANIMATION_MS = 2040;
+const STREAMVAULT_LOGO_ANIMATION_MS = 1500;
 
 function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
   const [frame, setFrame] = useState(5);
@@ -606,7 +626,7 @@ function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
       setFrame(5);
       setAnimating(false);
       timersRef.current = [];
-    }, 2520));
+    }, STREAMVAULT_LOGO_ANIMATION_MS));
   }, [clearTimers]);
 
   useEffect(() => {
@@ -676,7 +696,32 @@ const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
 const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
 const EVENT_TITLE_MODE_KEY = "streamhub.events.titleMode";
 const SITE_COMMENT_COLOR_KEY = "streamhub.site.commentColor";
+const SITE_WATCH_CLIENT_ID_KEY = "streamhub.site.watchClientId";
+const SITE_COMMENT_REACTIONS: Array<{ key: SiteCommentReactionName; label: string; emoji: string; image: string }> = [
+  { key: "like", label: "Нравится", emoji: "👍", image: "https://em-content.zobj.net/source/apple/419/thumbs-up_1f44d.png" },
+  { key: "dislike", label: "Не нравится", emoji: "👎", image: "https://em-content.zobj.net/source/apple/419/thumbs-down_1f44e.png" },
+  { key: "heart", label: "Сердце", emoji: "❤️", image: "https://em-content.zobj.net/source/apple/419/red-heart_2764-fe0f.png" },
+  { key: "broken_heart", label: "Разбитое сердце", emoji: "💔", image: "https://em-content.zobj.net/source/apple/419/broken-heart_1f494.png" },
+  { key: "fire", label: "Огонь", emoji: "🔥", image: "https://em-content.zobj.net/source/apple/419/fire_1f525.png" },
+  { key: "cry", label: "Рыдаю", emoji: "😭", image: "https://em-content.zobj.net/source/apple/419/loudly-crying-face_1f62d.png" },
+  { key: "laugh", label: "Смешно", emoji: "😂", image: "https://em-content.zobj.net/source/apple/419/face-with-tears-of-joy_1f602.png" },
+  { key: "poop", label: "Какашка", emoji: "💩", image: "https://em-content.zobj.net/source/apple/419/pile-of-poo_1f4a9.png" },
+];
 type EventTitleMode = "display" | "source";
+
+function storedSiteWatchClientId() {
+  try {
+    const existing = window.localStorage.getItem(SITE_WATCH_CLIENT_ID_KEY);
+    if (existing && /^[A-Za-z0-9._:-]{8,64}$/.test(existing)) return existing;
+    const generated = typeof crypto?.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `watch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    window.localStorage.setItem(SITE_WATCH_CLIENT_ID_KEY, generated);
+    return generated;
+  } catch {
+    return `watch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  }
+}
 
 function storedSiteCommentColor() {
   try {
@@ -2562,12 +2607,14 @@ function AuthModal({
   );
 }
 
-function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
+function SiteHeroPreviewVideo({ event, onActivate }: { event: SiteEvent; onActivate?: () => void }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const reverseTimerRef = useRef<number | null>(null);
-  const directionRef = useRef<"forward" | "reverse">("forward");
+  const fadeTimerRef = useRef<number | null>(null);
+  const restartTimerRef = useRef<number | null>(null);
+  const restartingRef = useRef(false);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
+  const [restarting, setRestarting] = useState(false);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -2583,18 +2630,18 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
     let previewEnd = 10;
     setLoading(true);
     setFailed(false);
-    directionRef.current = "forward";
+    restartingRef.current = false;
+    setRestarting(false);
 
-    const stopReverse = () => {
-      if (reverseTimerRef.current == null) return;
-      window.clearInterval(reverseTimerRef.current);
-      reverseTimerRef.current = null;
+    const clearRestartTimers = () => {
+      if (fadeTimerRef.current != null) window.clearTimeout(fadeTimerRef.current);
+      if (restartTimerRef.current != null) window.clearTimeout(restartTimerRef.current);
+      fadeTimerRef.current = null;
+      restartTimerRef.current = null;
     };
 
     const playForward = async () => {
       if (disposed) return;
-      stopReverse();
-      directionRef.current = "forward";
       video.muted = true;
       video.defaultMuted = true;
       video.playbackRate = 1;
@@ -2605,21 +2652,23 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
       }
     };
 
-    const startReverse = () => {
-      if (disposed || directionRef.current === "reverse") return;
-      directionRef.current = "reverse";
+    const restartPreview = () => {
+      if (disposed || restartingRef.current) return;
+      restartingRef.current = true;
+      clearRestartTimers();
       video.pause();
-      stopReverse();
-      reverseTimerRef.current = window.setInterval(() => {
-        if (disposed || directionRef.current !== "reverse" || video.seeking) return;
-        const next = Math.max(0, video.currentTime - 0.08);
-        video.currentTime = next;
-        if (next <= 0.04) {
-          stopReverse();
-          video.currentTime = 0;
-          void playForward();
-        }
-      }, 80);
+      setRestarting(true);
+      fadeTimerRef.current = window.setTimeout(() => {
+        if (disposed) return;
+        video.currentTime = 0;
+        void playForward();
+        restartTimerRef.current = window.setTimeout(() => {
+          if (!disposed) {
+            restartingRef.current = false;
+            setRestarting(false);
+          }
+        }, 250);
+      }, 250);
     };
 
     const refreshPreviewEnd = () => {
@@ -2634,20 +2683,19 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
     };
     const onCanPlay = () => {
       setLoading(false);
-      if (directionRef.current === "forward" && video.paused) void playForward();
+      if (!restartingRef.current && video.paused) void playForward();
     };
     const onTimeUpdate = () => {
-      if (directionRef.current !== "forward") return;
-      if (video.currentTime >= previewEnd - 0.05) {
-        video.currentTime = previewEnd;
-        startReverse();
-      }
+      if (restartingRef.current) return;
+      if (video.currentTime >= previewEnd - 0.05) restartPreview();
     };
-    const onEnded = () => startReverse();
+    const onEnded = () => restartPreview();
     const onError = () => {
-      stopReverse();
+      clearRestartTimers();
       setLoading(false);
       setFailed(true);
+      restartingRef.current = false;
+      setRestarting(false);
     };
 
     video.addEventListener("loadedmetadata", onLoadedMetadata);
@@ -2677,7 +2725,7 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
 
     return () => {
       disposed = true;
-      stopReverse();
+      clearRestartTimers();
       video.pause();
       video.removeEventListener("loadedmetadata", onLoadedMetadata);
       video.removeEventListener("loadeddata", onCanPlay);
@@ -2692,13 +2740,34 @@ function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
   }, [event.id, event.playable, event.playback_url]);
 
   return (
-    <div className="streamvault-preview-main" aria-label="Первые 10 секунд записи, воспроизведение вперёд и назад">
+    <div
+      className="streamvault-preview-main"
+      role={onActivate ? "link" : undefined}
+      tabIndex={onActivate ? 0 : undefined}
+      aria-label={onActivate ? `Открыть ${event.title}` : "Первые 10 секунд записи"}
+      onClick={onActivate}
+      onKeyDown={onActivate ? (keyEvent) => {
+        if (keyEvent.key === "Enter" || keyEvent.key === " ") {
+          keyEvent.preventDefault();
+          onActivate();
+        }
+      } : undefined}
+    >
       {failed ? (
         <SiteArtwork event={event} wide label="VIDEO PREVIEW" src={event.assets?.frames?.[0]?.url} />
       ) : (
         <video ref={videoRef} muted playsInline preload="auto" aria-hidden="true" />
       )}
-      {loading && !failed ? <span className="streamvault-preview-loading">Загрузка первых 10 сек…</span> : null}
+      {loading && !failed ? (
+        <div className="streamvault-video-loading" role="status" aria-live="polite" aria-label="Видео загружается">
+          <div className="streamvault-video-loading-card">
+            <span className="streamvault-video-loading-spinner" aria-hidden="true" />
+            <strong>Загрузка видео…</strong>
+            <small>Подготавливаем воспроизведение</small>
+          </div>
+        </div>
+      ) : null}
+      <span className={`streamvault-preview-loop-fade${restarting ? " is-active" : ""}`} aria-hidden="true" />
     </div>
   );
 }
@@ -2744,6 +2813,57 @@ function SiteEventTimecodes({
             <strong>{item.title}</strong>
           </button>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function SiteWatchSessionsPanel({
+  sessions,
+  current,
+  busyId,
+  notice,
+  onJoin,
+  onCreate,
+}: {
+  sessions: SiteWatchSession[];
+  current: SiteWatchSession | null;
+  busyId: string | null;
+  notice: string;
+  onJoin: (session: SiteWatchSession) => void;
+  onCreate: () => void;
+}) {
+  return (
+    <section className="streamvault-watch-sessions" aria-labelledby="streamvaultWatchSessionsTitle">
+      <div className="streamvault-watch-sessions-head">
+        <div>
+          <strong id="streamvaultWatchSessionsTitle">Совместный просмотр</strong>
+          <span>play / pause / перемотка синхронизируются для всей комнаты</span>
+        </div>
+        <button type="button" disabled={busyId === "new"} onClick={onCreate}>
+          {busyId === "new" ? "Создаём…" : "+ Новая сессия"}
+        </button>
+      </div>
+      {notice ? <div className="streamvault-watch-sessions-notice">{notice}</div> : null}
+      <div className="streamvault-watch-sessions-list">
+        {sessions.length ? sessions.map((session) => {
+          const isCurrent = current?.id === session.id;
+          return (
+            <button
+              type="button"
+              key={session.id}
+              className={isCurrent ? "is-current" : ""}
+              disabled={isCurrent || busyId === session.id}
+              onClick={() => onJoin(session)}
+            >
+              <span className="streamvault-watch-session-main">
+                <strong>{session.owner_label}</strong>
+                <small>{session.participant_count} {session.participant_count === 1 ? "зритель" : "зрителей"} · {session.is_playing ? `▶ ${fmtMs(session.position_ms)}` : `Ⅱ ${fmtMs(session.position_ms)}`}</small>
+              </span>
+              <span className="streamvault-watch-session-action">{isCurrent ? "Вы здесь" : busyId === session.id ? "Подключаем…" : "Присоединиться"}</span>
+            </button>
+          );
+        }) : <div className="streamvault-watch-sessions-empty">Активных сессий пока нет.</div>}
       </div>
     </section>
   );
@@ -3092,9 +3212,13 @@ function App() {
   const [sitePublishEventId, setSitePublishEventId] = useState("");
   const [sitePublishCategories, setSitePublishCategories] = useState<string[]>([]);
   const [siteAction, setSiteAction] = useState(false);
-  const [sitePreviewOverlay, setSitePreviewOverlay] = useState<{ src: string; label: string } | null>(null);
+  const [sitePreviewOverlay, setSitePreviewOverlay] = useState<{ items: Array<{ src: string; label: string }>; index: number } | null>(null);
   const [siteCommentDraft, setSiteCommentDraft] = useState("");
   const [siteCommentColor, setSiteCommentColor] = useState(storedSiteCommentColor);
+  const [siteCommentUnderlined, setSiteCommentUnderlined] = useState(false);
+  const [siteCommentReplyTo, setSiteCommentReplyTo] = useState<{ id: number; nickname: string; login: string } | null>(null);
+  const [siteCommentReactionSending, setSiteCommentReactionSending] = useState<number | null>(null);
+  const [siteCommentReactionPickerId, setSiteCommentReactionPickerId] = useState<number | null>(null);
   const [siteCommentNotice, setSiteCommentNotice] = useState("");
   const [siteComments, setSiteComments] = useState<SiteUserComment[]>([]);
   const [siteCommentsLoading, setSiteCommentsLoading] = useState(false);
@@ -3102,6 +3226,15 @@ function App() {
   const [siteCommentCooldownUntil, setSiteCommentCooldownUntil] = useState(0);
   const [siteCommentClock, setSiteCommentClock] = useState(() => Date.now());
   const siteCommentRef = useRef<HTMLTextAreaElement | null>(null);
+  const siteWatchClientIdRef = useRef(storedSiteWatchClientId());
+  const [siteWatchSessions, setSiteWatchSessions] = useState<SiteWatchSession[]>([]);
+  const [siteWatchSession, setSiteWatchSession] = useState<SiteWatchSession | null>(null);
+  const [siteWatchBusyId, setSiteWatchBusyId] = useState<string | null>(null);
+  const [siteWatchNotice, setSiteWatchNotice] = useState("");
+  const siteWatchApplyingRemoteRef = useRef(false);
+  const siteWatchLastAppliedVersionRef = useRef(0);
+  const siteWatchPublishInFlightRef = useRef(false);
+  const siteWatchCurrentRef = useRef<SiteWatchSession | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
 
@@ -3125,7 +3258,18 @@ function App() {
     if (!sitePreviewOverlay) return;
     const previousOverflow = document.body.style.overflow;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setSitePreviewOverlay(null);
+      if (event.key === "Escape") {
+        setSitePreviewOverlay(null);
+        return;
+      }
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        setSitePreviewOverlay((current) => {
+          if (!current || current.items.length < 2) return current;
+          const delta = event.key === "ArrowLeft" ? -1 : 1;
+          return { ...current, index: (current.index + delta + current.items.length) % current.items.length };
+        });
+      }
     };
     document.body.style.overflow = "hidden";
     window.addEventListener("keydown", onKeyDown);
@@ -3147,6 +3291,7 @@ function App() {
       try {
         const res = await fetch(`${API}/api/v1/site/events/${selectedSiteEvent.id}/comments?page_size=100`, {
           cache: "no-store",
+          credentials: "include",
           signal: controller.signal,
         });
         if (!res.ok) throw new Error(await res.text());
@@ -3160,6 +3305,110 @@ function App() {
     })();
     return () => controller.abort();
   }, [selectedSiteEvent?.id]);
+
+  useEffect(() => {
+    siteWatchCurrentRef.current = siteWatchSession;
+  }, [siteWatchSession]);
+
+  useEffect(() => {
+    const event = selectedSiteEvent;
+    if (!event?.playable || !event.playback_url) {
+      siteWatchCurrentRef.current = null;
+      setSiteWatchSession(null);
+      setSiteWatchSessions([]);
+      setSiteWatchNotice("");
+      return;
+    }
+    let cancelled = false;
+    setSiteWatchSessions([]);
+    setSiteWatchSession(null);
+    siteWatchCurrentRef.current = null;
+    siteWatchLastAppliedVersionRef.current = 0;
+    setSiteWatchNotice("");
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      void createSiteWatchSession(event.id);
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+    // Event changes should create a fresh room. Auth changes only affect the display name on the next heartbeat/create.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSiteEvent?.id, selectedSiteEvent?.playable, selectedSiteEvent?.playback_url]);
+
+  useEffect(() => {
+    const eventId = selectedSiteEvent?.id;
+    if (!eventId) return;
+    const controller = new AbortController();
+    const load = () => {
+      void loadSiteWatchSessions(eventId, controller.signal).catch((error) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) console.warn("watch session list failed", error);
+      });
+    };
+    load();
+    const timer = window.setInterval(load, 3000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSiteEvent?.id]);
+
+  useEffect(() => {
+    const session = siteWatchSession;
+    if (!session) return;
+    let disposed = false;
+    const heartbeat = async () => {
+      try {
+        const res = await fetch(`${API}/api/v1/site/watch-sessions/${session.id}/heartbeat`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ client_id: siteWatchClientIdRef.current }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+        if (disposed) return;
+        const next = data.session as SiteWatchSession;
+        applySiteWatchState(next, data.server_now_utc || null);
+        siteWatchCurrentRef.current = next;
+        setSiteWatchSession(next);
+      } catch (error) {
+        if (!disposed) setSiteWatchNotice(`Синхронизация приостановлена: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    void heartbeat();
+    const timer = window.setInterval(heartbeat, 700);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [siteWatchSession?.id]);
+
+  useEffect(() => {
+    if (!siteWatchSession) return;
+    const video = siteVideoRef.current;
+    if (!video) return;
+    const onLocalControl = () => {
+      if (siteWatchApplyingRemoteRef.current) return;
+      void publishSiteWatchState();
+    };
+    video.addEventListener("play", onLocalControl);
+    video.addEventListener("pause", onLocalControl);
+    video.addEventListener("seeked", onLocalControl);
+    const timer = window.setInterval(() => {
+      if (!video.paused && !video.ended) void publishSiteWatchState();
+    }, 2500);
+    return () => {
+      video.removeEventListener("play", onLocalControl);
+      video.removeEventListener("pause", onLocalControl);
+      video.removeEventListener("seeked", onLocalControl);
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [siteWatchSession?.id]);
 
   useEffect(() => {
     if (siteCommentCooldownUntil <= Date.now()) {
@@ -3486,17 +3735,166 @@ function App() {
     return url.toString();
   }
 
+  function openSiteEvent(event: SiteEvent) {
+    window.location.assign(siteEventUrl(event.id));
+  }
+
   function openSiteEventNewTab(event: SiteEvent) {
     window.open(siteEventUrl(event.id), "_blank", "noopener,noreferrer");
   }
 
+  function openSitePreviewFrame(event: SiteEvent, frameIndex: number) {
+    const items = (event.assets?.frames || []).flatMap((frame, index) => frame?.url ? [{ src: frame.url, label: `${event.title} · кадр ${index + 1}` }] : []);
+    if (!items.length) return;
+    const targetUrl = event.assets?.frames?.[frameIndex]?.url || "";
+    const index = Math.max(0, items.findIndex((item) => item.src === targetUrl));
+    setSitePreviewOverlay({ items, index });
+  }
+
   function closeSiteEvent() {
+    void leaveSiteWatchSession(siteWatchCurrentRef.current);
+    siteWatchCurrentRef.current = null;
+    setSiteWatchSession(null);
+    setSiteWatchSessions([]);
     setSelectedSiteEvent(null);
     const url = new URL(window.location.href);
     if (url.searchParams.has("site_event")) {
       url.searchParams.delete("site_event");
       window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
     }
+  }
+
+  async function loadSiteWatchSessions(eventId: string, signal?: AbortSignal) {
+    const res = await fetch(`${API}/api/v1/site/events/${eventId}/watch-sessions`, { cache: "no-store", signal });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json() as { items?: SiteWatchSession[] };
+    setSiteWatchSessions(data.items || []);
+  }
+
+  async function leaveSiteWatchSession(session: SiteWatchSession | null) {
+    if (!session) return;
+    try {
+      await fetch(`${API}/api/v1/site/watch-sessions/${session.id}/leave`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: siteWatchClientIdRef.current }),
+        keepalive: true,
+      });
+    } catch {
+      // Session expiry is also handled server-side, so leaving is best-effort.
+    }
+  }
+
+  async function createSiteWatchSession(eventId = selectedSiteEvent?.id || "") {
+    if (!eventId) return;
+    const previous = siteWatchCurrentRef.current;
+    setSiteWatchBusyId("new");
+    setSiteWatchNotice("");
+    try {
+      if (previous) await leaveSiteWatchSession(previous);
+      const video = siteVideoRef.current;
+      const res = await fetch(`${API}/api/v1/site/events/${eventId}/watch-sessions`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_id: siteWatchClientIdRef.current,
+          position_ms: Math.max(0, Math.round((video?.currentTime || 0) * 1000)),
+          is_playing: Boolean(video && !video.paused && !video.ended),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+      const next = data.session as SiteWatchSession;
+      siteWatchCurrentRef.current = next;
+      siteWatchLastAppliedVersionRef.current = next.state_version || 0;
+      setSiteWatchSession(next);
+      await loadSiteWatchSessions(eventId);
+    } catch (error) {
+      setSiteWatchNotice(`Не удалось создать сессию: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setSiteWatchBusyId(null);
+    }
+  }
+
+  async function joinSiteWatchSession(target: SiteWatchSession) {
+    if (siteWatchCurrentRef.current?.id === target.id) return;
+    setSiteWatchBusyId(target.id);
+    setSiteWatchNotice("");
+    try {
+      const previous = siteWatchCurrentRef.current;
+      if (previous) await leaveSiteWatchSession(previous);
+      const res = await fetch(`${API}/api/v1/site/watch-sessions/${target.id}/join`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: siteWatchClientIdRef.current }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+      const next = data.session as SiteWatchSession;
+      siteWatchCurrentRef.current = next;
+      siteWatchLastAppliedVersionRef.current = 0;
+      setSiteWatchSession(next);
+      if (selectedSiteEvent?.id) await loadSiteWatchSessions(selectedSiteEvent.id);
+    } catch (error) {
+      setSiteWatchNotice(`Не удалось присоединиться: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setSiteWatchBusyId(null);
+    }
+  }
+
+  async function publishSiteWatchState() {
+    const session = siteWatchCurrentRef.current;
+    const video = siteVideoRef.current;
+    if (!session || !video || siteWatchApplyingRemoteRef.current || siteWatchPublishInFlightRef.current) return;
+    siteWatchPublishInFlightRef.current = true;
+    try {
+      const res = await fetch(`${API}/api/v1/site/watch-sessions/${session.id}/state`, {
+        method: "PUT",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_id: siteWatchClientIdRef.current,
+          position_ms: Math.max(0, Math.round(video.currentTime * 1000)),
+          is_playing: !video.paused && !video.ended,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+      const next = data.session as SiteWatchSession;
+      siteWatchCurrentRef.current = next;
+      siteWatchLastAppliedVersionRef.current = Math.max(siteWatchLastAppliedVersionRef.current, next.state_version || 0);
+      setSiteWatchSession(next);
+    } catch (error) {
+      console.warn("watch session state publish failed", error);
+    } finally {
+      siteWatchPublishInFlightRef.current = false;
+    }
+  }
+
+  function applySiteWatchState(session: SiteWatchSession, serverNowUtc?: string | null) {
+    const video = siteVideoRef.current;
+    if (!video || siteWatchPublishInFlightRef.current) return;
+    const isNewVersion = session.state_version > siteWatchLastAppliedVersionRef.current;
+    if (isNewVersion) siteWatchLastAppliedVersionRef.current = session.state_version;
+    const serverNow = serverNowUtc ? Date.parse(serverNowUtc) : NaN;
+    const stateUpdated = session.state_updated_at ? Date.parse(session.state_updated_at) : NaN;
+    const elapsedMs = session.is_playing && Number.isFinite(serverNow) && Number.isFinite(stateUpdated)
+      ? Math.max(0, serverNow - stateUpdated)
+      : 0;
+    const targetSeconds = Math.max(0, (session.position_ms + elapsedMs) / 1000);
+    const drift = Math.abs(video.currentTime - targetSeconds);
+    if (!isNewVersion && drift < 1.25 && session.is_playing === (!video.paused && !video.ended)) return;
+    siteWatchApplyingRemoteRef.current = true;
+    if (drift > (isNewVersion ? 0.75 : 1.25) && Number.isFinite(targetSeconds)) video.currentTime = targetSeconds;
+    if (session.is_playing) {
+      if (video.paused || video.ended) void video.play().catch(() => undefined);
+    } else if (!video.paused) {
+      video.pause();
+    }
+    window.setTimeout(() => { siteWatchApplyingRemoteRef.current = false; }, 350);
   }
 
   function updateSiteCoverMotion(event: React.PointerEvent<HTMLButtonElement>) {
@@ -3549,7 +3947,12 @@ function App() {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body: siteCommentDraft.trim(), text_color: siteCommentColor }),
+        body: JSON.stringify({
+          body: siteCommentDraft.trim(),
+          text_color: siteCommentColor,
+          is_underlined: siteCommentUnderlined,
+          parent_comment_id: siteCommentReplyTo?.id || null,
+        }),
       });
       const data = await res.json().catch(() => ({}));
       if (res.status === 429) {
@@ -3563,6 +3966,8 @@ function App() {
       if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
       if (data.comment) setSiteComments((current) => [data.comment as SiteUserComment, ...current]);
       setSiteCommentDraft("");
+      setSiteCommentUnderlined(false);
+      setSiteCommentReplyTo(null);
       const seconds = Math.max(1, Number(data.cooldown_seconds || 60));
       setSiteCommentCooldownUntil(Date.now() + seconds * 1000);
       setSiteCommentClock(Date.now());
@@ -3571,6 +3976,48 @@ function App() {
       setSiteCommentNotice(e instanceof Error ? e.message : String(e));
     } finally {
       setSiteCommentSending(false);
+    }
+  }
+
+  function replyToSiteComment(comment: SiteUserComment) {
+    if (!authUser) {
+      setAuthModalOpen(true);
+      return;
+    }
+    setSiteCommentReplyTo({ id: comment.id, nickname: comment.user.nickname, login: comment.user.login });
+    setSiteCommentNotice("");
+    window.setTimeout(() => {
+      siteCommentRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      siteCommentRef.current?.focus();
+    }, 0);
+  }
+
+  async function toggleSiteCommentReaction(comment: SiteUserComment, reaction: SiteCommentReactionName) {
+    if (!authUser) {
+      setAuthModalOpen(true);
+      return;
+    }
+    if (siteCommentReactionSending === comment.id) return;
+    setSiteCommentReactionSending(comment.id);
+    try {
+      const res = await fetch(`${API}/api/v1/site/comments/${comment.id}/reaction`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reaction }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+      setSiteComments((current) => current.map((item) => item.id === comment.id ? {
+        ...item,
+        reactions: data.reactions || {},
+        viewer_reaction: data.viewer_reaction || null,
+      } : item));
+      setSiteCommentReactionPickerId(null);
+    } catch (error) {
+      setSiteCommentNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSiteCommentReactionSending(null);
     }
   }
 
@@ -4334,6 +4781,108 @@ function App() {
     [messages, position]
   );
 
+  const siteCommentById = new Map(siteComments.map((comment) => [comment.id, comment]));
+  const siteCommentChildren = new Map<number, SiteUserComment[]>();
+  for (const comment of siteComments) {
+    if (!comment.parent_comment_id || !siteCommentById.has(comment.parent_comment_id)) continue;
+    const children = siteCommentChildren.get(comment.parent_comment_id) || [];
+    children.push(comment);
+    siteCommentChildren.set(comment.parent_comment_id, children);
+  }
+  for (const children of siteCommentChildren.values()) {
+    children.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime() || a.id - b.id);
+  }
+  const siteRootComments = siteComments.filter((comment) => !comment.parent_comment_id || !siteCommentById.has(comment.parent_comment_id));
+
+  const sitePreviewOverlayItem = sitePreviewOverlay
+    ? sitePreviewOverlay.items[sitePreviewOverlay.index] || null
+    : null;
+
+  function renderSiteComment(comment: SiteUserComment, depth = 0): React.ReactNode {
+    const replies = siteCommentChildren.get(comment.id) || [];
+    return (
+      <div className={`streamvault-comment-thread${depth ? " is-reply" : ""}`} key={comment.id}>
+        <article className="streamvault-comment-item">
+          <div className="streamvault-comment-avatar">
+            {comment.user.avatar_url ? <img src={apiUrl(comment.user.avatar_url)} alt="" loading="lazy" /> : comment.user.nickname.slice(0, 1).toUpperCase()}
+          </div>
+          <div className="streamvault-comment-item-body">
+            <div className="streamvault-comment-meta">
+              <strong>{comment.user.nickname}</strong>
+              <small>@{comment.user.login}</small>
+              <time dateTime={comment.created_at}>{new Date(comment.created_at).toLocaleString("ru-RU")}</time>
+            </div>
+            <p className={comment.is_underlined ? "is-underlined" : ""} style={{ color: comment.text_color || "#ff9b37" }}>{comment.body}</p>
+            <div className="streamvault-comment-footer">
+              <div className="streamvault-comment-reactions" aria-label="Реакции на комментарий">
+                {SITE_COMMENT_REACTIONS.filter((reaction) => Number(comment.reactions?.[reaction.key] || 0) > 0).map((reaction) => {
+                  const count = Number(comment.reactions?.[reaction.key] || 0);
+                  const selectedReaction = comment.viewer_reaction === reaction.key;
+                  return (
+                    <button
+                      key={reaction.key}
+                      type="button"
+                      className={selectedReaction ? "is-selected" : ""}
+                      aria-pressed={selectedReaction}
+                      aria-label={`${reaction.label}: ${count}`}
+                      title={reaction.label}
+                      disabled={siteCommentReactionSending === comment.id}
+                      onClick={() => void toggleSiteCommentReaction(comment, reaction.key)}
+                    >
+                      <span className="streamvault-comment-reaction-emoji" aria-hidden="true">
+                        <span>{reaction.emoji}</span>
+                        <img src={reaction.image} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                      </span>
+                      <span className="streamvault-comment-reaction-count">{count}</span>
+                    </button>
+                  );
+                })}
+                <div className="streamvault-comment-reaction-picker-wrap">
+                  <button
+                    type="button"
+                    className={`streamvault-comment-reaction-add${siteCommentReactionPickerId === comment.id ? " is-open" : ""}`}
+                    aria-label="Выбрать реакцию"
+                    aria-expanded={siteCommentReactionPickerId === comment.id}
+                    onClick={() => {
+                      if (!authUser) { setAuthModalOpen(true); return; }
+                      setSiteCommentReactionPickerId((current) => current === comment.id ? null : comment.id);
+                    }}
+                  >☺+</button>
+                  {siteCommentReactionPickerId === comment.id ? (
+                    <div className="streamvault-comment-reaction-picker" role="menu" aria-label="Выбор реакции">
+                      {SITE_COMMENT_REACTIONS.map((reaction) => (
+                        <button
+                          type="button"
+                          key={reaction.key}
+                          className={comment.viewer_reaction === reaction.key ? "is-selected" : ""}
+                          title={reaction.label}
+                          aria-label={reaction.label}
+                          disabled={siteCommentReactionSending === comment.id}
+                          onClick={() => void toggleSiteCommentReaction(comment, reaction.key)}
+                        >
+                          <span className="streamvault-comment-reaction-emoji" aria-hidden="true">
+                            <span>{reaction.emoji}</span>
+                            <img src={reaction.image} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <button className="streamvault-comment-reply" type="button" onClick={() => replyToSiteComment(comment)}>Ответить</button>
+            </div>
+          </div>
+        </article>
+        {replies.length ? (
+          <div className="streamvault-comment-replies">
+            {replies.map((reply) => renderSiteComment(reply, depth + 1))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
   if (selectedSiteEvent) {
     const eventDate = selectedSiteEvent.source_started_at_utc
       ? new Date(selectedSiteEvent.source_started_at_utc).toLocaleString("ru-RU")
@@ -4367,6 +4916,16 @@ function App() {
                 )}
               </div>
               <SiteEventTimecodes items={selectedSiteEvent.timecodes || []} videoRef={siteVideoRef} />
+              {selectedSiteEvent.playable ? (
+                <SiteWatchSessionsPanel
+                  sessions={siteWatchSessions}
+                  current={siteWatchSession}
+                  busyId={siteWatchBusyId}
+                  notice={siteWatchNotice}
+                  onJoin={(session) => void joinSiteWatchSession(session)}
+                  onCreate={() => void createSiteWatchSession()}
+                />
+              ) : null}
               <section className="streamvault-watch-meta">
                 <div className="streamvault-watch-title-row">
                   <div>
@@ -4400,13 +4959,20 @@ function App() {
                       {authUser.avatar_url ? <img src={apiUrl(authUser.avatar_url)} alt="" /> : authUser.nickname.slice(0, 1).toUpperCase()}
                     </div>
                     <div>
+                      {siteCommentReplyTo ? (
+                        <div className="streamvault-comment-replying">
+                          <span>Ответ для <strong>{siteCommentReplyTo.nickname}</strong> <small>@{siteCommentReplyTo.login}</small></span>
+                          <button type="button" onClick={() => setSiteCommentReplyTo(null)} aria-label="Отменить ответ">×</button>
+                        </div>
+                      ) : null}
                       <textarea
                         ref={siteCommentRef}
                         value={siteCommentDraft}
                         onChange={(event) => { setSiteCommentDraft(event.target.value); setSiteCommentNotice(""); }}
                         rows={3}
                         maxLength={4000}
-                        placeholder="Написать комментарий…"
+                        placeholder={siteCommentReplyTo ? `Ответить ${siteCommentReplyTo.nickname}…` : "Написать комментарий…"}
+                        className={siteCommentUnderlined ? "is-underlined" : ""}
                         style={{ color: siteCommentColor }}
                       />
                       <div className="streamvault-comment-actions">
@@ -4423,6 +4989,13 @@ function App() {
                           />
                           <span>Цвет</span>
                         </label>
+                        <button
+                          type="button"
+                          className={`streamvault-comment-underline${siteCommentUnderlined ? " is-active" : ""}`}
+                          aria-pressed={siteCommentUnderlined}
+                          title="Подчеркнуть текст"
+                          onClick={() => setSiteCommentUnderlined((value) => !value)}
+                        ><span>U</span></button>
                         <span>{Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000)) > 0
                           ? `Следующий комментарий через ${Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000))} сек.`
                           : siteCommentNotice}</span>
@@ -4430,7 +5003,7 @@ function App() {
                           type="button"
                           disabled={!siteCommentDraft.trim() || siteCommentSending || Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000)) > 0}
                           onClick={() => void submitSiteComment()}
-                        >{siteCommentSending ? "Отправляем…" : "Отправить"}</button>
+                        >{siteCommentSending ? "Отправляем…" : siteCommentReplyTo ? "Ответить" : "Отправить"}</button>
                       </div>
                     </div>
                   </div>
@@ -4443,21 +5016,7 @@ function App() {
                 <div className="streamvault-comment-list">
                   {siteCommentsLoading ? <div className="streamvault-comment-empty">Загрузка комментариев…</div> : null}
                   {!siteCommentsLoading && siteComments.length === 0 ? <div className="streamvault-comment-empty">Комментариев пока нет.</div> : null}
-                  {siteComments.map((comment) => (
-                    <article className="streamvault-comment-item" key={comment.id}>
-                      <div className="streamvault-comment-avatar">
-                        {comment.user.avatar_url ? <img src={apiUrl(comment.user.avatar_url)} alt="" loading="lazy" /> : comment.user.nickname.slice(0, 1).toUpperCase()}
-                      </div>
-                      <div className="streamvault-comment-item-body">
-                        <div className="streamvault-comment-meta">
-                          <strong>{comment.user.nickname}</strong>
-                          <small>@{comment.user.login}</small>
-                          <time dateTime={comment.created_at}>{new Date(comment.created_at).toLocaleString("ru-RU")}</time>
-                        </div>
-                        <p style={{ color: comment.text_color || "#ff9b37" }}>{comment.body}</p>
-                      </div>
-                    </article>
-                  ))}
+                  {siteRootComments.map((comment) => renderSiteComment(comment))}
                 </div>
               </section>
             </div>
@@ -4508,16 +5067,33 @@ function App() {
           onLogout={() => void logoutUser()}
         />
         {authModalOpen ? <AuthModal onClose={() => setAuthModalOpen(false)} onAuthenticated={setAuthUser} /> : null}
-        {sitePreviewOverlay ? (
+        {sitePreviewOverlay && sitePreviewOverlayItem ? (
           <div
             className="streamvault-frame-overlay"
             role="dialog"
             aria-modal="true"
-            aria-label={sitePreviewOverlay.label}
+            aria-label={sitePreviewOverlayItem.label}
             onMouseDown={(event) => { if (event.currentTarget === event.target) setSitePreviewOverlay(null); }}
           >
             <button type="button" className="streamvault-frame-overlay-close" onClick={() => setSitePreviewOverlay(null)} aria-label="Закрыть просмотр кадра">×</button>
-            <img src={apiUrl(sitePreviewOverlay.src)} alt={sitePreviewOverlay.label} />
+            {sitePreviewOverlay.items.length > 1 ? (
+              <button
+                type="button"
+                className="streamvault-frame-overlay-nav is-prev"
+                onClick={() => setSitePreviewOverlay((current) => current ? { ...current, index: (current.index - 1 + current.items.length) % current.items.length } : current)}
+                aria-label="Предыдущий кадр"
+              >←</button>
+            ) : null}
+            <img src={apiUrl(sitePreviewOverlayItem.src)} alt={sitePreviewOverlayItem.label} />
+            {sitePreviewOverlay.items.length > 1 ? (
+              <button
+                type="button"
+                className="streamvault-frame-overlay-nav is-next"
+                onClick={() => setSitePreviewOverlay((current) => current ? { ...current, index: (current.index + 1) % current.items.length } : current)}
+                aria-label="Следующий кадр"
+              >→</button>
+            ) : null}
+            <div className="streamvault-frame-overlay-counter">{sitePreviewOverlay.index + 1} / {sitePreviewOverlay.items.length}</div>
           </div>
         ) : null}
 
@@ -4567,6 +5143,7 @@ function App() {
                     <SiteArtwork event={latest} label="COVER" src={latest.assets?.cover?.url} />
                   </button>
                   <div className="streamvault-preview-stage">
+                    <SiteHeroPreviewVideo event={latest} onActivate={() => openSiteEvent(latest)} />
                     <div className="streamvault-preview-rail" aria-label="Четыре preview-кадра">
                       {[0, 1, 2, 3].map((frame) => {
                         const src = latest.assets?.frames?.[frame]?.url || null;
@@ -4575,7 +5152,7 @@ function App() {
                             key={frame}
                             type="button"
                             disabled={!src}
-                            onClick={() => src && setSitePreviewOverlay({ src, label: `${latest.title} · кадр ${frame + 1}` })}
+                            onClick={() => src && openSitePreviewFrame(latest, frame)}
                             aria-label={`Открыть кадр ${frame + 1}`}
                           >
                             <SiteArtwork event={latest} wide label={`#${frame + 1}`} src={src} />
@@ -4583,7 +5160,6 @@ function App() {
                         );
                       })}
                     </div>
-                    <SiteHeroPreviewVideo event={latest} />
                   </div>
                 </div>
                 <div className="streamvault-latest-copy">

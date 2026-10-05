@@ -374,10 +374,10 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
   filter: drop-shadow(0 7px 13px rgba(0,0,0,.5)) drop-shadow(0 0 11px rgba(255,120,24,.24));
 }
 .streamvault-brand-mark.is-animating .streamvault-brand-tilt {
-  animation: streamvault-logo-tilt 2.04s linear both;
+  animation: streamvault-logo-tilt 1.5s linear both;
 }
 .streamvault-brand-mark.is-animating .streamvault-brand-scale {
-  animation: streamvault-logo-scale 2.04s linear both;
+  animation: streamvault-logo-scale 1.5s linear both;
 }
 .streamvault-brand-copy {
   display: inline-flex;
@@ -402,20 +402,23 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 }
 @keyframes streamvault-logo-tilt {
   0% { transform: rotate(0deg); }
-  2.4% { transform: rotate(-6deg); }
-  4.8% { transform: rotate(5deg); }
-  6.86% { transform: rotate(-18deg); }
-  41.18% { transform: rotate(-18deg); }
-  53.43% { transform: rotate(8deg); }
-  87.75% { transform: rotate(8deg); }
+  2% { transform: rotate(-7deg); }
+  4% { transform: rotate(7deg); }
+  6% { transform: rotate(-6deg); }
+  8% { transform: rotate(5deg); }
+  10% { transform: rotate(-4deg); }
+  12% { transform: rotate(0deg); }
+  14% { transform: rotate(-18deg); }
+  42% { transform: rotate(-18deg); }
+  54% { transform: rotate(8deg); }
+  88% { transform: rotate(8deg); }
   100% { transform: rotate(0deg); }
 }
 @keyframes streamvault-logo-scale {
-  0% { transform: scale(1); animation-timing-function: ease-out; }
-  6.86% { transform: scale(1); animation-timing-function: cubic-bezier(.17,.67,.24,1); }
-  41.18% { transform: scale(1.5); animation-timing-function: cubic-bezier(.2,.8,.25,1); }
-  53.43% { transform: scale(1); animation-timing-function: cubic-bezier(.17,.67,.24,1); }
-  87.75% { transform: scale(1.5); animation-timing-function: cubic-bezier(.2,.8,.25,1); }
+  0%, 12% { transform: scale(1); animation-timing-function: cubic-bezier(.17,.67,.24,1); }
+  42% { transform: scale(1.5); animation-timing-function: cubic-bezier(.2,.8,.25,1); }
+  54% { transform: scale(1); animation-timing-function: cubic-bezier(.17,.67,.24,1); }
+  88% { transform: scale(1.5); animation-timing-function: cubic-bezier(.2,.8,.25,1); }
   100% { transform: scale(1); }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -565,10 +568,12 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
   text-align: left;
 }
 .streamvault-latest-cover { min-height: 280px; height: 100%; overflow: hidden; border-radius: 14px; }
-.streamvault-preview-stage { min-width: 0; display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 12px; }
-.streamvault-preview-main { min-height: 280px; position: relative; overflow: hidden; border-radius: 14px; background: #050708; }
+.streamvault-preview-stage { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 170px; gap: 12px; }
+.streamvault-preview-main { min-height: 280px; position: relative; overflow: hidden; border-radius: 14px; background: #050708; cursor: pointer; outline: 0; }
+.streamvault-preview-main:focus-visible { box-shadow: 0 0 0 2px var(--sv-orange); }
 .streamvault-preview-main > video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #050708; }
-.streamvault-preview-loading { position: absolute; left: 12px; bottom: 12px; z-index: 2; padding: 5px 8px; border-radius: 999px; background: rgba(5,7,8,.76); color: #cbd3da; font-size: 10px; font-weight: 800; letter-spacing: .02em; backdrop-filter: blur(5px); }
+.streamvault-preview-loop-fade { position: absolute; inset: 0; z-index: 4; background: #000; opacity: 0; pointer-events: none; transition: opacity .25s ease; }
+.streamvault-preview-loop-fade.is-active { opacity: 1; }
 .streamvault-preview-transition { position: absolute; inset: 0; animation: streamvault-preview-in .34s cubic-bezier(.2,.75,.2,1) both; }
 @keyframes streamvault-preview-in {
   from { opacity: .1; transform: translate3d(10px,0,0) scale(1.018); filter: saturate(.75); }
@@ -705,7 +710,8 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 .streamvault-comment-composer { display: grid; grid-template-columns: 40px minmax(0,1fr); gap: 10px; margin-top: 15px; }
 .streamvault-comment-avatar { width: 38px; height: 38px; overflow: hidden; border-radius: 50%; display: grid; place-items: center; background: #202a33; color: #dbe1e5; font-size: 11px; font-weight: 850; }
 .streamvault-comment-avatar img { width: 100%; height: 100%; display: block; object-fit: cover; }
-.streamvault-comment-composer textarea { width: 100%; min-height: 76px; resize: vertical; border: 1px solid var(--sv-line); border-radius: 11px; background: #11171d; color: var(--sv-orange-2); padding: 11px 12px; outline: 0; font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.streamvault-comment-composer textarea { width: 100%; min-height: 76px; resize: vertical; border: 1px solid var(--sv-line); border-radius: 11px; background: #11171d; color: var(--sv-orange-2); padding: 11px 12px; outline: 0; font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: none; }
+.streamvault-comment-composer textarea.is-underlined { text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .streamvault-comment-composer textarea:focus { border-color: #465461; }
 .streamvault-comment-actions { min-height: 38px; display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 8px; }
 .streamvault-comment-actions > span { margin-right: auto; color: #7d8790; font-size: 11px; }
@@ -714,16 +720,38 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 .streamvault-comment-color input::-webkit-color-swatch-wrapper { padding: 2px; }
 .streamvault-comment-color input::-webkit-color-swatch { border: 0; border-radius: 4px; }
 .streamvault-comment-actions button { border: 1px solid var(--sv-orange); background: var(--sv-orange); color: #181008; font-weight: 800; }
+.streamvault-comment-underline { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border-color: #394650 !important; border-radius: 7px; background: #11171d !important; color: #cbd3da !important; }
+.streamvault-comment-underline span { text-decoration: underline; text-underline-offset: 2px; font-weight: 900; }
+.streamvault-comment-underline.is-active { border-color: var(--sv-orange) !important; color: var(--sv-orange-2) !important; background: rgba(255,120,24,.12) !important; }
+.streamvault-comment-replying { margin: 0 0 7px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px; border: 1px solid var(--sv-line-soft); border-radius: 8px; background: rgba(255,255,255,.025); color: #89949e; font-size: 10px; }
+.streamvault-comment-replying strong { color: #dce2e7; }
+.streamvault-comment-replying small { color: #68737d; }
+.streamvault-comment-replying button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; background: transparent; color: #7d8790; font-size: 18px; }
 .streamvault-comment-login { min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 15px; padding: 10px 12px; border: 1px solid var(--sv-line-soft); border-radius: 11px; background: rgba(15,21,27,.62); color: #89949e; font-size: 11px; }
 .streamvault-comment-login button { border-color: var(--sv-orange); background: transparent; color: var(--sv-orange-2); font-weight: 800; }
 .streamvault-comment-list { display: grid; gap: 0; margin-top: 18px; border-top: 1px solid var(--sv-line-soft); }
+.streamvault-comment-thread { min-width: 0; }
+.streamvault-comment-thread.is-reply { margin-left: 38px; border-left: 1px solid #26313a; padding-left: 10px; }
 .streamvault-comment-item { display: grid; grid-template-columns: 40px minmax(0,1fr); gap: 10px; padding: 14px 2px; border-bottom: 1px solid var(--sv-line-soft); }
 .streamvault-comment-item-body { min-width: 0; }
 .streamvault-comment-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
 .streamvault-comment-meta strong { color: #e6ebef; font-size: 12px; }
 .streamvault-comment-meta small, .streamvault-comment-meta time { color: #68737d; font-size: 9px; }
 .streamvault-comment-meta time { margin-left: auto; }
-.streamvault-comment-item p { margin: 6px 0 0; color: var(--sv-orange-2); font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.streamvault-comment-item p { margin: 6px 0 0; color: var(--sv-orange-2); font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: none; overflow-wrap: anywhere; white-space: pre-wrap; }
+.streamvault-comment-item p.is-underlined { text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.streamvault-comment-footer { margin-top: 9px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.streamvault-comment-reactions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.streamvault-comment-reactions button { min-width: 29px; height: 27px; display: inline-flex; align-items: center; justify-content: center; gap: 3px; padding: 2px 5px; border: 1px solid transparent; border-radius: 999px; background: transparent; color: #7c8790; cursor: pointer; }
+.streamvault-comment-reactions button:hover { background: rgba(255,255,255,.045); border-color: #303b44; }
+.streamvault-comment-reactions button.is-selected { background: rgba(255,120,24,.12); border-color: rgba(255,155,55,.5); color: var(--sv-orange-2); }
+.streamvault-comment-reaction-emoji { position: relative; width: 20px; height: 20px; display: inline-grid; place-items: center; font-family: "Apple Color Emoji", "Segoe UI Emoji", sans-serif; font-size: 17px; line-height: 1; }
+.streamvault-comment-reaction-emoji > span { display: block; }
+.streamvault-comment-reaction-emoji > img { position: absolute; inset: 0; width: 20px; height: 20px; object-fit: contain; }
+.streamvault-comment-reaction-count { font-size: 9px; font-weight: 850; font-variant-numeric: tabular-nums; }
+.streamvault-comment-reply { border: 0; background: transparent; color: #77828c; padding: 3px 5px; font-size: 10px; font-weight: 800; cursor: pointer; }
+.streamvault-comment-reply:hover { color: var(--sv-orange-2); }
+.streamvault-comment-replies { min-width: 0; }
 .streamvault-comment-empty { padding: 18px 2px; color: #68737d; font-size: 11px; }
 
 .streamvault-app .site-replay-chat { height: min(72vh, 690px); min-height: 430px; border-color: var(--sv-line); border-radius: 14px; background: rgba(15,21,27,.96); box-shadow: 0 24px 80px rgba(0,0,0,.35); position: sticky; top: 88px; }
@@ -1150,4 +1178,108 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 }
 @media (max-width: 900px) {
   .streamvault-header-actions .streamvault-header-button.primary { display: inline-flex; align-items: center; }
+}
+
+/* frame lightbox navigation */
+.streamvault-frame-overlay-nav {
+  position: fixed;
+  z-index: 221;
+  top: 50%;
+  width: 52px;
+  height: 64px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  transform: translateY(-50%);
+  border: 1px solid #4b565f;
+  border-radius: 13px;
+  background: rgba(13,18,22,.9);
+  color: #f2f4f6;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+}
+.streamvault-frame-overlay-nav.is-prev { left: 22px; }
+.streamvault-frame-overlay-nav.is-next { right: 22px; }
+.streamvault-frame-overlay-nav:hover { border-color: var(--sv-orange); color: var(--sv-orange-2); }
+.streamvault-frame-overlay-counter {
+  position: fixed;
+  z-index: 221;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  padding: 5px 9px;
+  border: 1px solid #394650;
+  border-radius: 999px;
+  background: rgba(13,18,22,.88);
+  color: #a9b3bc;
+  font-size: 10px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+/* compact reaction picker */
+.streamvault-comment-reaction-picker-wrap { position: relative; }
+.streamvault-comment-reaction-add { min-width: 32px !important; padding: 2px 7px !important; color: #7c8790 !important; font-size: 12px; font-weight: 900; }
+.streamvault-comment-reaction-add.is-open { border-color: rgba(255,155,55,.5) !important; color: var(--sv-orange-2) !important; background: rgba(255,120,24,.1) !important; }
+.streamvault-comment-reaction-picker {
+  position: absolute;
+  z-index: 24;
+  left: 0;
+  bottom: calc(100% + 7px);
+  display: grid;
+  grid-template-columns: repeat(4, 34px);
+  gap: 4px;
+  padding: 7px;
+  border: 1px solid #303b44;
+  border-radius: 11px;
+  background: rgba(13,18,22,.98);
+  box-shadow: 0 16px 45px rgba(0,0,0,.55);
+}
+.streamvault-comment-reaction-picker button { width: 34px; min-width: 34px; height: 34px; padding: 5px; }
+
+/* synchronized watch rooms */
+.streamvault-watch-sessions {
+  margin-top: 14px;
+  padding: 13px;
+  border: 1px solid var(--sv-line-soft);
+  border-radius: 13px;
+  background: rgba(15,21,27,.72);
+}
+.streamvault-watch-sessions-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.streamvault-watch-sessions-head > div { display: grid; gap: 2px; }
+.streamvault-watch-sessions-head strong { color: #e7edf1; font-size: 13px; }
+.streamvault-watch-sessions-head span { color: #6f7a84; font-size: 9px; }
+.streamvault-watch-sessions-head > button { border-color: #3b4751; background: #11171d; color: #cbd3da; font-size: 10px; font-weight: 800; }
+.streamvault-watch-sessions-head > button:hover:not(:disabled) { border-color: var(--sv-orange); color: var(--sv-orange-2); }
+.streamvault-watch-sessions-notice { margin-top: 9px; color: #d9a16c; font-size: 10px; }
+.streamvault-watch-sessions-list { display: grid; gap: 6px; margin-top: 10px; }
+.streamvault-watch-sessions-list > button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border: 1px solid #26313a;
+  border-radius: 9px;
+  background: #10161b;
+  color: #cbd3da;
+  text-align: left;
+}
+.streamvault-watch-sessions-list > button:hover:not(:disabled) { border-color: #465461; background: #131b21; }
+.streamvault-watch-sessions-list > button.is-current { border-color: rgba(255,120,24,.52); background: rgba(255,120,24,.075); }
+.streamvault-watch-session-main { min-width: 0; display: grid; gap: 2px; }
+.streamvault-watch-session-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e6ebef; font-size: 11px; }
+.streamvault-watch-session-main small { color: #6f7a84; font-size: 9px; font-variant-numeric: tabular-nums; }
+.streamvault-watch-session-action { flex: 0 0 auto; color: var(--sv-orange-2); font-size: 9px; font-weight: 850; }
+.streamvault-watch-sessions-empty { padding: 9px 2px 2px; color: #65717b; font-size: 10px; }
+
+@media (max-width: 700px) {
+  .streamvault-frame-overlay { padding: 56px 12px 70px; }
+  .streamvault-frame-overlay-nav { width: 42px; height: 52px; font-size: 24px; }
+  .streamvault-frame-overlay-nav.is-prev { left: 8px; }
+  .streamvault-frame-overlay-nav.is-next { right: 8px; }
+  .streamvault-watch-sessions-head { align-items: flex-start; flex-direction: column; }
 }
