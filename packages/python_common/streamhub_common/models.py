@@ -558,6 +558,101 @@ class StorageMigrationJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    nickname: Mapped[str] = mapped_column(String(40))
+    login: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    avatar_path: Mapped[str | None] = mapped_column(String(512))
+    email_verified_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    telegram_user_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, index=True)
+    telegram_username: Mapped[str | None] = mapped_column(String(64))
+    telegram_verified_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    twitch_user_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    twitch_login: Mapped[str | None] = mapped_column(String(255))
+    twitch_verified_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserEmailVerificationCode(Base):
+    __tablename__ = "user_email_verification_codes"
+    __table_args__ = (Index("ix_user_email_verification_user_id_id", "user_id", "id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    code_hash: Mapped[str] = mapped_column(String(64))
+    attempt_count: Mapped[int] = mapped_column(SmallInteger, default=0)
+    expires_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), index=True)
+    sent_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6))
+    consumed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+
+
+class UserTelegramRegistration(Base):
+    __tablename__ = "user_telegram_registrations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    start_token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    browser_token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    telegram_user_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    telegram_username: Mapped[str | None] = mapped_column(String(64))
+    telegram_first_name: Mapped[str | None] = mapped_column(String(255))
+    expires_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), index=True)
+    started_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    confirmed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserTwitchRegistration(Base):
+    __tablename__ = "user_twitch_registrations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    state_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    browser_token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    twitch_user_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    twitch_login: Mapped[str | None] = mapped_column(String(255))
+    expires_at_utc: Mapped[datetime] = mapped_column(DATETIME(fsp=6), index=True)
+    confirmed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SiteComment(Base):
+    __tablename__ = "site_comments"
+    __table_args__ = (
+        Index("ix_site_comments_event_id_id", "event_id", "id"),
+        Index("ix_site_comments_user_id_created_at", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("media_events.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    body: Mapped[str] = mapped_column(Text)
+    text_color: Mapped[str] = mapped_column(String(7), default="#ff9b37")
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, index=True)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
 

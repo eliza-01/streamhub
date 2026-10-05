@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 import uuid
 
 import httpx
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
@@ -23,6 +24,7 @@ from streamhub_common.models import (
     Session,
     SiteEventAsset,
     SiteEventPublication,
+    SiteComment,
     SiteEventTimecode,
     TelegramVideoPartBinding,
     VideoPart,
@@ -30,7 +32,10 @@ from streamhub_common.models import (
     VideoRun,
     VideoSegment,
     VideoSession,
+    User,
 )
+
+from .user_auth import require_current_user
 
 from ..site_assets import (
     SITE_ASSET_SLOTS,
@@ -44,6 +49,7 @@ router = APIRouter(prefix="/api/v1/site", tags=["site"])
 settings = get_settings()
 
 MAX_EVENT_CATEGORIES = 3
+_COMMENT_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 class SitePublishRequest(BaseModel):
@@ -70,6 +76,11 @@ class SiteTimecodeInput(BaseModel):
 
 class SiteTimecodesRequest(BaseModel):
     items: list[SiteTimecodeInput] = Field(default_factory=list, max_length=200)
+
+
+class SiteCommentCreateRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=4000)
+    text_color: str = Field(default="#ff9b37", min_length=7, max_length=7)
 
 
 def _event_title(event: MediaEvent) -> str:
@@ -527,6 +538,98 @@ async def site_feed(
 async def site_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
     row = await _require_public_event(db, event_id)
     return (await _site_payloads(db, [row], include_timecodes=True))[0]
+
+
+def _site_comment_payload(comment: SiteComment, user: User) -> dict:
+    avatar_url = None
+    if user.avatar_path:
+        version = int(user.updated_at.timestamp()) if user.updated_at else 0
+        avatar_url = f"/api/v1/user-auth/users/{user.id}/avatar?v={version}"
+    return {
+        "id": int(comment.id),
+        "event_id": str(comment.event_id),
+        "body": comment.body,
+        "text_color": comment.text_color or "#ff9b37",
+        "created_at": comment.created_at.isoformat() if comment.created_at else None,
+        "user": {
+            "id": str(user.id),
+            "nickname": user.nickname,
+            "login": user.login,
+            "avatar_url": avatar_url,
+        },
+    }
+
+
+@router.get("/events/{event_id}/comments")
+async def site_event_comments(
+    event_id: uuid.UUID,
+    page_size: int = Query(default=100, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await _require_public_event(db, event_id)
+    rows = (
+        await db.execute(
+            select(SiteComment, User)
+            .join(User, User.id == SiteComment.user_id)
+            .where(SiteComment.event_id == event_id, User.is_active.is_(True))
+            .order_by(SiteComment.created_at.desc(), SiteComment.id.desc())
+            .limit(page_size)
+        )
+    ).all()
+    return {
+        "event_id": str(event_id),
+        "items": [_site_comment_payload(comment, user) for comment, user in rows],
+    }
+
+
+@router.post("/events/{event_id}/comments", status_code=201)
+async def create_site_event_comment(
+    event_id: uuid.UUID,
+    payload: SiteCommentCreateRequest,
+    user: User = Depends(require_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await _require_public_event(db, event_id)
+    body = payload.body.strip()
+    if not body:
+        raise HTTPException(400, "Комментарий не может быть пустым")
+    text_color = payload.text_color.lower()
+    if not _COMMENT_COLOR_RE.fullmatch(text_color):
+        raise HTTPException(400, "Некорректный цвет комментария")
+
+    now = datetime.utcnow()
+    # Serialize comment creation per user so concurrent clicks/tabs cannot bypass the 60s limit.
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    latest = (
+        await db.execute(
+            select(SiteComment)
+            .where(SiteComment.user_id == user.id)
+            .order_by(SiteComment.created_at.desc(), SiteComment.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latest and latest.created_at:
+        elapsed = max(0.0, (now - latest.created_at).total_seconds())
+        if elapsed < 60:
+            retry_after = max(1, int(60 - elapsed + 0.999))
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "message": "Можно отправлять не больше одного комментария в минуту",
+                    "retry_after_seconds": retry_after,
+                },
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    comment = SiteComment(event_id=event_id, user_id=user.id, body=body, text_color=text_color, created_at=now)
+    db.add(comment)
+    await db.commit()
+    await db.refresh(comment)
+    return {
+        "comment": _site_comment_payload(comment, user),
+        "cooldown_seconds": 60,
+        "next_allowed_at": (now + timedelta(seconds=60)).isoformat(),
+    }
 
 
 def _naive_utc(value: datetime | None) -> datetime | None:

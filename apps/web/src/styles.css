@@ -265,7 +265,7 @@ td { font-variant-numeric: tabular-nums; }
 .site-replay-chat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 13px 14px 11px; border-bottom: 1px solid #202a33; }
 .site-replay-chat-head strong { font-size: 14px; }
 .site-replay-chat-head span { color: #7f8c98; font-size: 11px; text-align: right; }
-.site-replay-chat-list { min-height: 0; overflow-y: auto; padding: 9px 10px 12px; scrollbar-width: thin; scrollbar-color: #33404d transparent; }
+.site-replay-chat-list { min-height: 0; overflow-y: auto; overflow-anchor: none; padding: 9px 10px 12px; scrollbar-width: thin; scrollbar-color: #33404d transparent; }
 .site-replay-chat-message { display: grid; grid-template-columns: minmax(0, 1fr); padding: 5px 2px; font-size: 12px; line-height: 1.42; }
 .site-replay-chat-body { min-width: 0; overflow-wrap: anywhere; }
 .site-chat-line { display: inline; min-width: 0; }
@@ -290,7 +290,7 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
   .site-replay-chat { position: static; height: 480px; min-height: 320px; }
 }
 
-/* StreamVault public UI v1. The public surface intentionally has its own shell
+/* MRW Hub public UI v1. The public surface intentionally has its own shell
    so StreamHub operator controls do not leak into the viewer experience. */
 .streamvault-app {
   --sv-bg: #080b0e;
@@ -565,8 +565,10 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
   text-align: left;
 }
 .streamvault-latest-cover { min-height: 280px; height: 100%; overflow: hidden; border-radius: 14px; }
-.streamvault-preview-stage { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 170px; gap: 12px; }
-.streamvault-preview-main { min-height: 280px; position: relative; overflow: hidden; border-radius: 14px; cursor: pointer; }
+.streamvault-preview-stage { min-width: 0; display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 12px; }
+.streamvault-preview-main { min-height: 280px; position: relative; overflow: hidden; border-radius: 14px; background: #050708; }
+.streamvault-preview-main > video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #050708; }
+.streamvault-preview-loading { position: absolute; left: 12px; bottom: 12px; z-index: 2; padding: 5px 8px; border-radius: 999px; background: rgba(5,7,8,.76); color: #cbd3da; font-size: 10px; font-weight: 800; letter-spacing: .02em; backdrop-filter: blur(5px); }
 .streamvault-preview-transition { position: absolute; inset: 0; animation: streamvault-preview-in .34s cubic-bezier(.2,.75,.2,1) both; }
 @keyframes streamvault-preview-in {
   from { opacity: .1; transform: translate3d(10px,0,0) scale(1.018); filter: saturate(.75); }
@@ -575,8 +577,13 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 
 .streamvault-preview-rail { min-height: 0; display: grid; grid-template-rows: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .streamvault-preview-rail > button { min-height: 0; overflow: hidden; border: 1px solid var(--sv-line); border-radius: 9px; opacity: .64; transition: opacity .18s ease, border-color .18s ease, transform .18s ease; }
-.streamvault-preview-rail > button:hover { transform: translateX(-2px); }
-.streamvault-preview-rail > button:hover, .streamvault-preview-rail > button.active { opacity: 1; border-color: var(--sv-orange); }
+.streamvault-preview-rail > button:hover { transform: translateX(2px); }
+.streamvault-preview-rail > button:hover, .streamvault-preview-rail > button:focus-visible { opacity: 1; border-color: var(--sv-orange); }
+.streamvault-preview-rail > button:disabled { cursor: default; opacity: .32; transform: none; }
+.streamvault-frame-overlay { position: fixed; inset: 0; z-index: 220; display: grid; place-items: center; padding: 42px; background: rgba(0,0,0,.88); backdrop-filter: blur(8px); }
+.streamvault-frame-overlay > img { display: block; max-width: min(94vw, 1680px); max-height: 88vh; width: auto; height: auto; object-fit: contain; border-radius: 12px; box-shadow: 0 24px 90px rgba(0,0,0,.7); }
+.streamvault-frame-overlay-close { position: fixed; top: 18px; right: 22px; z-index: 221; width: 42px; height: 42px; display: grid; place-items: center; padding: 0; border: 1px solid #4b565f; border-radius: 50%; background: rgba(13,18,22,.92); color: #f2f4f6; font-size: 28px; line-height: 1; cursor: pointer; }
+.streamvault-frame-overlay-close:hover { border-color: var(--sv-orange); color: var(--sv-orange-2); }
 .streamvault-artwork {
   width: 100%;
   height: 100%;
@@ -692,15 +699,32 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 .streamvault-chat-summary span { color: #6f7a84; font-size: 10px; }
 .streamvault-chat-summary strong { font-size: 13px; font-variant-numeric: tabular-nums; }
 .streamvault-comments { margin-top: 34px; padding-top: 24px; border-top: 1px solid var(--sv-line-soft); }
+.streamvault-comments-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .streamvault-comments-head h2 { margin: 0; font-size: 19px; letter-spacing: -.02em; }
-.streamvault-comments-head p { margin: 6px 0 0; color: #67727c; font-size: 11px; }
+.streamvault-comments-head h2 span { margin-left: 5px; color: #6f7a84; font-size: 12px; font-weight: 750; }
 .streamvault-comment-composer { display: grid; grid-template-columns: 40px minmax(0,1fr); gap: 10px; margin-top: 15px; }
-.streamvault-comment-avatar { width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; background: #202a33; color: #dbe1e5; font-size: 11px; font-weight: 850; }
-.streamvault-comment-composer textarea { width: 100%; min-height: 76px; resize: vertical; border: 1px solid var(--sv-line); border-radius: 11px; background: #11171d; color: var(--sv-text); padding: 11px 12px; outline: 0; }
+.streamvault-comment-avatar { width: 38px; height: 38px; overflow: hidden; border-radius: 50%; display: grid; place-items: center; background: #202a33; color: #dbe1e5; font-size: 11px; font-weight: 850; }
+.streamvault-comment-avatar img { width: 100%; height: 100%; display: block; object-fit: cover; }
+.streamvault-comment-composer textarea { width: 100%; min-height: 76px; resize: vertical; border: 1px solid var(--sv-line); border-radius: 11px; background: #11171d; color: var(--sv-orange-2); padding: 11px 12px; outline: 0; font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .streamvault-comment-composer textarea:focus { border-color: #465461; }
-.streamvault-comment-actions { min-height: 38px; display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 8px; }
-.streamvault-comment-actions span { color: #7d8790; font-size: 11px; }
+.streamvault-comment-actions { min-height: 38px; display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 8px; }
+.streamvault-comment-actions > span { margin-right: auto; color: #7d8790; font-size: 11px; }
+.streamvault-comment-color { display: inline-flex; align-items: center; gap: 6px; color: #7d8790; font-size: 10px; font-weight: 800; cursor: pointer; }
+.streamvault-comment-color input { width: 28px; height: 28px; padding: 0; overflow: hidden; border: 1px solid #394650; border-radius: 7px; background: transparent; cursor: pointer; }
+.streamvault-comment-color input::-webkit-color-swatch-wrapper { padding: 2px; }
+.streamvault-comment-color input::-webkit-color-swatch { border: 0; border-radius: 4px; }
 .streamvault-comment-actions button { border: 1px solid var(--sv-orange); background: var(--sv-orange); color: #181008; font-weight: 800; }
+.streamvault-comment-login { min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 15px; padding: 10px 12px; border: 1px solid var(--sv-line-soft); border-radius: 11px; background: rgba(15,21,27,.62); color: #89949e; font-size: 11px; }
+.streamvault-comment-login button { border-color: var(--sv-orange); background: transparent; color: var(--sv-orange-2); font-weight: 800; }
+.streamvault-comment-list { display: grid; gap: 0; margin-top: 18px; border-top: 1px solid var(--sv-line-soft); }
+.streamvault-comment-item { display: grid; grid-template-columns: 40px minmax(0,1fr); gap: 10px; padding: 14px 2px; border-bottom: 1px solid var(--sv-line-soft); }
+.streamvault-comment-item-body { min-width: 0; }
+.streamvault-comment-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.streamvault-comment-meta strong { color: #e6ebef; font-size: 12px; }
+.streamvault-comment-meta small, .streamvault-comment-meta time { color: #68737d; font-size: 9px; }
+.streamvault-comment-meta time { margin-left: auto; }
+.streamvault-comment-item p { margin: 6px 0 0; color: var(--sv-orange-2); font-size: 16px; font-weight: 800; line-height: 1.45; text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.streamvault-comment-empty { padding: 18px 2px; color: #68737d; font-size: 11px; }
 
 .streamvault-app .site-replay-chat { height: min(72vh, 690px); min-height: 430px; border-color: var(--sv-line); border-radius: 14px; background: rgba(15,21,27,.96); box-shadow: 0 24px 80px rgba(0,0,0,.35); position: sticky; top: 88px; }
 .streamvault-app .site-replay-chat-head { align-items: center; padding: 14px 14px 12px; border-bottom-color: var(--sv-line-soft); }
@@ -903,7 +927,7 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 .video-manager-session.is-clickable:hover { border-color: #a1a1aa; box-shadow: 0 5px 18px rgba(0,0,0,.08); transform: translateY(-1px); }
 .video-manager-session.is-clickable:focus-visible { outline: 2px solid #f59e0b; outline-offset: 2px; }
 
-/* StreamVault admin: editable public metadata + persistent manual artwork. */
+/* MRW Hub admin: editable public metadata + persistent manual artwork. */
 .streamvault-header-button.admin { border-color: rgba(255,120,24,.72); color: var(--sv-orange-2); background: rgba(255,120,24,.08); }
 .streamvault-header-button.admin:hover { border-color: var(--sv-orange); background: rgba(255,120,24,.16); color: #fff; }
 .streamvault-artwork.has-image { padding: 0; background: #090c0f; }
@@ -1046,4 +1070,84 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 .trash-purge-status.failed { background: #fff0f0; border-color: #efb0b0; }
 @media (max-width: 760px) {
   .trash-purge-job { align-items: stretch; flex-direction: column; }
+}
+
+/* MRW Hub user auth / registration */
+.streamvault-auth-backdrop {
+  position: fixed; inset: 0; z-index: 110; display: grid; place-items: center; padding: 20px;
+  background: rgba(0,0,0,.76); backdrop-filter: blur(7px);
+}
+.streamvault-auth-modal {
+  position: relative; width: min(430px, 100%); max-height: min(92vh, 820px); overflow: auto;
+  padding: 26px; border: 1px solid #303b45; border-radius: 18px; background: #0d1318; color: #eef2f5;
+  box-shadow: 0 30px 100px rgba(0,0,0,.62);
+}
+.streamvault-auth-close {
+  position: absolute; top: 12px; right: 12px; width: 34px; height: 34px; padding: 0;
+  border: 1px solid #34414b; border-radius: 9px; background: #141c23; color: #9ba6af; font-size: 20px;
+}
+.streamvault-auth-brand { display: grid; gap: 5px; margin-bottom: 20px; }
+.streamvault-auth-brand > span { color: var(--sv-orange); font-size: 9px; font-weight: 900; letter-spacing: .14em; }
+.streamvault-auth-brand > strong { font-size: 24px; line-height: 1.15; }
+.streamvault-auth-form { display: grid; gap: 12px; }
+.streamvault-auth-form > label { display: grid; gap: 6px; }
+.streamvault-auth-form > label > span:first-child { color: #8d98a2; font-size: 10px; font-weight: 800; }
+.streamvault-auth-form input:not([type="file"]) {
+  width: 100%; height: 42px; border: 1px solid #34414b; border-radius: 10px; background: #111920;
+  color: #f0f3f5; padding: 0 12px; outline: 0;
+}
+.streamvault-auth-form input:not([type="file"]):focus { border-color: var(--sv-orange); box-shadow: 0 0 0 2px rgba(255,120,24,.12); }
+.streamvault-auth-submit {
+  min-height: 42px; margin-top: 4px; border: 1px solid var(--sv-orange); border-radius: 10px;
+  background: var(--sv-orange); color: #17100b; font-weight: 900;
+}
+.streamvault-auth-submit.telegram {
+  display: flex; align-items: center; justify-content: center; gap: 9px; width: 100%; padding: 0 14px;
+  background: #229ed9; border-color: #229ed9; color: #fff; text-decoration: none; cursor: pointer;
+}
+.streamvault-auth-submit.telegram:hover { background: #2aabee; border-color: #2aabee; color: #fff; }
+.streamvault-auth-submit.telegram:disabled { opacity: .58; cursor: wait; }
+.streamvault-auth-submit.twitch { display: flex; align-items: center; justify-content: center; gap: 9px; width: 100%; padding: 0 14px; background: #9147ff; border-color: #9147ff; color: #fff; text-decoration: none; cursor: pointer; }
+.streamvault-auth-submit.twitch:hover { background: #a970ff; border-color: #a970ff; color: #fff; }
+.streamvault-auth-submit.twitch:disabled { opacity: .58; cursor: wait; }
+.streamvault-auth-submit.twitch .site-twitch-icon { width: 19px; height: 19px; color: currentColor; }
+.streamvault-auth-confirm-grid { display: grid; grid-template-columns: 1fr; gap: 8px; }
+.streamvault-auth-telegram-icon { width: 19px; height: 19px; flex: 0 0 19px; fill: currentColor; }
+.streamvault-auth-switch { border: 0; background: transparent; color: var(--sv-orange-2); font-size: 11px; font-weight: 800; text-decoration: underline; text-underline-offset: 3px; }
+.streamvault-auth-switch.muted { color: #7d8993; }
+.streamvault-auth-error, .streamvault-auth-notice { padding: 9px 11px; border-radius: 9px; font-size: 10px; line-height: 1.45; }
+.streamvault-auth-error { border: 1px solid #713a3a; background: #261718; color: #e9aaaa; }
+.streamvault-auth-notice { border: 1px solid rgba(68,167,110,.45); background: rgba(68,167,110,.09); color: #8fd4ad; }
+.streamvault-auth-copy { margin: 0 0 3px; color: #9aa4ad; font-size: 12px; line-height: 1.55; }
+.streamvault-auth-copy strong { color: #f0f3f5; }
+.streamvault-auth-code { text-align: center; font-size: 23px; font-weight: 900; letter-spacing: .32em; font-variant-numeric: tabular-nums; }
+.streamvault-auth-avatar-picker { position: relative; grid-template-columns: 72px minmax(0,1fr); align-items: center; gap: 4px 12px !important; padding-bottom: 3px; cursor: pointer; }
+.streamvault-auth-avatar-picker > span:first-child { grid-column: 2; }
+.streamvault-auth-avatar-input { position: absolute !important; width: 1px !important; height: 1px !important; opacity: 0; pointer-events: none; }
+.streamvault-auth-avatar-picker small { grid-column: 2; color: #66727c; font-size: 9px; }
+.streamvault-auth-avatar-preview { grid-column: 1; grid-row: 1 / span 3; width: 72px; height: 72px; overflow: hidden; display: grid; place-items: center; border: 0; border-radius: 50%; background: #151e25; color: var(--sv-orange-2); }
+.streamvault-auth-avatar-preview img { width: 100%; height: 100%; object-fit: cover; }
+.streamvault-auth-avatar-preview b { display: grid; place-items: center; width: 100%; height: 100%; font-size: 26px; line-height: 1; }
+.streamvault-auth-avatar-plus { position: relative; width: 24px; height: 24px; display: block; }
+.streamvault-auth-avatar-plus::before, .streamvault-auth-avatar-plus::after { content: ""; position: absolute; left: 50%; top: 50%; border-radius: 999px; background: currentColor; transform: translate(-50%, -50%); }
+.streamvault-auth-avatar-plus::before { width: 24px; height: 3px; }
+.streamvault-auth-avatar-plus::after { width: 3px; height: 24px; }
+.streamvault-auth-user { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 3px 5px 3px 4px; border: 1px solid var(--sv-line); border-radius: 11px; background: #11171d; }
+.streamvault-auth-avatar { width: 30px; height: 30px; overflow: hidden; display: grid; place-items: center; flex: 0 0 30px; border-radius: 50%; background: rgba(255,120,24,.15); color: var(--sv-orange-2); font-size: 11px; font-weight: 900; }
+.streamvault-auth-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.streamvault-auth-user-copy { min-width: 0; display: grid; gap: 0; line-height: 1.1; }
+.streamvault-auth-user-copy strong { max-width: 110px; overflow: hidden; color: #e8ecef; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.streamvault-auth-user-copy small { max-width: 110px; overflow: hidden; color: #69757f; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.streamvault-auth-logout { min-height: 28px; padding: 0 7px; border: 0; border-left: 1px solid #303b45; border-radius: 0; background: transparent; color: #7f8992; font-size: 9px; }
+.streamvault-auth-logout:hover:not(:disabled) { border-color: transparent; border-left-color: #303b45; color: #fff; }
+@media (max-width: 900px) {
+  .streamvault-auth-user-copy { display: none; }
+  .streamvault-auth-logout { display: none; }
+}
+@media (max-width: 660px) {
+  .streamvault-auth-modal { padding: 22px 18px; }
+  .streamvault-auth-user { padding-right: 4px; }
+}
+@media (max-width: 900px) {
+  .streamvault-header-actions .streamvault-header-button.primary { display: inline-flex; align-items: center; }
 }

@@ -1,0 +1,155 @@
+diff --git a/system/control-center/character_store.py b/system/control-center/character_store.py
+index 94fa0f1..95f1730 100644
+--- a/system/control-center/character_store.py
++++ b/system/control-center/character_store.py
+@@ -12,7 +12,7 @@ import tempfile
+ from character_analysis import analyze_character_fbx, prepare_character_fbx
+ from opencloud_assets import create_model_asset, update_model_asset, wait_for_operation
+ 
+-SCHEMA_VERSION = 3
++SCHEMA_VERSION = 4
+ PROJECT = "game1"
+ ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+ ACTIVE_KEY = "active_character_archetype_id"
+@@ -95,6 +95,7 @@ class CharacterStore:
+             self._ensure_column(connection, "characters", "skeleton_structure_signature", "TEXT NOT NULL DEFAULT ''")
+             self._ensure_column(connection, "characters", "skeleton_json", "TEXT NOT NULL DEFAULT '{}'")
+             self._ensure_column(connection, "characters", "published_sha256", "TEXT NOT NULL DEFAULT ''")
++            self._ensure_column(connection, "characters", "model_replacement_pending", "INTEGER NOT NULL DEFAULT 0")
+             self._ensure_column(connection, "characters", "moderation_state", "TEXT NOT NULL DEFAULT ''")
+             self._ensure_column(connection, "characters", "published_at", "REAL")
+ 
+@@ -258,6 +259,10 @@ class CharacterStore:
+             prepared = prepared_target.relative_to(self.root).as_posix()
+             sha = prepared_digest
+ 
++        replacement_pending = int(old.get("model_replacement_pending") or 0) if old else 0
++        if raw_source and old and str(old.get("model_asset_id") or "").strip() and sha != str(old.get("sha256") or ""):
++            replacement_pending = 1
++
+         now = time.time()
+         revision = (int(old["revision"]) + 1) if old else 1
+         created_at = old["created_at"] if old else now
+@@ -270,6 +275,7 @@ class CharacterStore:
+             "prepared_path": prepared,
+             "sha256": sha,
+             "model_asset_id": old.get("model_asset_id") if old else None,
++            "model_replacement_pending": replacement_pending,
+             "published_sha256": str(old.get("published_sha256") or "") if old else "",
+             "moderation_state": str(old.get("moderation_state") or "") if old else "",
+             "published_at": old.get("published_at") if old else None,
+@@ -288,14 +294,14 @@ class CharacterStore:
+         with self.connect() as connection:
+             connection.execute(
+                 """INSERT OR REPLACE INTO characters(
+-                  id,display_name,race,gender,source_path,prepared_path,sha256,model_asset_id,
++                  id,display_name,race,gender,source_path,prepared_path,sha256,model_asset_id,model_replacement_pending,
+                   status,revision,created_at,updated_at,armature_name,bone_count,mesh_count,
+                   skeleton_signature,skeleton_structure_signature,skeleton_json,published_sha256,
+                   moderation_state,published_at
+-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 (
+                     values["id"], values["display_name"], values["race"], values["gender"],
+-                    values["source_path"], values["prepared_path"], values["sha256"], values["model_asset_id"],
++                    values["source_path"], values["prepared_path"], values["sha256"], values["model_asset_id"], values["model_replacement_pending"],
+                     values["status"], values["revision"], values["created_at"], values["updated_at"],
+                     values["armature_name"], values["bone_count"], values["mesh_count"],
+                     values["skeleton_signature"], values["skeleton_structure_signature"], values["skeleton_json"],
+@@ -384,6 +390,7 @@ class CharacterStore:
+             "prepared_path": target_prepared.relative_to(self.root).as_posix(),
+             "sha256": str(source.get("sha256") or ""),
+             "model_asset_id": source.get("model_asset_id"),
++            "model_replacement_pending": int(source.get("model_replacement_pending") or 0),
+             "published_sha256": str(source.get("published_sha256") or ""),
+             "moderation_state": str(source.get("moderation_state") or ""),
+             "published_at": source.get("published_at"),
+@@ -399,12 +406,12 @@ class CharacterStore:
+         with self.connect() as connection:
+             connection.execute(
+                 """UPDATE characters SET
+-                   source_path=?,prepared_path=?,sha256=?,model_asset_id=?,published_sha256=?,
++                   source_path=?,prepared_path=?,sha256=?,model_asset_id=?,model_replacement_pending=?,published_sha256=?,
+                    moderation_state=?,published_at=?,armature_name=?,bone_count=?,mesh_count=?,
+                    skeleton_signature=?,skeleton_structure_signature=?,skeleton_json=?,status=?,
+                    revision=revision+1,updated_at=? WHERE id=?""",
+                 (
+-                    values["source_path"], values["prepared_path"], values["sha256"], values["model_asset_id"],
++                    values["source_path"], values["prepared_path"], values["sha256"], values["model_asset_id"], values["model_replacement_pending"],
+                     values["published_sha256"], values["moderation_state"], values["published_at"],
+                     values["armature_name"], values["bone_count"], values["mesh_count"],
+                     values["skeleton_signature"], values["skeleton_structure_signature"], values["skeleton_json"],
+@@ -447,8 +454,9 @@ class CharacterStore:
+         creator_id = str(publication.get("creatorId") or "").strip()
+         description = str(publication.get("description") or "game1 character model").strip()
+         current_asset_id = str(row.get("model_asset_id") or "").strip()
++        replacement_pending = bool(int(row.get("model_replacement_pending") or 0))
+ 
+-        if current_asset_id:
++        if current_asset_id and not replacement_pending:
+             operation = update_model_asset(
+                 prepared,
+                 asset_id=current_asset_id,
+@@ -472,7 +480,7 @@ class CharacterStore:
+         now = time.time()
+         with self.connect() as connection:
+             connection.execute(
+-                """UPDATE characters SET model_asset_id=?,published_sha256=?,moderation_state=?,published_at=?,updated_at=?
++                """UPDATE characters SET model_asset_id=?,model_replacement_pending=0,published_sha256=?,moderation_state=?,published_at=?,updated_at=?
+                    WHERE id=?""",
+                 (result.asset_id, row["sha256"], result.moderation_state or "", now, now, character_id),
+             )
+@@ -567,6 +575,7 @@ class CharacterStore:
+                         "preparedPath": row["prepared_path"],
+                         "sha256": row["sha256"],
+                         "assetId": row["model_asset_id"],
++                        "replacementPending": bool(int(row.get("model_replacement_pending") or 0)),
+                         "publishedSha256": row.get("published_sha256") or "",
+                         "moderationState": row.get("moderation_state") or "",
+                     },
+diff --git a/system/control-center/static/character-assets.js b/system/control-center/static/character-assets.js
+index 31bff95..d27c70b 100644
+--- a/system/control-center/static/character-assets.js
++++ b/system/control-center/static/character-assets.js
+@@ -25,15 +25,15 @@ function setForm(row){state.selected=row?.id||null;state.sourcePath='';state.mod
+ function renderRuntime(){const r=state.data.runtime;const host=$('runtime-state');if(r.mode==='registered'){host.className='runtime-state registered';host.innerHTML=`<strong>registered · ${esc(r.activeArchetypeId)}</strong><span>${esc(r.race)} / ${esc(r.gender)} · model asset ${esc(r.modelAssetId)}</span>`}else{host.className='runtime-state bootstrap';host.innerHTML=`<strong>bootstrap placeholder</strong><span>${esc(r.reason)}${r.activeArchetypeId?' · selected '+esc(r.activeArchetypeId):''}</span>`}const pub=state.data.publication||{};$('publication-state').className=pub.configured?'publication-ready':'publication-missing';$('publication-state').textContent=pub.configured?`open cloud: ${pub.creatorType} ${pub.creatorId}`:'open cloud: not configured'}
+ function renderTree(){const host=$('character-tree');host.innerHTML='';for(const item of state.data.items){const button=document.createElement('button');button.className=item.id===state.selected?'active':'';button.innerHTML=`<span>${esc(item.display_name||item.id)}<small>${esc(item.race||'?')} · ${esc(item.gender||'?')}</small></span><small>${esc(item.status)}</small>`;button.onclick=()=>setForm(item);host.appendChild(button)}if(!state.data.items.length)host.innerHTML='<small class="muted">no registered characters.</small>';$('rail-count').textContent=state.data.items.length}
+ function renderRows(){const body=$('rows');body.innerHTML='';for(const item of state.data.items){const active=state.data.activeArchetypeId===item.id;const tr=document.createElement('tr');tr.className=item.id===state.selected?'active':'';tr.innerHTML=`<td>${active?'yes':''}</td><td><b>${esc(item.race||'?')} / ${esc(item.gender||'?')}</b><br><small>${esc(item.id)}</small></td><td>${item.model_asset_id?`asset ${esc(item.model_asset_id)}`:'local only'}<br><small>${esc(item.sha256||'').slice(0,12)}</small></td><td>${esc(item.armature_name||'—')}<br><small>${esc(item.bone_count||0)} bones · ${esc(item.mesh_count||0)} mesh</small></td><td>${statusTag(item.status)}</td><td>${esc(item.revision)}</td><td><div class="row-actions"><button data-open>edit</button><button data-publish>publish</button><button data-sync>sync studio</button><button data-active>activate</button><button data-delete class="danger">delete</button></div></td>`;tr.querySelector('[data-open]').onclick=()=>setForm(item);tr.querySelector('[data-publish]').onclick=()=>publishCharacter(item.id);tr.querySelector('[data-sync]').onclick=()=>syncStudio(item.id);tr.querySelector('[data-active]').onclick=()=>activate(item.id);tr.querySelector('[data-delete]').onclick=()=>removeCharacter(item.id);body.appendChild(tr)}}
+-function renderDetails(row){const host=$('selected-details');if(!row){host.innerHTML='<span class="muted">select a character.</span>';return}host.innerHTML=`<div class="section-title"><div><span>selected</span><h3>${esc(row.display_name)}</h3></div>${statusTag(row.status)}</div><div class="details-grid"><div><b>canonical source</b><span>${esc(row.source_path||'—')}</span></div><div><b>prepared</b><span>${esc(row.prepared_path||'—')}</span></div><div><b>model asset id</b><span>${esc(row.model_asset_id||'not published')}</span></div><div><b>publication</b><span>${esc(row.moderation_state||'—')}</span></div><div><b>armature</b><span>${esc(row.armature_name||'—')} · ${esc(row.bone_count||0)} bones</span></div><div><b>skeleton signature</b><span>${esc(row.skeleton_signature||'—')}</span></div></div>`}
++function renderDetails(row){const host=$('selected-details');if(!row){host.innerHTML='<span class="muted">select a character.</span>';return}host.innerHTML=`<div class="section-title"><div><span>selected</span><h3>${esc(row.display_name)}</h3></div>${statusTag(row.status)}</div><div class="details-grid"><div><b>canonical source</b><span>${esc(row.source_path||'—')}</span></div><div><b>prepared</b><span>${esc(row.prepared_path||'—')}</span></div><div><b>model asset id</b><span>${esc(row.model_asset_id||'not published')}</span></div><div><b>replacement</b><span>${row.model_replacement_pending?'new asset id on next publish':'no pending replacement'}</span></div><div><b>publication</b><span>${esc(row.moderation_state||'—')}</span></div><div><b>armature</b><span>${esc(row.armature_name||'—')} · ${esc(row.bone_count||0)} bones</span></div><div><b>skeleton signature</b><span>${esc(row.skeleton_signature||'—')}</span></div></div>`}
+ function renderModelSource(row){const select=$('character-model-source');if(!select)return;if(!row){select.innerHTML='<option value="">register a new fbx first</option>';select.value='';select.disabled=true;return}const rows=(state.data?.items||[]).filter(item=>item.source_path&&item.prepared_path);const options=[];options.push(`<option value="${esc(row.id)}">current · ${esc(row.id)} · asset ${esc(row.model_asset_id||'local')}</option>`);for(const item of rows){if(item.id===row.id)continue;options.push(`<option value="${esc(item.id)}">${esc(item.race)}/${esc(item.gender)} · ${esc(item.id)} · asset ${esc(item.model_asset_id)}</option>`)}select.innerHTML=options.join('');const desired=state.modelSourceId||row.id;select.value=options.some(html=>html.includes(`value="${desired}"`))?desired:row.id;state.modelSourceId=select.value;select.disabled=false}
+-function renderForm(row){renderModelSource(row);if(row){$('model-status').innerHTML=`<strong>${esc(row.display_name)} · ${esc(row.status)}</strong><span>${esc(row.source_path||'no source')} · ${esc(row.armature_name||'no armature metadata')} · ${esc(row.bone_count||0)} bones</span>`;$('register-character').textContent=state.sourcePath?'register new revision':'choose fbx for revision';$('register-character').disabled=!state.sourcePath;$('save-archetype').disabled=false;}else{$('model-status').innerHTML='<strong>not registered</strong><span>choose an fbx with a skinned armature.</span>';$('register-character').textContent='register character';$('register-character').disabled=!state.sourcePath;$('save-archetype').disabled=true;}const has=row&&row.source_path;const configured=!!state.data?.publication?.configured;$('publish-character').disabled=!has||!configured;$('sync-character').disabled=!row?.model_asset_id;$('activate-character').disabled=!row?.model_asset_id;$('publication-hint').textContent=!row?'select a registered character.':!configured?'configure open cloud in .env.local before publishing.':row.model_asset_id?`publish updates permanent asset ${row.model_asset_id}.`:'publish creates a new permanent model asset id.'}
++function renderForm(row){renderModelSource(row);if(row){$('model-status').innerHTML=`<strong>${esc(row.display_name)} · ${esc(row.status)}</strong><span>${esc(row.source_path||'no source')} · ${esc(row.armature_name||'no armature metadata')} · ${esc(row.bone_count||0)} bones</span>`;$('register-character').textContent=state.sourcePath?'register replacement revision':'choose fbx for revision';$('register-character').disabled=!state.sourcePath;$('save-archetype').disabled=false;}else{$('model-status').innerHTML='<strong>not registered</strong><span>choose an fbx with a skinned armature.</span>';$('register-character').textContent='register character';$('register-character').disabled=!state.sourcePath;$('save-archetype').disabled=true;}const has=row&&row.source_path;const configured=!!state.data?.publication?.configured;const replacement=!!row?.model_replacement_pending;$('publish-character').disabled=!has||!configured;$('publish-character').textContent=replacement?'publish replacement':'publish model';$('sync-character').disabled=!row?.model_asset_id;$('activate-character').disabled=!row?.model_asset_id;$('publication-hint').textContent=!row?'select a registered character.':!configured?'configure open cloud in .env.local before publishing.':replacement?`next publish creates a new roblox model asset id; current asset ${row.model_asset_id} stays assigned until the upload succeeds.`:row.model_asset_id?`publish without a replacement updates the current asset ${row.model_asset_id}.`:'publish creates a new permanent model asset id.'}
+ function renderCharacters(){if(!state.data)return;const row=selectedRow();const published=state.data.items.filter(x=>x.status==='PUBLISHED').length;$('metric-total').textContent=state.data.items.length;$('metric-published').textContent=published;$('metric-active').textContent=state.data.activeArchetypeId?'1':'0';renderRuntime();renderTree();renderRows();renderDetails(row);renderForm(row)}
+-async function loadCharacters(){try{state.data=await request('/api/characters');const races=state.data.options?.races||['human'];const genders=state.data.options?.genders||['male','female'];$('race').innerHTML=races.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');$('gender').innerHTML=genders.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');if(state.selected&&!state.data.items.some(x=>x.id===state.selected))state.selected=null;if(!state.selected)syncIdentity();renderCharacters();populateAnimationCharacters()}catch(error){toast(error.message,true)}}
++async function loadCharacters(){try{const formRace=$('race').value;const formGender=$('gender').value;state.data=await request('/api/characters');const races=state.data.options?.races||['human'];const genders=state.data.options?.genders||['male','female'];$('race').innerHTML=races.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');$('gender').innerHTML=genders.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');if(state.selected&&!state.data.items.some(x=>x.id===state.selected))state.selected=null;const row=selectedRow();const wantedRace=formRace||row?.race||races[0]||'';const wantedGender=formGender||row?.gender||genders[0]||'';$('race').value=races.includes(wantedRace)?wantedRace:(row?.race||races[0]||'');$('gender').value=genders.includes(wantedGender)?wantedGender:(row?.gender||genders[0]||'');if(!state.selected)syncIdentity();renderCharacters();populateAnimationCharacters()}catch(error){toast(error.message,true)}}
+ async function chooseModel(){try{const result=await request('/api/files/choose-character-model',{method:'POST'});if(!result.path)return;state.sourcePath=result.path;$('picked-model').textContent=result.path;renderForm(selectedRow())}catch(error){toast(error.message,true)}}
+ async function registerCharacter(){try{const row=selectedRow();if(!state.sourcePath)throw Error('choose an fbx first');if(row){const identityChanged=$('character-id').value.trim().toLowerCase()!==row.id||$('race').value!==row.race||$('gender').value!==row.gender||$('display-name').value.trim()!==(row.display_name||'');if(identityChanged)throw Error('save archetype identity first, then register the model revision');}$('register-character').disabled=true;toast('analyzing and registering character…');const result=await request('/api/characters',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({existingId:row?.id||'',id:$('character-id').value,displayName:$('display-name').value,race:$('race').value,gender:$('gender').value,sourcePath:state.sourcePath})});state.selected=result.id;state.modelSourceId=result.id;state.sourcePath='';await loadCharacters();toast(`registered ${result.id} · ${result.bone_count} bones`)}catch(error){toast(error.message,true)}finally{renderForm(selectedRow())}}
+ async function saveArchetype(){const row=selectedRow();if(!row)return;try{const oldId=row.id;const nextId=$('character-id').value.trim().toLowerCase();const nextRace=$('race').value;const nextGender=$('gender').value;const modelSource=state.modelSourceId||oldId;const identityChanged=oldId!==nextId||row.race!==nextRace||row.gender!==nextGender;const modelChanged=modelSource!==oldId;if((identityChanged||modelChanged)&&!confirm(`save archetype changes for ${oldId}? identity paths will be migrated and an existing registered model asset can be reassigned without republishing.`))return;$('save-archetype').disabled=true;toast('saving archetype…');const result=await request('/api/characters/'+encodeURIComponent(oldId)+'/identity',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:nextId,displayName:$('display-name').value,race:nextRace,gender:nextGender})});let reassigned=false;if(modelChanged){await request('/api/characters/'+encodeURIComponent(result.newId)+'/model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sourceCharacterId:modelSource})});reassigned=true}state.selected=result.newId;state.modelSourceId=result.newId;state.animationCharacter=result.newId;await loadCharacters();const syncHint=(result.studioSyncRequired||reassigned)?' · sync studio before play':'';toast(`saved ${result.newId}${reassigned?' · model asset reassigned':''}${syncHint}`)}catch(error){toast(error.message,true)}finally{renderForm(selectedRow())}}
+-async function publishCharacter(id=state.selected){try{if(!id)throw Error('select a character');toast('publishing character model to roblox…');await request('/api/characters/'+encodeURIComponent(id)+'/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({description:$('publication-description').value})});state.selected=id;await loadCharacters();toast(`published ${id}`)}catch(error){toast(error.message,true)}}
++async function publishCharacter(id=state.selected){try{if(!id)throw Error('select a character');const before=(state.data?.items||[]).find(row=>row.id===id);toast(before?.model_replacement_pending?'publishing replacement as a new roblox model asset…':'publishing character model to roblox…');await request('/api/characters/'+encodeURIComponent(id)+'/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({description:$('publication-description').value})});state.selected=id;await loadCharacters();const row=selectedRow();toast(`published ${id}${row?.model_asset_id?' · asset '+row.model_asset_id:''}`)}catch(error){toast(error.message,true)}}
+ async function syncStudio(id=state.selected){try{if(!id)throw Error('select a character');toast('syncing published character into studio…');const result=await request('/api/characters/'+encodeURIComponent(id)+'/sync',{method:'POST'});toast(`studio synced ${id} · ${result.studio?.destination||''}`)}catch(error){toast(error.message,true)}}
+ async function activate(id=state.selected){try{if(!id)throw Error('select a character');await request('/api/characters/'+encodeURIComponent(id)+'/activate',{method:'POST'});state.selected=id;await loadCharacters();toast(`active character: ${id}`)}catch(error){toast(error.message,true)}}
+ async function removeCharacter(id){if(!confirm(`delete ${id} from the game1 character registry? source files are preserved.`))return;try{await request('/api/characters/'+encodeURIComponent(id),{method:'DELETE'});if(state.selected===id)state.selected=null;await loadCharacters();setForm(null);toast(`deleted registry row ${id}`)}catch(error){toast(error.message,true)}}
+diff --git a/system/control-center/static/index.html b/system/control-center/static/index.html
+index 040c8eb..48adfbd 100644
+--- a/system/control-center/static/index.html
++++ b/system/control-center/static/index.html
+@@ -41,7 +41,7 @@
+ <section class="content">
+ <div id="characters-view">
+ <div class="panel hero">
+-<div><span class="eyebrow">character assets · clean game1 schema</span><h2>characters</h2><p>race and gender are gameplay identity. each registered archetype owns one canonical fbx with a skinned armature. source and prepared copies stay recoverable inside the project; publication creates or updates one roblox model asset id.</p></div>
++<div><span class="eyebrow">character assets · clean game1 schema</span><h2>characters</h2><p>race and gender are gameplay identity. each registered archetype owns one canonical fbx with a skinned armature. source and prepared copies stay recoverable inside the project; publication creates a roblox model asset id; replacing the canonical FBX publishes a new asset id.</p></div>
+ <div class="metrics"><div><b id="metric-total">0</b><span>registered</span></div><div><b id="metric-published">0</b><span>published</span></div><div><b id="metric-active">0</b><span>active</span></div></div>
+ </div>
+ <div class="panel runtime-card"><div id="runtime-state" class="runtime-state bootstrap"><strong>bootstrap</strong><span>loading runtime source…</span></div><div id="publication-state" class="publication-missing">open cloud: checking…</div></div>
+@@ -58,7 +58,7 @@
+ <div id="model-status" class="status-box"><strong>not registered</strong><span>select a character row or choose an fbx.</span></div>
+ <div class="actions"><button id="save-archetype" type="button" disabled>save archetype</button><button id="register-character" class="primary" type="button">register character</button><button id="clear-form" type="button">clear form</button></div>
+ <hr class="card-separator">
+-<span class="eyebrow">02 · publication</span><h3 class="subheading">roblox model asset</h3><p>first publish creates a permanent model asset id. later source revisions update the same id. studio sync refreshes the local canonical rig without republishing.</p>
++<span class="eyebrow">02 · publication</span><h3 class="subheading">roblox model asset</h3><p>first publish creates a model asset id. registering a different FBX marks a replacement; the next publish creates a new model asset id and switches the archetype only after upload succeeds. studio sync then loads that new asset.</p>
+ <label>description<input id="publication-description" value="game1 character model"></label>
+ <div class="actions"><button id="publish-character" class="primary" type="button" disabled>publish model</button><button id="sync-character" type="button" disabled>sync studio</button><button id="activate-character" type="button" disabled>activate</button></div>
+ <small id="publication-hint" class="hint">select a registered character.</small>

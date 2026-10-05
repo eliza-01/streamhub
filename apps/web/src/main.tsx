@@ -429,6 +429,20 @@ type SiteEvent = {
   playable: boolean;
 };
 
+type SiteUserComment = {
+  id: number;
+  event_id: string;
+  body: string;
+  text_color?: string | null;
+  created_at: string;
+  user: {
+    id: string;
+    nickname: string;
+    login: string;
+    avatar_url?: string | null;
+  };
+};
+
 type SiteAvailableEvent = {
   id: string;
   media_type: "live" | "vod";
@@ -451,6 +465,34 @@ type SiteAdminEvent = SiteAvailableEvent & {
   hidden: boolean;
   categories: Array<SiteCategory & { position?: number }>;
   timecodes: SiteTimecode[];
+};
+
+type AuthUser = {
+  id: string;
+  nickname: string;
+  login: string;
+  email?: string | null;
+  email_verified?: boolean;
+  telegram_verified: boolean;
+  telegram_username?: string | null;
+  twitch_verified?: boolean;
+  twitch_login?: string | null;
+  avatar_url?: string | null;
+  created_at?: string | null;
+};
+
+type AuthModalMode = "login" | "register";
+
+type TelegramRegistrationState = {
+  pollToken: string;
+  deepLink: string;
+  status: "pending" | "started";
+};
+
+type TwitchRegistrationState = {
+  pollToken: string;
+  authorizeUrl: string;
+  status: "pending" | "failed" | "denied";
 };
 
 type MediaEvent = {
@@ -601,7 +643,7 @@ function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
       onClick={onActivate}
       onPointerEnter={playLogoAnimation}
       onFocus={playLogoAnimation}
-      aria-label="StreamVault — главная"
+      aria-label="MRW Hub — главная"
     >
       <span className={`streamvault-brand-mark${animating ? " is-animating" : ""}`} aria-hidden="true">
         <span className="streamvault-brand-tilt">
@@ -611,7 +653,7 @@ function StreamVaultAnimatedBrand({ onActivate }: { onActivate: () => void }) {
         </span>
       </span>
       <span className="streamvault-brand-copy" aria-hidden="true">
-        <strong>MRW</strong>
+        <strong>MRW Hub</strong>
         <small>v0.1</small>
       </span>
     </button>
@@ -633,7 +675,17 @@ const PROGRESS_POLL_MS = 5000;
 const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
 const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
 const EVENT_TITLE_MODE_KEY = "streamhub.events.titleMode";
+const SITE_COMMENT_COLOR_KEY = "streamhub.site.commentColor";
 type EventTitleMode = "display" | "source";
+
+function storedSiteCommentColor() {
+  try {
+    const value = window.localStorage.getItem(SITE_COMMENT_COLOR_KEY) || "";
+    return /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : "#ff9b37";
+  } catch {
+    return "#ff9b37";
+  }
+}
 
 function storedEventTitleMode(): EventTitleMode {
   try {
@@ -967,8 +1019,14 @@ function TelegramVideoPlayer({
 }
 
 function safeChatColor(value?: string | null) {
-  if (!value || !/^#[0-9a-f]{6}$/i.test(value)) return undefined;
-  return value.toLowerCase() === "#000000" ? "#8b949e" : value;
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, "");
+  if (["#000", "#000000", "black", "rgb(0,0,0)", "rgba(0,0,0,1)"].includes(normalized)) return "#8b949e";
+  if (/^#[0-9a-f]{3}$/i.test(normalized)) {
+    return `#${normalized.slice(1).split("").map((part) => part + part).join("")}`;
+  }
+  if (/^#[0-9a-f]{6}$/i.test(normalized)) return normalized;
+  return undefined;
 }
 
 type ChatBadgeView = {
@@ -1601,6 +1659,9 @@ function SiteReplayChat({
   const smoothFollowRef = useRef(false);
   const smoothFollowTimerRef = useRef<number | null>(null);
   const lastChatScrollTopRef = useRef(0);
+  const pointerScrollIntentRef = useRef(false);
+  const followingRef = useRef(true);
+  const pausedWindowStartIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     setBadgeAssets({});
@@ -1666,6 +1727,8 @@ function SiteReplayChat({
   useEffect(() => {
     setMessages([]);
     setFollowing(true);
+    followingRef.current = true;
+    pausedWindowStartIdRef.current = null;
     lastChatScrollTopRef.current = 0;
     loadedRangeRef.current = null;
     if (!hasChat) {
@@ -1804,7 +1867,7 @@ function SiteReplayChat({
     const detach = attach();
     const timer = window.setInterval(() => {
       syncClock();
-      void loadWindow(false);
+      if (followingRef.current) void loadWindow(false);
     }, 500);
 
     return () => {
@@ -1815,10 +1878,16 @@ function SiteReplayChat({
     };
   }, [eventId, hasChat, messageCount, playbackTimeline, videoRef]);
 
-  const visible = useMemo(
-    () => messages.filter((message) => (message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentMs + 100).slice(-500),
-    [messages, currentMs]
-  );
+  const visible = useMemo(() => {
+    const eligible = messages.filter((message) => (message.player_offset_ms ?? Number.POSITIVE_INFINITY) <= currentMs + 100);
+    if (following) return eligible.slice(-500);
+    const startId = pausedWindowStartIdRef.current;
+    if (startId != null) {
+      const startIndex = eligible.findIndex((message) => message.id === startId);
+      if (startIndex >= 0) return eligible.slice(startIndex);
+    }
+    return eligible.slice(-500);
+  }, [messages, currentMs, following]);
   const nextMessagePlayerMs = useMemo(() => {
     const next = messages.find((message) => (message.player_offset_ms ?? Number.NEGATIVE_INFINITY) > currentMs + 100);
     return next?.player_offset_ms ?? null;
@@ -1848,6 +1917,14 @@ function SiteReplayChat({
     if (smoothFollowTimerRef.current != null) window.clearTimeout(smoothFollowTimerRef.current);
   }, []);
 
+  function pauseFollowing() {
+    if (visible.length === 0) return;
+    if (followingRef.current) pausedWindowStartIdRef.current = visible[0]?.id ?? null;
+    followingRef.current = false;
+    cancelSmoothFollow();
+    setFollowing(false);
+  }
+
   function cancelSmoothFollow() {
     smoothFollowRef.current = false;
     if (smoothFollowTimerRef.current != null) {
@@ -1861,6 +1938,8 @@ function SiteReplayChat({
     if (!node) return;
     cancelSmoothFollow();
     smoothFollowRef.current = true;
+    followingRef.current = true;
+    pausedWindowStartIdRef.current = null;
     setFollowing(true);
     node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
     smoothFollowTimerRef.current = window.setTimeout(() => {
@@ -1868,6 +1947,8 @@ function SiteReplayChat({
       smoothFollowTimerRef.current = null;
       const current = listRef.current;
       if (current) current.scrollTop = current.scrollHeight;
+      followingRef.current = true;
+      pausedWindowStartIdRef.current = null;
       setFollowing(true);
     }, 450);
   }
@@ -1878,41 +1959,52 @@ function SiteReplayChat({
     const previousTop = lastChatScrollTopRef.current;
     const currentTop = node.scrollTop;
     const movingUp = currentTop < previousTop - 0.5;
-    const movingDown = currentTop > previousTop + 0.5;
     lastChatScrollTopRef.current = currentTop;
 
     if (smoothFollowRef.current) return;
     if (visible.length === 0) {
-      if (!following) setFollowing(true);
+      if (!following) {
+        followingRef.current = true;
+        pausedWindowStartIdRef.current = null;
+        setFollowing(true);
+      }
       return;
     }
 
     const distance = Math.max(0, node.scrollHeight - currentTop - node.clientHeight);
     if (following) {
-      if (movingUp && distance > 4) setFollowing(false);
+      // DOM growth (large messages, emotes, simultaneous batches) can emit scroll events.
+      // Leave live-follow only when an actual pointer/scrollbar gesture moved upward.
+      if (pointerScrollIntentRef.current && movingUp && distance > 4) pauseFollowing();
       return;
     }
-    if (movingDown && distance <= 2) setFollowing(true);
+    if (distance <= 2) {
+      followingRef.current = true;
+      pausedWindowStartIdRef.current = null;
+      setFollowing(true);
+    }
+  }
+
+  function handleChatPointerDown() {
+    pointerScrollIntentRef.current = true;
+  }
+
+  function handleChatPointerEnd() {
+    pointerScrollIntentRef.current = false;
   }
 
   function handleChatWheel(event: React.WheelEvent<HTMLDivElement>) {
-    if (event.deltaY < 0 && visible.length > 0) {
-      cancelSmoothFollow();
-      setFollowing(false);
-    }
+    pointerScrollIntentRef.current = false;
+    if (event.deltaY < 0 && visible.length > 0) pauseFollowing();
   }
 
   function handleChatTouchMove() {
     if (visible.length === 0) return;
-    cancelSmoothFollow();
-    setFollowing(false);
+    pauseFollowing();
   }
 
   function handleChatKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
-    if (visible.length > 0 && ["ArrowUp", "PageUp", "Home"].includes(event.key)) {
-      cancelSmoothFollow();
-      setFollowing(false);
-    }
+    if (visible.length > 0 && ["ArrowUp", "PageUp", "Home"].includes(event.key)) pauseFollowing();
   }
 
   function seekToNextMessage() {
@@ -1930,6 +2022,8 @@ function SiteReplayChat({
       video.addEventListener("loadedmetadata", seekAndPlay, { once: true });
       void video.play().catch(() => undefined);
     }
+    followingRef.current = true;
+    pausedWindowStartIdRef.current = null;
     setFollowing(true);
   }
 
@@ -1945,7 +2039,7 @@ function SiteReplayChat({
         <div><strong>Чат записи</strong></div>
         <span>{hasChat ? `${messageCount.toLocaleString("ru-RU")} сообщений` : "Чат не записан"}</span>
       </div>
-      <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onTouchMove={handleChatTouchMove} onKeyDown={handleChatKeyDown} tabIndex={0}>
+      <div className="site-replay-chat-list" ref={listRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onPointerDown={handleChatPointerDown} onPointerUp={handleChatPointerEnd} onPointerCancel={handleChatPointerEnd} onTouchMove={handleChatTouchMove} onKeyDown={handleChatKeyDown} tabIndex={0}>
         {visible.length === 0 ? (
           hasChat && nextMessagePlayerMs != null ? (
             <button
@@ -2034,22 +2128,28 @@ function StreamVaultHeader({
   query,
   searchResults,
   searchLoading,
+  authUser,
   onQueryChange,
   onSubmit,
   onSearchResult,
   onBrand,
   onAdmin,
   onSiteAdmin,
+  onLogin,
+  onLogout,
 }: {
   query: string;
   searchResults: SiteEvent[];
   searchLoading: boolean;
+  authUser: AuthUser | null;
   onQueryChange: (value: string) => void;
   onSubmit: () => void;
   onSearchResult: (event: SiteEvent) => void;
   onBrand: () => void;
   onAdmin: () => void;
   onSiteAdmin: () => void;
+  onLogin: () => void;
+  onLogout: () => void;
 }) {
   const [searchOpen, setSearchOpen] = useState(false);
   const trimmedQuery = query.trim();
@@ -2125,9 +2225,481 @@ function StreamVaultHeader({
         <div className="streamvault-header-actions">
           <button type="button" className="streamvault-header-button" onClick={onAdmin}>StreamHub</button>
           <button type="button" className="streamvault-header-button admin" onClick={onSiteAdmin}>Админка</button>
+          {authUser ? (
+            <div className="streamvault-auth-user">
+              <span className="streamvault-auth-avatar" aria-hidden="true">
+                {authUser.avatar_url ? <img src={apiUrl(authUser.avatar_url)} alt="" /> : authUser.nickname.slice(0, 1).toUpperCase()}
+              </span>
+              <span className="streamvault-auth-user-copy"><strong>{authUser.nickname}</strong><small>@{authUser.login}</small></span>
+              <button type="button" className="streamvault-auth-logout" onClick={onLogout}>Выйти</button>
+            </div>
+          ) : (
+            <button type="button" className="streamvault-header-button primary" onClick={onLogin}>Войти</button>
+          )}
         </div>
       </div>
     </header>
+  );
+}
+
+function TelegramMark() {
+  return (
+    <svg className="streamvault-auth-telegram-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M21.7 3.2 18.5 19c-.24 1.12-.88 1.39-1.78.87l-4.88-3.6-2.35 2.27c-.26.26-.48.48-.98.48l.35-4.97 9.05-8.18c.39-.35-.09-.55-.61-.2L6.1 12.72l-4.81-1.5c-1.05-.33-1.07-1.05.22-1.55L20.32 2.4c.87-.32 1.63.2 1.38.8Z" />
+    </svg>
+  );
+}
+
+function AuthModal({
+  initialMode = "login",
+  onClose,
+  onAuthenticated,
+}: {
+  initialMode?: AuthModalMode;
+  onClose: () => void;
+  onAuthenticated: (user: AuthUser) => void;
+}) {
+  const [mode, setMode] = useState<AuthModalMode>(initialMode);
+  const [login, setLogin] = useState("");
+  const [password, setPassword] = useState("");
+  const [nickname, setNickname] = useState("");
+  const [registerLogin, setRegisterLogin] = useState("");
+  const [registerPassword, setRegisterPassword] = useState("");
+  const [passwordConfirm, setPasswordConfirm] = useState("");
+  const [avatar, setAvatar] = useState<File | null>(null);
+  const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
+  const [telegramRegistration, setTelegramRegistration] = useState<TelegramRegistrationState | null>(null);
+  const [twitchRegistration, setTwitchRegistration] = useState<TwitchRegistrationState | null>(null);
+  const [busyProvider, setBusyProvider] = useState<"telegram" | "twitch" | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => () => {
+    if (avatarPreview) URL.revokeObjectURL(avatarPreview);
+  }, [avatarPreview]);
+
+  useEffect(() => {
+    if (mode !== "register" || !telegramRegistration?.pollToken) return undefined;
+    let cancelled = false;
+    let timer = 0;
+
+    const poll = async () => {
+      try {
+        const params = new URLSearchParams({ poll_token: telegramRegistration.pollToken });
+        const res = await fetch(`${API}/api/v1/user-auth/telegram-registration/status?${params.toString()}`, {
+          cache: "no-store",
+          credentials: "include",
+        });
+        if (!res.ok) {
+          if (res.status === 404) throw new Error("Регистрация не найдена. Запустите её заново");
+          return;
+        }
+        const data = await res.json();
+        if (cancelled) return;
+        if (data.status === "confirmed" && data.user) {
+          onAuthenticated(data.user as AuthUser);
+          onClose();
+          return;
+        }
+        if (data.status === "expired") {
+          setTelegramRegistration(null);
+          setNotice("");
+          setError("Ссылка регистрации истекла. Нажмите подтверждение ещё раз");
+          return;
+        }
+        if (data.telegram_started || data.status === "started") {
+          setTelegramRegistration((current) => current ? { ...current, status: "started" } : current);
+          setNotice("Бот открыт. Нажмите «Подтвердить регистрацию» в Telegram");
+        } else {
+          setNotice("Ожидаем подтверждение в Telegram…");
+        }
+      } catch (e) {
+        if (!cancelled) console.warn("telegram registration status failed", e);
+      }
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 1500);
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [mode, telegramRegistration?.pollToken, onAuthenticated, onClose]);
+
+  useEffect(() => {
+    if (mode !== "register" || !twitchRegistration?.pollToken) return undefined;
+    let cancelled = false;
+    let timer = 0;
+
+    const poll = async () => {
+      try {
+        const params = new URLSearchParams({ poll_token: twitchRegistration.pollToken });
+        const res = await fetch(`${API}/api/v1/user-auth/twitch-registration/status?${params.toString()}`, {
+          cache: "no-store",
+          credentials: "include",
+        });
+        if (!res.ok) {
+          if (res.status === 404) throw new Error("Регистрация не найдена. Запустите её заново");
+          return;
+        }
+        const data = await res.json();
+        if (cancelled) return;
+        if (data.status === "confirmed" && data.user) {
+          onAuthenticated(data.user as AuthUser);
+          onClose();
+          return;
+        }
+        if (data.status === "expired") {
+          setTwitchRegistration(null);
+          setNotice("");
+          setError("Ссылка Twitch-регистрации истекла. Нажмите подтверждение ещё раз");
+          return;
+        }
+        if (data.status === "failed" || data.status === "denied") {
+          setTwitchRegistration((current) => current ? { ...current, status: data.status } : current);
+          setNotice("");
+          setError(data.status === "denied" ? "Подтверждение Twitch отменено" : "Не удалось подтвердить регистрацию через Twitch");
+          return;
+        }
+        setNotice("Ожидаем подтверждение в Twitch…");
+      } catch (e) {
+        if (!cancelled) console.warn("twitch registration status failed", e);
+      }
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 1500);
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [mode, twitchRegistration?.pollToken, onAuthenticated, onClose]);
+
+  function resetRegistration() {
+    setTelegramRegistration(null);
+    setTwitchRegistration(null);
+    setNotice("");
+    setError("");
+  }
+
+  async function responseError(res: Response) {
+    try {
+      const data = await res.json();
+      return String(data.detail || data.message || `HTTP ${res.status}`);
+    } catch {
+      return (await res.text()) || `HTTP ${res.status}`;
+    }
+  }
+
+  async function submitLogin(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true); setError(""); setNotice("");
+    try {
+      const res = await fetch(`${API}/api/v1/user-auth/login`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ login, password }),
+      });
+      if (!res.ok) throw new Error(await responseError(res));
+      const data = await res.json();
+      onAuthenticated(data.user as AuthUser);
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally { setBusy(false); }
+  }
+
+  async function submitRegistration(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    if (registerPassword !== passwordConfirm) {
+      setError("Пароли не совпадают");
+      return;
+    }
+
+    const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
+    const provider: "telegram" | "twitch" = submitter?.value === "twitch" ? "twitch" : "telegram";
+    if (provider === "telegram" && telegramRegistration) {
+      window.open(telegramRegistration.deepLink, "_blank", "noopener,noreferrer");
+      return;
+    }
+    if (provider === "twitch" && twitchRegistration && twitchRegistration.status === "pending") {
+      window.open(twitchRegistration.authorizeUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+
+    // Open synchronously from the user's click so popup blockers do not eat the provider link.
+    const providerWindow = window.open("about:blank", "_blank");
+    const form = new FormData();
+    form.set("nickname", nickname);
+    form.set("login", registerLogin);
+    form.set("password", registerPassword);
+    form.set("password_confirm", passwordConfirm);
+    form.set("provider", provider);
+    if (avatar) form.set("avatar", avatar);
+    setBusy(true);
+    setBusyProvider(provider);
+    setNotice("");
+    try {
+      const res = await fetch(`${API}/api/v1/user-auth/register`, {
+        method: "POST",
+        credentials: "include",
+        body: form,
+      });
+      if (!res.ok) throw new Error(await responseError(res));
+      const data = await res.json();
+
+      if (provider === "telegram") {
+        const next = {
+          pollToken: String(data.poll_token || ""),
+          deepLink: String(data.deep_link || ""),
+          status: "pending" as const,
+        };
+        if (!next.pollToken || !next.deepLink) throw new Error("API не вернул Telegram-ссылку регистрации");
+        setTwitchRegistration(null);
+        setTelegramRegistration(next);
+        if (providerWindow) {
+          providerWindow.opener = null;
+          providerWindow.location.href = next.deepLink;
+          setNotice("Ожидаем подтверждение в Telegram…");
+        } else {
+          setNotice("Ссылка готова. Нажмите Telegram ещё раз, чтобы открыть подтверждение");
+        }
+      } else {
+        const next = {
+          pollToken: String(data.poll_token || ""),
+          authorizeUrl: String(data.authorize_url || ""),
+          status: "pending" as const,
+        };
+        if (!next.pollToken || !next.authorizeUrl) throw new Error("API не вернул Twitch-ссылку регистрации");
+        setTelegramRegistration(null);
+        setTwitchRegistration(next);
+        if (providerWindow) {
+          providerWindow.opener = null;
+          providerWindow.location.href = next.authorizeUrl;
+          setNotice("Ожидаем подтверждение в Twitch…");
+        } else {
+          setNotice("Ссылка готова. Нажмите Twitch ещё раз, чтобы открыть подтверждение");
+        }
+      }
+    } catch (e) {
+      if (providerWindow) providerWindow.close();
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+      setBusyProvider(null);
+    }
+  }
+
+
+  return (
+    <div className="streamvault-auth-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="streamvault-auth-modal" role="dialog" aria-modal="true" aria-labelledby="streamvaultAuthTitle">
+        <button type="button" className="streamvault-auth-close" onClick={onClose} aria-label="Закрыть">×</button>
+        <div className="streamvault-auth-brand"><span>MRW HUB</span><strong id="streamvaultAuthTitle">{mode === "login" ? "Вход" : "Регистрация"}</strong></div>
+
+        {mode === "login" ? (
+          <form className="streamvault-auth-form" onSubmit={submitLogin}>
+            <label><span>Логин</span><input autoFocus autoComplete="username" value={login} onChange={(e) => setLogin(e.target.value)} required /></label>
+            <label><span>Пароль</span><input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
+            {error ? <div className="streamvault-auth-error">{error}</div> : null}
+            <button type="submit" className="streamvault-auth-submit" disabled={busy}>{busy ? "Входим…" : "Войти"}</button>
+            <button type="button" className="streamvault-auth-switch" onClick={() => { setMode("register"); setError(""); setNotice(""); }}>Зарегистрироваться</button>
+          </form>
+        ) : null}
+
+        {mode === "register" ? (
+          <form className="streamvault-auth-form" onSubmit={submitRegistration}>
+            <label className="streamvault-auth-avatar-picker">
+              <span>Аватарка</span>
+              <span className="streamvault-auth-avatar-preview">{avatarPreview ? <img src={avatarPreview} alt="Предпросмотр аватара" /> : (nickname.trim() ? <b>{nickname.trim().slice(0, 1).toUpperCase()}</b> : <i className="streamvault-auth-avatar-plus" aria-hidden="true" />)}</span>
+              <input className="streamvault-auth-avatar-input" type="file" accept="image/*,.gif" aria-label="Выбрать аватар" onChange={(e) => {
+                const next = e.target.files?.[0] || null;
+                if (next && next.size > 10 * 1024 * 1024) {
+                  e.currentTarget.value = "";
+                  setError("Аватар больше 10 MiB");
+                  return;
+                }
+                if (avatarPreview) URL.revokeObjectURL(avatarPreview);
+                setAvatar(next);
+                setAvatarPreview(next ? URL.createObjectURL(next) : null);
+                resetRegistration();
+              }} />
+              <small>JPG/PNG/WebP/GIF · до 10 MiB</small>
+            </label>
+            <label><span>Ник</span><input autoComplete="nickname" value={nickname} onChange={(e) => { setNickname(e.target.value); resetRegistration(); }} minLength={2} maxLength={40} required /></label>
+            <label><span>Логин</span><input autoComplete="username" value={registerLogin} onChange={(e) => { setRegisterLogin(e.target.value); resetRegistration(); }} pattern="[A-Za-z0-9_.-]{3,32}" required /></label>
+            <label><span>Пароль</span><input type="password" autoComplete="new-password" value={registerPassword} onChange={(e) => { setRegisterPassword(e.target.value); resetRegistration(); }} minLength={8} required /></label>
+            <label><span>Повторить пароль</span><input type="password" autoComplete="new-password" value={passwordConfirm} onChange={(e) => { setPasswordConfirm(e.target.value); resetRegistration(); }} minLength={8} required /></label>
+            {notice ? <div className="streamvault-auth-notice">{notice}</div> : null}
+            {error ? <div className="streamvault-auth-error">{error}</div> : null}
+            <div className="streamvault-auth-confirm-grid">
+              {telegramRegistration ? (
+                <a className="streamvault-auth-submit telegram" href={telegramRegistration.deepLink} target="_blank" rel="noreferrer">
+                  <span>Подтвердить регистрацию</span><TelegramMark />
+                </a>
+              ) : (
+                <button type="submit" name="provider" value="telegram" className="streamvault-auth-submit telegram" disabled={busy}>
+                  <span>{busyProvider === "telegram" ? "Готовим регистрацию…" : "Подтвердить регистрацию"}</span><TelegramMark />
+                </button>
+              )}
+              {twitchRegistration?.status === "pending" ? (
+                <a className="streamvault-auth-submit twitch" href={twitchRegistration.authorizeUrl} target="_blank" rel="noreferrer">
+                  <span>Подтвердить регистрацию</span><TwitchIcon />
+                </a>
+              ) : (
+                <button type="submit" name="provider" value="twitch" className="streamvault-auth-submit twitch" disabled={busy}>
+                  <span>{busyProvider === "twitch" ? "Готовим регистрацию…" : "Подтвердить регистрацию"}</span><TwitchIcon />
+                </button>
+              )}
+            </div>
+          </form>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+function SiteHeroPreviewVideo({ event }: { event: SiteEvent }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const reverseTimerRef = useRef<number | null>(null);
+  const directionRef = useRef<"forward" | "reverse">("forward");
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !event.playable || !event.playback_url) {
+      setLoading(false);
+      setFailed(true);
+      return;
+    }
+
+    const source = apiUrl(event.playback_url);
+    let hls: Hls | null = null;
+    let disposed = false;
+    let previewEnd = 10;
+    setLoading(true);
+    setFailed(false);
+    directionRef.current = "forward";
+
+    const stopReverse = () => {
+      if (reverseTimerRef.current == null) return;
+      window.clearInterval(reverseTimerRef.current);
+      reverseTimerRef.current = null;
+    };
+
+    const playForward = async () => {
+      if (disposed) return;
+      stopReverse();
+      directionRef.current = "forward";
+      video.muted = true;
+      video.defaultMuted = true;
+      video.playbackRate = 1;
+      try {
+        await video.play();
+      } catch {
+        // canplay/loadeddata will retry once enough media is buffered.
+      }
+    };
+
+    const startReverse = () => {
+      if (disposed || directionRef.current === "reverse") return;
+      directionRef.current = "reverse";
+      video.pause();
+      stopReverse();
+      reverseTimerRef.current = window.setInterval(() => {
+        if (disposed || directionRef.current !== "reverse" || video.seeking) return;
+        const next = Math.max(0, video.currentTime - 0.08);
+        video.currentTime = next;
+        if (next <= 0.04) {
+          stopReverse();
+          video.currentTime = 0;
+          void playForward();
+        }
+      }, 80);
+    };
+
+    const refreshPreviewEnd = () => {
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 10;
+      previewEnd = Math.max(0.5, Math.min(10, duration));
+    };
+    const onLoadedMetadata = () => {
+      refreshPreviewEnd();
+      if (video.currentTime > 0.05) video.currentTime = 0;
+      setLoading(false);
+      void playForward();
+    };
+    const onCanPlay = () => {
+      setLoading(false);
+      if (directionRef.current === "forward" && video.paused) void playForward();
+    };
+    const onTimeUpdate = () => {
+      if (directionRef.current !== "forward") return;
+      if (video.currentTime >= previewEnd - 0.05) {
+        video.currentTime = previewEnd;
+        startReverse();
+      }
+    };
+    const onEnded = () => startReverse();
+    const onError = () => {
+      stopReverse();
+      setLoading(false);
+      setFailed(true);
+    };
+
+    video.addEventListener("loadedmetadata", onLoadedMetadata);
+    video.addEventListener("loadeddata", onCanPlay);
+    video.addEventListener("canplay", onCanPlay);
+    video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("ended", onEnded);
+    video.addEventListener("error", onError);
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = source;
+      video.load();
+    } else if (Hls.isSupported()) {
+      hls = new Hls({ startPosition: 0 });
+      hls.loadSource(source);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        refreshPreviewEnd();
+        void playForward();
+      });
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) onError();
+      });
+    } else {
+      onError();
+    }
+
+    return () => {
+      disposed = true;
+      stopReverse();
+      video.pause();
+      video.removeEventListener("loadedmetadata", onLoadedMetadata);
+      video.removeEventListener("loadeddata", onCanPlay);
+      video.removeEventListener("canplay", onCanPlay);
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("ended", onEnded);
+      video.removeEventListener("error", onError);
+      hls?.destroy();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [event.id, event.playable, event.playback_url]);
+
+  return (
+    <div className="streamvault-preview-main" aria-label="Первые 10 секунд записи, воспроизведение вперёд и назад">
+      {failed ? (
+        <SiteArtwork event={event} wide label="VIDEO PREVIEW" src={event.assets?.frames?.[0]?.url} />
+      ) : (
+        <video ref={videoRef} muted playsInline preload="auto" aria-hidden="true" />
+      )}
+      {loading && !failed ? <span className="streamvault-preview-loading">Загрузка первых 10 сек…</span> : null}
+    </div>
   );
 }
 
@@ -2287,7 +2859,7 @@ function SiteAdminPanel({
     <div className="site-modal-backdrop site-admin-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="site-modal site-admin-modal" role="dialog" aria-modal="true" aria-labelledby="siteAdminTitle">
         <div className="site-admin-head">
-          <div><div className="section-label">STREAMVAULT ADMIN</div><h2 id="siteAdminTitle">События</h2></div>
+          <div><div className="section-label">MRW HUB ADMIN</div><h2 id="siteAdminTitle">События</h2></div>
           <div className="site-admin-head-actions">
             <button type="button" className="primary" onClick={onAddEvent}>+ Добавить событие</button>
             <button type="button" onClick={onClose}>Закрыть</button>
@@ -2520,10 +3092,92 @@ function App() {
   const [sitePublishEventId, setSitePublishEventId] = useState("");
   const [sitePublishCategories, setSitePublishCategories] = useState<string[]>([]);
   const [siteAction, setSiteAction] = useState(false);
-  const [siteHeroFrame, setSiteHeroFrame] = useState(0);
+  const [sitePreviewOverlay, setSitePreviewOverlay] = useState<{ src: string; label: string } | null>(null);
   const [siteCommentDraft, setSiteCommentDraft] = useState("");
+  const [siteCommentColor, setSiteCommentColor] = useState(storedSiteCommentColor);
   const [siteCommentNotice, setSiteCommentNotice] = useState("");
+  const [siteComments, setSiteComments] = useState<SiteUserComment[]>([]);
+  const [siteCommentsLoading, setSiteCommentsLoading] = useState(false);
+  const [siteCommentSending, setSiteCommentSending] = useState(false);
+  const [siteCommentCooldownUntil, setSiteCommentCooldownUntil] = useState(0);
+  const [siteCommentClock, setSiteCommentClock] = useState(() => Date.now());
   const siteCommentRef = useRef<HTMLTextAreaElement | null>(null);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+
+  useEffect(() => {
+    const loadCurrentUser = async () => {
+      try {
+        let res = await fetch(`${API}/api/v1/user-auth/me`, { cache: "no-store", credentials: "include" });
+        if (res.status === 401) {
+          const refreshed = await fetch(`${API}/api/v1/user-auth/refresh`, { method: "POST", credentials: "include" });
+          if (refreshed.ok) res = await fetch(`${API}/api/v1/user-auth/me`, { cache: "no-store", credentials: "include" });
+        }
+        if (!res.ok) return;
+        const data = await res.json();
+        setAuthUser(data.user || null);
+      } catch { /* guest mode */ }
+    };
+    void loadCurrentUser();
+  }, []);
+
+  useEffect(() => {
+    if (!sitePreviewOverlay) return;
+    const previousOverflow = document.body.style.overflow;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSitePreviewOverlay(null);
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [sitePreviewOverlay]);
+
+  useEffect(() => {
+    if (!selectedSiteEvent?.id) {
+      setSiteComments([]);
+      setSiteCommentsLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setSiteCommentsLoading(true);
+    void (async () => {
+      try {
+        const res = await fetch(`${API}/api/v1/site/events/${selectedSiteEvent.id}/comments?page_size=100`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        setSiteComments((data.items || []) as SiteUserComment[]);
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) console.warn("comments unavailable", e);
+      } finally {
+        if (!controller.signal.aborted) setSiteCommentsLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [selectedSiteEvent?.id]);
+
+  useEffect(() => {
+    if (siteCommentCooldownUntil <= Date.now()) {
+      setSiteCommentClock(Date.now());
+      return undefined;
+    }
+    setSiteCommentClock(Date.now());
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setSiteCommentClock(now);
+      if (now >= siteCommentCooldownUntil) window.clearInterval(timer);
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [siteCommentCooldownUntil]);
+
+  async function logoutUser() {
+    try { await fetch(`${API}/api/v1/user-auth/logout`, { method: "POST", credentials: "include" }); } finally { setAuthUser(null); }
+  }
 
   useEffect(() => {
     try { window.localStorage.setItem(PART_TARGET_MIB_KEY, String(partTargetMib)); } catch { /* browser storage unavailable */ }
@@ -2877,6 +3531,47 @@ function App() {
       siteCommentRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
       siteCommentRef.current?.focus();
     }, 0);
+  }
+
+  async function submitSiteComment() {
+    if (!selectedSiteEvent || !authUser || !siteCommentDraft.trim() || siteCommentSending) return;
+    const cooldownRemaining = Math.max(0, Math.ceil((siteCommentCooldownUntil - Date.now()) / 1000));
+    if (cooldownRemaining > 0) {
+      setSiteCommentClock(Date.now());
+      setSiteCommentNotice(`Следующий комментарий через ${cooldownRemaining} сек.`);
+      return;
+    }
+
+    setSiteCommentSending(true);
+    setSiteCommentNotice("");
+    try {
+      const res = await fetch(`${API}/api/v1/site/events/${selectedSiteEvent.id}/comments`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: siteCommentDraft.trim(), text_color: siteCommentColor }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 429) {
+        const detail = data.detail && typeof data.detail === "object" ? data.detail : {};
+        const seconds = Math.max(1, Number(detail.retry_after_seconds || res.headers.get("Retry-After") || 60));
+        setSiteCommentCooldownUntil(Date.now() + seconds * 1000);
+        setSiteCommentClock(Date.now());
+        setSiteCommentNotice(`Лимит: 1 комментарий в минуту. Подождите ${seconds} сек.`);
+        return;
+      }
+      if (!res.ok) throw new Error(String(data.detail || data.message || `HTTP ${res.status}`));
+      if (data.comment) setSiteComments((current) => [data.comment as SiteUserComment, ...current]);
+      setSiteCommentDraft("");
+      const seconds = Math.max(1, Number(data.cooldown_seconds || 60));
+      setSiteCommentCooldownUntil(Date.now() + seconds * 1000);
+      setSiteCommentClock(Date.now());
+      setSiteCommentNotice("Комментарий опубликован");
+    } catch (e) {
+      setSiteCommentNotice(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSiteCommentSending(false);
+    }
   }
 
   async function loadSiteAdminEvents() {
@@ -3649,13 +4344,17 @@ function App() {
           query={siteQuery}
           searchResults={siteSearchResults}
           searchLoading={siteSearchLoading}
+          authUser={authUser}
           onQueryChange={setSiteQuery}
           onSubmit={() => {}}
           onSearchResult={openSiteEventNewTab}
           onBrand={closeSiteEvent}
           onAdmin={() => { closeSiteEvent(); setView("events"); }}
           onSiteAdmin={() => void openSiteAdmin()}
+          onLogin={() => setAuthModalOpen(true)}
+          onLogout={() => void logoutUser()}
         />
+        {authModalOpen ? <AuthModal onClose={() => setAuthModalOpen(false)} onAuthenticated={setAuthUser} /> : null}
         <main className="streamvault-watch-shell">
           <button className="streamvault-back" type="button" onClick={closeSiteEvent}>← К записям</button>
           <div className="streamvault-watch-layout">
@@ -3693,30 +4392,72 @@ function App() {
 
               <section className="streamvault-comments" aria-labelledby="streamvaultCommentsTitle">
                 <div className="streamvault-comments-head">
-                  <div>
-                    <h2 id="streamvaultCommentsTitle">Комментарии</h2>
-                    <p>UI v1 · пользовательские комментарии подключим после утверждения интерфейса.</p>
-                  </div>
+                  <h2 id="streamvaultCommentsTitle">Комментарии <span>{siteComments.length}</span></h2>
                 </div>
-                <div className="streamvault-comment-composer">
-                  <div className="streamvault-comment-avatar">SV</div>
-                  <div>
-                    <textarea
-                      ref={siteCommentRef}
-                      value={siteCommentDraft}
-                      onChange={(event) => { setSiteCommentDraft(event.target.value); setSiteCommentNotice(""); }}
-                      rows={3}
-                      placeholder="Написать комментарий…"
-                    />
-                    <div className="streamvault-comment-actions">
-                      <span>{siteCommentNotice}</span>
-                      <button
-                        type="button"
-                        disabled={!siteCommentDraft.trim()}
-                        onClick={() => setSiteCommentNotice("Сохранение комментариев подключим на backend-этапе.")}
-                      >Отправить</button>
+                {authUser ? (
+                  <div className="streamvault-comment-composer">
+                    <div className="streamvault-comment-avatar">
+                      {authUser.avatar_url ? <img src={apiUrl(authUser.avatar_url)} alt="" /> : authUser.nickname.slice(0, 1).toUpperCase()}
+                    </div>
+                    <div>
+                      <textarea
+                        ref={siteCommentRef}
+                        value={siteCommentDraft}
+                        onChange={(event) => { setSiteCommentDraft(event.target.value); setSiteCommentNotice(""); }}
+                        rows={3}
+                        maxLength={4000}
+                        placeholder="Написать комментарий…"
+                        style={{ color: siteCommentColor }}
+                      />
+                      <div className="streamvault-comment-actions">
+                        <label className="streamvault-comment-color" title="Цвет текста комментария">
+                          <input
+                            type="color"
+                            value={siteCommentColor}
+                            onChange={(event) => {
+                              const value = event.target.value.toLowerCase();
+                              setSiteCommentColor(value);
+                              try { window.localStorage.setItem(SITE_COMMENT_COLOR_KEY, value); } catch { /* ignore */ }
+                            }}
+                            aria-label="Цвет текста комментария"
+                          />
+                          <span>Цвет</span>
+                        </label>
+                        <span>{Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000)) > 0
+                          ? `Следующий комментарий через ${Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000))} сек.`
+                          : siteCommentNotice}</span>
+                        <button
+                          type="button"
+                          disabled={!siteCommentDraft.trim() || siteCommentSending || Math.max(0, Math.ceil((siteCommentCooldownUntil - siteCommentClock) / 1000)) > 0}
+                          onClick={() => void submitSiteComment()}
+                        >{siteCommentSending ? "Отправляем…" : "Отправить"}</button>
+                      </div>
                     </div>
                   </div>
+                ) : (
+                  <div className="streamvault-comment-login">
+                    <span>Войдите, чтобы оставить комментарий.</span>
+                    <button type="button" onClick={() => setAuthModalOpen(true)}>Войти</button>
+                  </div>
+                )}
+                <div className="streamvault-comment-list">
+                  {siteCommentsLoading ? <div className="streamvault-comment-empty">Загрузка комментариев…</div> : null}
+                  {!siteCommentsLoading && siteComments.length === 0 ? <div className="streamvault-comment-empty">Комментариев пока нет.</div> : null}
+                  {siteComments.map((comment) => (
+                    <article className="streamvault-comment-item" key={comment.id}>
+                      <div className="streamvault-comment-avatar">
+                        {comment.user.avatar_url ? <img src={apiUrl(comment.user.avatar_url)} alt="" loading="lazy" /> : comment.user.nickname.slice(0, 1).toUpperCase()}
+                      </div>
+                      <div className="streamvault-comment-item-body">
+                        <div className="streamvault-comment-meta">
+                          <strong>{comment.user.nickname}</strong>
+                          <small>@{comment.user.login}</small>
+                          <time dateTime={comment.created_at}>{new Date(comment.created_at).toLocaleString("ru-RU")}</time>
+                        </div>
+                        <p style={{ color: comment.text_color || "#ff9b37" }}>{comment.body}</p>
+                      </div>
+                    </article>
+                  ))}
                 </div>
               </section>
             </div>
@@ -3756,13 +4497,29 @@ function App() {
           query={siteQuery}
           searchResults={siteSearchResults}
           searchLoading={siteSearchLoading}
+          authUser={authUser}
           onQueryChange={setSiteQuery}
           onSubmit={() => {}}
           onSearchResult={openSiteEventNewTab}
           onBrand={() => { setSiteCategory("all"); setSiteQuery(""); void loadSiteFeed("all", ""); }}
           onAdmin={() => setView("events")}
           onSiteAdmin={() => void openSiteAdmin()}
+          onLogin={() => setAuthModalOpen(true)}
+          onLogout={() => void logoutUser()}
         />
+        {authModalOpen ? <AuthModal onClose={() => setAuthModalOpen(false)} onAuthenticated={setAuthUser} /> : null}
+        {sitePreviewOverlay ? (
+          <div
+            className="streamvault-frame-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-label={sitePreviewOverlay.label}
+            onMouseDown={(event) => { if (event.currentTarget === event.target) setSitePreviewOverlay(null); }}
+          >
+            <button type="button" className="streamvault-frame-overlay-close" onClick={() => setSitePreviewOverlay(null)} aria-label="Закрыть просмотр кадра">×</button>
+            <img src={apiUrl(sitePreviewOverlay.src)} alt={sitePreviewOverlay.label} />
+          </div>
+        ) : null}
 
         <nav className="streamvault-mobile-categories" aria-label="Категории">
           <button className={siteCategory === "all" ? "active" : ""} onClick={() => { setSiteCategory("all"); void loadSiteFeed("all", ""); }}>
@@ -3810,23 +4567,23 @@ function App() {
                     <SiteArtwork event={latest} label="COVER" src={latest.assets?.cover?.url} />
                   </button>
                   <div className="streamvault-preview-stage">
-                    <button
-                      type="button"
-                      className="streamvault-preview-main"
-                      onClick={() => setSiteHeroFrame((current) => (current + 1) % 4)}
-                      aria-label="Следующий кадр"
-                    >
-                      <div className="streamvault-preview-transition" key={`${latest.id}:${siteHeroFrame}`}>
-                        <SiteArtwork event={latest} wide label={`PREVIEW ${siteHeroFrame + 1}`} src={latest.assets?.frames?.[siteHeroFrame]?.url} />
-                      </div>
-                    </button>
                     <div className="streamvault-preview-rail" aria-label="Четыре preview-кадра">
-                      {[0, 1, 2, 3].map((frame) => (
-                        <button key={frame} type="button" className={siteHeroFrame === frame ? "active" : ""} onClick={() => setSiteHeroFrame(frame)}>
-                          <SiteArtwork event={latest} wide label={`#${frame + 1}`} src={latest.assets?.frames?.[frame]?.url} />
-                        </button>
-                      ))}
+                      {[0, 1, 2, 3].map((frame) => {
+                        const src = latest.assets?.frames?.[frame]?.url || null;
+                        return (
+                          <button
+                            key={frame}
+                            type="button"
+                            disabled={!src}
+                            onClick={() => src && setSitePreviewOverlay({ src, label: `${latest.title} · кадр ${frame + 1}` })}
+                            aria-label={`Открыть кадр ${frame + 1}`}
+                          >
+                            <SiteArtwork event={latest} wide label={`#${frame + 1}`} src={src} />
+                          </button>
+                        );
+                      })}
                     </div>
+                    <SiteHeroPreviewVideo event={latest} />
                   </div>
                 </div>
                 <div className="streamvault-latest-copy">

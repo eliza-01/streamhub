@@ -190,7 +190,8 @@ def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
     assert 'siteChatOtherEventsCache' in web
     assert 'siteChatOtherEventsCache.set(otherEventsCacheKey, items)' in web
     assert 'site-chat-history-other-heading' not in web
-    assert 'value.toLowerCase() === "#000000" ? "#8b949e" : value' in web
+    assert '["#000", "#000000", "black", "rgb(0,0,0)", "rgba(0,0,0,1)"]' in web
+    assert 'return "#8b949e"' in web
     assert 'Сообщений:' in web
     assert 'Посмотреть профиль Twitch' in web
     assert 'function TwitchIcon()' in web
@@ -200,8 +201,14 @@ def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
     assert 'onWheel={handleChatWheel}' in web
     assert 'onTouchMove={handleChatTouchMove}' in web
     assert 'const movingUp = currentTop < previousTop - 0.5' in web
-    assert 'if (movingUp && distance > 4) setFollowing(false)' in web
-    assert 'if (movingDown && distance <= 2) setFollowing(true)' in web
+    assert 'pointerScrollIntentRef.current && movingUp && distance > 4' in web
+    assert 'if (distance <= 2) {' in web
+    assert 'pausedWindowStartIdRef.current = null' in web
+    assert 'onPointerDown={handleChatPointerDown}' in web
+    assert 'overflow-anchor: none' in css
+    assert 'pausedWindowStartIdRef' in web
+    assert 'if (followingRef.current) void loadWindow(false)' in web
+    assert 'if (following) return eligible.slice(-500)' in web
     assert 'node.scrollTo({ top: node.scrollHeight, behavior: "smooth" })' in web
     assert 'node.scrollTop = node.scrollHeight' in web
     assert 'className="site-chat-follow"' in web
@@ -228,6 +235,29 @@ def test_site_chat_user_history_hotfixes_and_twitch_profile_action():
     assert 'left: 50%; bottom: 12px; transform: translateX(-50%)' in css
     assert 'const onWaiting = () => markLoadingSoon(320)' in web
     assert 'video.addEventListener("timeupdate", markProgressing)' in web
+
+
+def test_site_user_comments_are_persisted_authenticated_and_rate_limited():
+    migration = _read("migrations/versions/0017_site_comments.py")
+    models = _read("packages/python_common/streamhub_common/models.py")
+    route = _read("apps/api/app/routers/site.py")
+    auth = _read("apps/api/app/routers/user_auth.py")
+    web = _read("apps/web/src/main.tsx")
+
+    assert 'down_revision = "0016_users_telegram_registration"' in migration
+    assert '"site_comments"' in migration
+    assert 'class SiteComment(Base):' in models
+    assert '@router.get("/events/{event_id}/comments")' in route
+    assert '@router.post("/events/{event_id}/comments", status_code=201)' in route
+    assert 'Depends(require_current_user)' in route
+    assert '.with_for_update()' in route
+    assert 'status.HTTP_429_TOO_MANY_REQUESTS' in route
+    assert '"retry_after_seconds": retry_after' in route
+    assert 'async def require_current_user(' in auth
+    assert '/comments?page_size=100' in web
+    assert '/comments`' in web
+    assert 'Следующий комментарий через' in web
+    assert 'UI v1 · пользовательские комментарии подключим после утверждения интерфейса.' not in web
 
 
 def test_site_admin_assets_migration_keeps_source_title_and_persistent_asset_metadata():

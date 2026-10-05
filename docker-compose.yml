@@ -144,6 +144,18 @@ services:
       video-part-builder:
         condition: service_healthy
 
+  registration-bot:
+    build:
+      context: .
+      dockerfile: apps/registration_bot/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+
   web:
     build:
       context: .
