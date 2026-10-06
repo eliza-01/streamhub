@@ -1,0 +1,1090 @@
+diff --git a/apps/api/app/routers/site.py b/apps/api/app/routers/site.py
+index dc3f8ed..f1ce205 100644
+--- a/apps/api/app/routers/site.py
++++ b/apps/api/app/routers/site.py
+@@ -253,6 +253,7 @@ async def _storage_event_ids(db: AsyncSession) -> set[uuid.UUID]:
+             .where(
+                 VideoSession.deleted_at_utc.is_(None),
+                 VideoPart.status == "ready",
++                VideoPart.kind == "source",
+             )
+             .distinct()
+         )
+@@ -270,6 +271,7 @@ async def _event_has_public_storage(db: AsyncSession, event_id: uuid.UUID) -> bo
+                 VideoSession.event_id == event_id,
+                 VideoSession.deleted_at_utc.is_(None),
+                 VideoPart.status == "ready",
++                VideoPart.kind == "source",
+             )
+             .limit(1)
+         )
+@@ -366,6 +368,7 @@ async def _video_summaries(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict
+                 VideoSession.event_id.in_(event_ids),
+                 VideoSession.deleted_at_utc.is_(None),
+                 VideoPart.status == "ready",
++                VideoPart.kind == "source",
+             )
+             .group_by(VideoSession.id)
+             .order_by(VideoSession.event_id, VideoSession.created_at.desc())
+@@ -1183,6 +1186,7 @@ async def site_event_playback_timeline(event_id: uuid.UUID, db: AsyncSession = D
+             .where(
+                 VideoPart.video_session_id == session_id,
+                 VideoPart.status == "ready",
++                VideoPart.kind == "source",
+             )
+             .order_by(VideoSegment.segment_no, VideoPart.part_no)
+         )
+diff --git a/apps/api/app/routers/video.py b/apps/api/app/routers/video.py
+index 4daef99..19b115e 100644
+--- a/apps/api/app/routers/video.py
++++ b/apps/api/app/routers/video.py
+@@ -18,6 +18,7 @@ from streamhub_common.models import (
+     VideoPart,
+     VideoPartBuildJob,
+     VideoPartSegment,
++    VideoProxyPartSource,
+     TelegramVideoPartBinding,
+     VideoRun,
+     VideoSegment,
+@@ -46,6 +47,10 @@ class PartCreateRequest(PartPlanRequest):
+     pass
+ 
+ 
++class ProxyPartPlanRequest(BaseModel):
++    target_mib: int = Field(default=1990, ge=1, le=102400)
++
++
+ class SegmentReplacementRequest(BaseModel):
+     copy_directory: str = Field(min_length=1, max_length=1024)
+ 
+@@ -81,6 +86,7 @@ def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
+     return {
+         "id": str(part.id),
+         "video_session_id": str(part.video_session_id),
++        "kind": part.kind or "source",
+         "part_no": part.part_no,
+         "run_no": part.run_no,
+         "start_segment_no": part.start_segment_no,
+@@ -96,6 +102,7 @@ def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
+         "local_file_state": part.local_file_state,
+         "local_unlinked_at_utc": part.local_unlinked_at_utc,
+         "local_unlink_error": part.local_unlink_error,
++        "profile": part.profile_json,
+         "created_at": part.created_at,
+         "completed_at_utc": part.completed_at_utc,
+         "job": None if job is None else {
+@@ -119,6 +126,18 @@ def _part_file_name(session_id: uuid.UUID, part_no: int, start_segment_no: int,
+     return f"vp_{session_id.hex}__part{part_no:04d}__s{start_segment_no:06d}-s{end_segment_no:06d}.ts"
+ 
+ 
++def _proxy_part_file_name(session_id: uuid.UUID, part_no: int, first_source_part: int, last_source_part: int) -> str:
++    return f"vpx_{session_id.hex}__part{part_no:04d}__p{first_source_part:04d}-p{last_source_part:04d}.mp4"
++
++
++PROXY_VIDEO_BITRATE_BPS = 4_000_000
++PROXY_AUDIO_BITRATE_BPS = 160_000
++PROXY_MUX_SAFETY = 1.03
++
++def _proxy_expected_bytes(duration_ms: int) -> int:
++    return int((max(0, duration_ms) / 1000.0) * ((PROXY_VIDEO_BITRATE_BPS + PROXY_AUDIO_BITRATE_BPS) / 8.0) * PROXY_MUX_SAFETY)
++
++
+ async def plan_part_range(
+     db: AsyncSession,
+     session_id: uuid.UUID,
+@@ -818,6 +837,7 @@ async def _reserve_video_part(
+     part = VideoPart(
+         id=uuid.uuid4(),
+         video_session_id=session_id,
++        kind="source",
+         part_no=part_no,
+         run_no=run_no,
+         start_segment_no=segments[0].segment_no,
+@@ -870,7 +890,7 @@ async def create_video_part(
+     await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
+     session, segments, run_no, plan = await plan_part_range(db, session_id, payload, lock=True)
+     part_no = int(
+-        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
++        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id, VideoPart.kind == "source"))
+         or 0
+     ) + 1
+     queued_status = await _queued_part_status(db)
+@@ -901,7 +921,7 @@ async def create_all_video_parts(
+     await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
+     session, planned, skipped = await plan_all_part_ranges(db, session_id, payload, lock=True)
+     next_part_no = int(
+-        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
++        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id, VideoPart.kind == "source"))
+         or 0
+     ) + 1
+     queued_status = await _queued_part_status(db)
+@@ -937,6 +957,185 @@ async def create_all_video_parts(
+     }
+ 
+ 
++async def _proxy_part_plan(db: AsyncSession, session_id: uuid.UUID, target_mib: int, *, lock: bool = False) -> tuple[VideoSession, list[dict]]:
++    session = await db.get(VideoSession, session_id)
++    if session is None or session.deleted_at_utc is not None:
++        raise HTTPException(404, "video session not found")
++    stmt = (
++        select(VideoPart)
++        .where(
++            VideoPart.video_session_id == session_id,
++            VideoPart.kind == "source",
++            VideoPart.status == "ready",
++            VideoPart.local_file_state == "present",
++        )
++        .order_by(VideoPart.part_no)
++    )
++    if lock:
++        stmt = stmt.with_for_update()
++    source_parts = (await db.execute(stmt)).scalars().all()
++    if not source_parts:
++        raise HTTPException(409, "no local ready source parts are available")
++
++    used_ids = set(
++        (await db.execute(select(VideoProxyPartSource.source_part_id))).scalars().all()
++    )
++    available = [part for part in source_parts if part.id not in used_ids]
++    if not available:
++        raise HTTPException(409, "all local ready source parts are already assigned to proxy parts")
++
++    max_bytes = int(target_mib) * 1024 * 1024
++    plans: list[dict] = []
++    current: list[VideoPart] = []
++    duration_ms = 0
++
++    def flush() -> None:
++        nonlocal current, duration_ms
++        if not current:
++            return
++        expected = _proxy_expected_bytes(duration_ms)
++        plans.append({
++            "source_part_ids": [str(part.id) for part in current],
++            "source_part_nos": [int(part.part_no) for part in current],
++            "first_source_part_no": int(current[0].part_no),
++            "last_source_part_no": int(current[-1].part_no),
++            "source_part_count": len(current),
++            "start_segment_no": int(current[0].start_segment_no),
++            "end_segment_no": int(current[-1].end_segment_no),
++            "duration_ms": int(duration_ms),
++            "expected_bytes": expected,
++            "target_mib": int(target_mib),
++        })
++        current = []
++        duration_ms = 0
++
++    for part in available:
++        next_duration = duration_ms + int(part.duration_ms or 0)
++        next_expected = _proxy_expected_bytes(next_duration)
++        if current and next_expected > max_bytes:
++            flush()
++            next_duration = int(part.duration_ms or 0)
++            next_expected = _proxy_expected_bytes(next_duration)
++        if next_expected > max_bytes:
++            raise HTTPException(409, f"source Part #{part.part_no} alone exceeds proxy max size at the 4 Mbps profile")
++        current.append(part)
++        duration_ms = next_duration
++    flush()
++    return session, plans
++
++
++@router.post("/video-sessions/{session_id}/proxy-parts/plan")
++async def plan_proxy_parts(
++    session_id: uuid.UUID,
++    payload: ProxyPartPlanRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    _session, plans = await _proxy_part_plan(db, session_id, payload.target_mib)
++    return {
++        "items": plans,
++        "part_count": len(plans),
++        "source_part_count": sum(item["source_part_count"] for item in plans),
++        "duration_ms": sum(item["duration_ms"] for item in plans),
++        "expected_bytes": sum(item["expected_bytes"] for item in plans),
++        "target_mib": payload.target_mib,
++        "profile": {"width": 1920, "height": 1080, "fps": 60, "video_codec": "hevc", "video_bitrate_kbps": 4000, "video_max_bitrate_kbps": 4000, "audio_codec": "aac", "audio_bitrate_kbps": 160},
++    }
++
++
++@router.post("/video-sessions/{session_id}/proxy-parts/build-all")
++async def create_proxy_parts(
++    session_id: uuid.UUID,
++    payload: ProxyPartPlanRequest,
++    db: AsyncSession = Depends(get_db),
++) -> dict:
++    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
++    session, plans = await _proxy_part_plan(db, session_id, payload.target_mib, lock=True)
++    source_by_id = {
++        part.id: part for part in (
++            await db.execute(
++                select(VideoPart).where(
++                    VideoPart.video_session_id == session_id,
++                    VideoPart.kind == "source",
++                    VideoPart.id.in_([uuid.UUID(value) for plan in plans for value in plan["source_part_ids"]]),
++                )
++            )
++        ).scalars().all()
++    }
++    next_part_no = int(
++        await db.scalar(
++            select(func.coalesce(func.max(VideoPart.part_no), 0)).where(
++                VideoPart.video_session_id == session_id,
++                VideoPart.kind == "proxy",
++            )
++        ) or 0
++    ) + 1
++    queued_status = await _queued_part_status(db)
++    metadata = session.metadata_json or {}
++    output_subdir = str(metadata.get("output_subdir") or "streamhub").strip("/\\")
++    created: list[tuple[VideoPart, VideoPartBuildJob, dict]] = []
++    for offset, plan in enumerate(plans):
++        source_parts = [source_by_id[uuid.UUID(value)] for value in plan["source_part_ids"]]
++        part_no = next_part_no + offset
++        file_name = _proxy_part_file_name(
++            session_id, part_no, int(plan["first_source_part_no"]), int(plan["last_source_part_no"])
++        )
++        relative_path = f"{output_subdir}/twitch/events/{session.event_id}/video/{session.id}/proxy_parts/{file_name}"
++        profile = {
++            "width": 1920,
++            "height": 1080,
++            "fps": 60,
++            "video_codec": "hevc",
++            "video_bitrate_kbps": 4000,
++            "video_max_bitrate_kbps": 4000,
++            "audio_codec": "aac",
++            "audio_bitrate_kbps": 160,
++            "max_mib": int(payload.target_mib),
++            "source_part_nos": plan["source_part_nos"],
++        }
++        proxy = VideoPart(
++            id=uuid.uuid4(),
++            video_session_id=session_id,
++            kind="proxy",
++            part_no=part_no,
++            run_no=0,
++            start_segment_no=int(plan["start_segment_no"]),
++            end_segment_no=int(plan["end_segment_no"]),
++            duration_ms=int(plan["duration_ms"]),
++            expected_bytes=int(plan["expected_bytes"]),
++            file_name=file_name,
++            relative_path=relative_path,
++            status=queued_status,
++            profile_json=profile,
++        )
++        db.add(proxy)
++        await db.flush()
++        for position, source_part in enumerate(source_parts):
++            db.add(VideoProxyPartSource(proxy_part_id=proxy.id, source_part_id=source_part.id, position=position))
++        job = VideoPartBuildJob(
++            part_id=proxy.id,
++            status=queued_status,
++            phase=queued_status,
++            total_bytes=int(plan["expected_bytes"]),
++        )
++        db.add(job)
++        created.append((proxy, job, plan))
++    await db.commit()
++    for proxy, job, _plan in created:
++        await db.refresh(proxy)
++        await db.refresh(job)
++    wakeup_error = None
++    if created:
++        try:
++            await part_builder_post(f"/internal/v1/parts/{created[0][0].id}/enqueue", {})
++        except HTTPException as exc:
++            wakeup_error = str(exc.detail)
++    return {
++        "items": [{**part_dict(part, job), "plan": plan} for part, job, plan in created],
++        "part_count": len(created),
++        "builder_wakeup_error": wakeup_error,
++    }
++
++
+ @router.get("/video-sessions/{session_id}/parts")
+ async def list_video_parts(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+     session = await db.get(VideoSession, session_id)
+@@ -1016,7 +1215,9 @@ async def replace_video_part_segments(
+     payload: SegmentReplacementRequest,
+     db: AsyncSession = Depends(get_db),
+ ) -> dict:
+-    await ensure_part_telegram_linked(db, part_id)
++    part = await ensure_part_telegram_linked(db, part_id)
++    if (part.kind or "source") != "source":
++        raise HTTPException(409, "proxy parts do not own source segments")
+     return await part_builder_post(
+         f"/internal/v1/parts/{part_id}/replace-segments",
+         {"copy_directory": payload.copy_directory.strip()},
+diff --git a/apps/api/app/telegram/playback.py b/apps/api/app/telegram/playback.py
+index b67fb66..e5f8cf6 100644
+--- a/apps/api/app/telegram/playback.py
++++ b/apps/api/app/telegram/playback.py
+@@ -152,7 +152,7 @@ class TelegramPlaybackService:
+                     .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
+                     .join(VideoPartSegment, VideoPartSegment.part_id == VideoPart.id)
+                     .join(VideoSegment, VideoSegment.id == VideoPartSegment.segment_id)
+-                    .where(VideoPart.video_session_id == session_id, VideoPart.status == "ready")
++                    .where(VideoPart.video_session_id == session_id, VideoPart.status == "ready", VideoPart.kind == "source")
+                     .order_by(VideoPartSegment.segment_no, VideoPart.part_no)
+                 )
+             ).mappings().all()
+@@ -229,6 +229,7 @@ class TelegramPlaybackService:
+                     .where(
+                         VideoPart.id == part_id,
+                         VideoPart.status == "ready",
++                        VideoPart.kind == "source",
+                         VideoPartSegment.segment_no == segment_no,
+                     )
+                 )
+@@ -266,7 +267,7 @@ class TelegramPlaybackService:
+                         TelegramVideoPartBinding.message_id,
+                     )
+                     .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
+-                    .where(VideoPart.id == part_id, VideoPart.status == "ready")
++                    .where(VideoPart.id == part_id, VideoPart.status == "ready", VideoPart.kind == "source")
+                 )
+             ).mappings().first()
+         if row is None:
+diff --git a/apps/video_part_builder/Dockerfile b/apps/video_part_builder/Dockerfile
+index 4c020d0..0ef2235 100644
+--- a/apps/video_part_builder/Dockerfile
++++ b/apps/video_part_builder/Dockerfile
+@@ -2,6 +2,7 @@ FROM python:3.12-slim
+ WORKDIR /opt/streamhub
+ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ COPY requirements.txt ./requirements.txt
++RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+ RUN pip install --no-cache-dir -r requirements.txt
+ COPY packages/python_common ./packages/python_common
+ RUN pip install --no-cache-dir ./packages/python_common
+diff --git a/apps/video_part_builder/app/main.py b/apps/video_part_builder/app/main.py
+index 0b77353..cd16d70 100644
+--- a/apps/video_part_builder/app/main.py
++++ b/apps/video_part_builder/app/main.py
+@@ -4,6 +4,7 @@ import asyncio
+ import hashlib
+ import logging
+ import os
++import signal
+ import socket
+ import uuid
+ from contextlib import asynccontextmanager
+@@ -20,6 +21,7 @@ from streamhub_common.models import (
+     VideoPart,
+     VideoPartBuildJob,
+     VideoPartSegment,
++    VideoProxyPartSource,
+     TelegramVideoPartBinding,
+     VideoSegment,
+     VideoSession,
+@@ -389,7 +391,163 @@ async def db_cancel_requested(job_id: int) -> bool:
+         return bool(value)
+ 
+ 
++
++async def load_proxy_inputs(part_id: uuid.UUID) -> tuple[VideoPart, VideoSession, list[VideoPart]]:
++    async with SessionLocal() as db:
++        part = await db.get(VideoPart, part_id)
++        if part is None:
++            raise RuntimeError("proxy part disappeared")
++        session = await db.get(VideoSession, part.video_session_id)
++        if session is None:
++            raise RuntimeError("video session disappeared")
++        rows = (
++            await db.execute(
++                select(VideoProxyPartSource, VideoPart)
++                .join(VideoPart, VideoPart.id == VideoProxyPartSource.source_part_id)
++                .where(VideoProxyPartSource.proxy_part_id == part_id)
++                .order_by(VideoProxyPartSource.position)
++            )
++        ).all()
++        source_parts = [source for _mapping, source in rows]
++        if not source_parts:
++            raise RuntimeError("proxy part has no source parts")
++        return part, session, source_parts
++
++
++def _ffconcat_quote(path: Path) -> str:
++    return str(path).replace("'", "'\\''")
++
++
++async def build_proxy_part(job_id: int, part_id: uuid.UUID) -> None:
++    part, session, source_parts = await load_proxy_inputs(part_id)
++    if session.deleted_at_utc is not None:
++        raise RuntimeError("video session is in trash")
++    if (part.kind or "source") != "proxy":
++        raise RuntimeError("not a proxy part")
++    profile = part.profile_json or {}
++    max_mib = int(profile.get("max_mib") or 1990)
++    max_bytes = max_mib * 1024 * 1024
++    metadata = session.metadata_json or {}
++    root = configured_output_root(str(metadata.get("output_root_key") or "root1")).resolve()
++    final_path = safe_child(root, part.relative_path)
++    final_path.parent.mkdir(parents=True, exist_ok=True)
++
++    source_paths: list[Path] = []
++    for source_part in source_parts:
++        if (source_part.kind or "source") != "source":
++            raise RuntimeError("proxy source is not an original part")
++        if source_part.status != "ready":
++            raise RuntimeError(f"source Part #{source_part.part_no} is not ready")
++        if source_part.local_file_state != "present":
++            raise RuntimeError(f"source Part #{source_part.part_no} is not available locally")
++        source_path = safe_child(root, source_part.relative_path)
++        if not source_path.is_file():
++            raise RuntimeError(f"source Part #{source_part.part_no} file is missing")
++        if source_part.final_bytes is not None and source_path.stat().st_size != int(source_part.final_bytes):
++            raise RuntimeError(f"source Part #{source_part.part_no} size mismatch")
++        source_paths.append(source_path)
++
++    for pattern in (f"{final_path.name}.partial-*", f"{final_path.name}.quarantine-*", f"{final_path.name}.concat-*"):
++        for stale in final_path.parent.glob(pattern):
++            try:
++                stale.unlink()
++            except FileNotFoundError:
++                pass
++    if final_path.exists():
++        quarantine = final_path.with_name(f"{final_path.name}.quarantine-{uuid.uuid4().hex}")
++        os.replace(final_path, quarantine)
++        fsync_directory(final_path.parent)
++        try:
++            quarantine.unlink()
++        except FileNotFoundError:
++            pass
++
++    token = uuid.uuid4().hex
++    partial = final_path.with_name(f"{final_path.name}.partial-{token}")
++    concat_file = final_path.with_name(f"{final_path.name}.concat-{token}.txt")
++    concat_file.write_text("".join(f"file '{_ffconcat_quote(path)}'\n" for path in source_paths), encoding="utf-8")
++    command = [
++        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
++        "-fflags", "+genpts",
++        "-f", "concat", "-safe", "0", "-i", str(concat_file),
++        "-map", "0:v:0", "-map", "0:a:0?",
++        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=60",
++        "-c:v", "libx265", "-preset", "medium",
++        "-b:v", "4000k", "-maxrate", "4000k", "-bufsize", "8000k",
++        "-pix_fmt", "yuv420p",
++        "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
++        "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
++        "-f", "mp4", str(partial),
++    ]
++    process = await asyncio.create_subprocess_exec(
++        *command,
++        stdout=asyncio.subprocess.DEVNULL,
++        stderr=asyncio.subprocess.PIPE,
++    )
++    communicate_task = asyncio.create_task(process.communicate())
++    last_progress = -1
++    try:
++        while not communicate_task.done():
++            written = partial.stat().st_size if partial.exists() else 0
++            if await db_cancel_requested(job_id):
++                process.terminate()
++                await communicate_task
++                raise BuildCancelled("cancel requested")
++            if gate.requested:
++                try:
++                    process.send_signal(signal.SIGSTOP)
++                    await maybe_wait_gate(job_id, part_id, written)
++                finally:
++                    if process.returncode is None:
++                        process.send_signal(signal.SIGCONT)
++            if written != last_progress:
++                await progress(job_id, part_id, written, "building")
++                last_progress = written
++            await asyncio.sleep(0.5)
++        _stdout, stderr = await communicate_task
++        if process.returncode != 0:
++            detail = (stderr or b"").decode("utf-8", "replace").strip()
++            raise RuntimeError(f"ffmpeg proxy transcode failed ({process.returncode}): {detail[-3000:]}")
++
++        final_bytes = partial.stat().st_size if partial.exists() else 0
++        if final_bytes <= 0:
++            raise RuntimeError("ffmpeg produced an empty proxy part")
++        if final_bytes > max_bytes:
++            raise RuntimeError(f"proxy part exceeds max size: {final_bytes} > {max_bytes} bytes ({max_mib} MiB)")
++
++        await progress(job_id, part_id, final_bytes, "verifying")
++        digest = hashlib.sha256()
++        with partial.open("rb") as handle:
++            while True:
++                await maybe_wait_gate(job_id, part_id, final_bytes, resume_phase="verifying")
++                chunk = handle.read(settings.part_build_chunk_bytes)
++                if not chunk:
++                    break
++                digest.update(chunk)
++                await asyncio.sleep(0)
++        await maybe_wait_gate(job_id, part_id, final_bytes, resume_phase="verifying")
++        os.replace(partial, final_path)
++        fsync_directory(final_path.parent)
++        await finalize_ready(job_id, part_id, final_bytes, digest.hexdigest(), {})
++    except asyncio.CancelledError:
++        if process.returncode is None:
++            process.terminate()
++        communicate_task.cancel()
++        raise
++    finally:
++        for temp in (partial, concat_file):
++            try:
++                temp.unlink()
++            except FileNotFoundError:
++                pass
++
++
+ async def build_part(job_id: int, part_id: uuid.UUID) -> None:
++    async with SessionLocal() as db:
++        kind = await db.scalar(select(VideoPart.kind).where(VideoPart.id == part_id))
++    if kind == "proxy":
++        await build_proxy_part(job_id, part_id)
++        return
+     part, session, pairs = await load_build_inputs(part_id)
+     if session.deleted_at_utc is not None:
+         raise RuntimeError("video session is in trash")
+@@ -537,7 +695,7 @@ async def finalize_ready(
+         job.status = "ready"
+         job.phase = "ready"
+         job.progress_bytes = final_bytes
+-        job.total_bytes = int(part.expected_bytes)
++        job.total_bytes = final_bytes if (part.kind or "source") == "proxy" else int(part.expected_bytes)
+         job.last_error = None
+         job.completed_at_utc = now
+         job.heartbeat_at_utc = now
+@@ -808,6 +966,8 @@ async def replace_part_segments(part_id: uuid.UUID, payload: SegmentReplacementP
+     replaced_count = 0
+     async with SessionLocal() as db:
+         part, session = await require_linked_ready_part(db, part_id)
++        if (part.kind or "source") != "source":
++            raise HTTPException(409, "proxy parts do not own source segments")
+         job = await db.scalar(select(VideoPartBuildJob).where(VideoPartBuildJob.part_id == part_id))
+         if job is not None and job.status in BUILDING_JOB_STATUSES:
+             raise HTTPException(409, "part build must be idle before replacing segments")
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 6855002..fd6f086 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -85,6 +85,7 @@ type VideoPartJob = {
+ type VideoPart = {
+   id: string;
+   video_session_id: string;
++  kind?: "source" | "proxy" | string;
+   part_no: number;
+   run_no: number;
+   start_segment_no: number;
+@@ -100,6 +101,10 @@ type VideoPart = {
+   local_file_state: string;
+   local_unlinked_at_utc?: string | null;
+   local_unlink_error?: string | null;
++  profile?: {
++    width?: number; height?: number; fps?: number; video_codec?: string; video_bitrate_kbps?: number; video_max_bitrate_kbps?: number;
++    audio_codec?: string; audio_bitrate_kbps?: number; max_mib?: number; source_part_nos?: number[];
++  } | null;
+   created_at: string;
+   completed_at_utc?: string | null;
+   job?: VideoPartJob | null;
+@@ -176,6 +181,29 @@ type PartPlanAll = {
+   skipped: string[];
+ };
+ 
++type ProxyPartPlan = {
++  source_part_ids: string[];
++  source_part_nos: number[];
++  first_source_part_no: number;
++  last_source_part_no: number;
++  source_part_count: number;
++  start_segment_no: number;
++  end_segment_no: number;
++  duration_ms: number;
++  expected_bytes: number;
++  target_mib: number;
++};
++
++type ProxyPartPlanAll = {
++  items: ProxyPartPlan[];
++  part_count: number;
++  source_part_count: number;
++  duration_ms: number;
++  expected_bytes: number;
++  target_mib: number;
++  profile: { width: number; height: number; fps: number; video_codec: string; video_bitrate_kbps: number; video_max_bitrate_kbps: number; audio_codec: string; audio_bitrate_kbps: number };
++};
++
+ type OutputRoot = {
+   key: string;
+   label: string;
+@@ -707,6 +735,7 @@ function SiteCategoryIcon({ slug }: { slug: string }) {
+ const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
+ const PROGRESS_POLL_MS = 5000;
+ const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
++const PROXY_PART_TARGET_MIB_KEY = "streamhub.videoManager.proxyTargetMib";
+ const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
+ const EVENT_TITLE_MODE_KEY = "streamhub.events.titleMode";
+ const SITE_COMMENT_COLOR_KEY = "streamhub.site.commentColor";
+@@ -3308,6 +3337,9 @@ function App() {
+   const [partPlan, setPartPlan] = useState<PartPlan | null>(null);
+   const [partPlanAll, setPartPlanAll] = useState<PartPlanAll | null>(null);
+   const [partAction, setPartAction] = useState(false);
++  const [proxyTargetMib, setProxyTargetMib] = useState(() => storedPositiveInt(PROXY_PART_TARGET_MIB_KEY, 1990));
++  const [proxyPlan, setProxyPlan] = useState<ProxyPartPlanAll | null>(null);
++  const [proxyAction, setProxyAction] = useState(false);
+   const [telegramBindings, setTelegramBindings] = useState<Record<string, TelegramBinding>>({});
+   const [telegramStatus, setTelegramStatus] = useState<TelegramStatus | null>(null);
+   const [telegramSyncing, setTelegramSyncing] = useState(false);
+@@ -3573,6 +3605,10 @@ function App() {
+     try { window.localStorage.setItem(PART_SEGMENT_COUNT_KEY, String(partSegmentCount)); } catch { /* browser storage unavailable */ }
+   }, [partSegmentCount]);
+ 
++  useEffect(() => {
++    try { window.localStorage.setItem(PROXY_PART_TARGET_MIB_KEY, String(proxyTargetMib)); } catch { /* browser storage unavailable */ }
++  }, [proxyTargetMib]);
++
+   useEffect(() => {
+     const query = siteQuery.trim();
+     if (view !== "site" || !query) {
+@@ -4396,6 +4432,7 @@ function App() {
+     setSelectedVideo(session);
+     setPartPlan(null);
+     setPartPlanAll(null);
++    setProxyPlan(null);
+     setSegmentReplacementPartId(null);
+     setSegmentReplacementDirectory("");
+     try {
+@@ -4417,7 +4454,7 @@ function App() {
+       setVideoSegments(loadedSegments);
+       setVideoParts(loadedParts);
+       const reserved = new Set<number>();
+-      loadedParts.forEach((part) => {
++      loadedParts.filter((part) => (part.kind || "source") === "source").forEach((part) => {
+         for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
+       });
+       const next = loadedSegments.find((segment) => segment.storage_state === "archive_ready" && segment.integrity_state === "hashed" && !reserved.has(segment.segment_no))?.segment_no || loadedSegments[0]?.segment_no || 1;
+@@ -4447,7 +4484,7 @@ function App() {
+ 
+   function nextBuildableSegment(after: number, parts: VideoPart[]) {
+     const reserved = new Set<number>();
+-    parts.forEach((part) => {
++    parts.filter((part) => (part.kind || "source") === "source").forEach((part) => {
+       for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
+     });
+     return videoSegments.find((segment) => (
+@@ -4554,6 +4591,47 @@ function App() {
+     }
+   }
+ 
++  async function previewProxyParts() {
++    if (!selectedVideo) return;
++    setProxyAction(true);
++    try {
++      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/proxy-parts/plan`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ target_mib: proxyTargetMib }),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      setProxyPlan(await res.json() as ProxyPartPlanAll);
++      setError(null);
++    } catch (e) {
++      setProxyPlan(null);
++      setError(String(e));
++    } finally {
++      setProxyAction(false);
++    }
++  }
++
++  async function buildProxyParts() {
++    if (!selectedVideo || !proxyPlan) return;
++    setProxyAction(true);
++    try {
++      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/proxy-parts/build-all`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ target_mib: proxyTargetMib }),
++      });
++      if (!res.ok) throw new Error(await res.text());
++      const data = await res.json() as { builder_wakeup_error?: string | null };
++      await loadVideoParts(selectedVideo.id);
++      setProxyPlan(null);
++      setError(data.builder_wakeup_error ? `Proxy Parts поставлены в durable queue, но wakeup builder не прошёл: ${data.builder_wakeup_error}` : null);
++    } catch (e) {
++      setError(String(e));
++    } finally {
++      setProxyAction(false);
++    }
++  }
++
+   async function partActionRequest(part: VideoPart, action: "retry" | "cancel" | "delete") {
+     if (!selectedVideo) return;
+     if (action === "delete" && !window.confirm(`Удалить part #${part.part_no}? Source segments останутся.`)) return;
+@@ -5584,6 +5662,36 @@ function App() {
+             </div>
+           )}
+         </section>
++        <section className="video-block proxy-parts-block">
++          <div className="section-label">PROXY PARTS · HEVC 1080p60</div>
++          <p className="muted small">Создаются из готовых локальных Parts. Профиль фиксирован: HEVC/H.265 · 1920×1080 · 60 fps · target/max 4/4 Mbps · AAC 160 kbps. Исходные Parts не изменяются.</p>
++          <div className="part-controls">
++            <label className="storage-field"><span>Max Proxy Part MiB · сохраняется</span><input type="number" min={1} value={proxyTargetMib} onChange={(e) => { setProxyTargetMib(Math.max(1, Number(e.target.value) || 1)); setProxyPlan(null); }} /></label>
++          </div>
++          <p className="muted small">Стандарт: 1990 MiB. Builder объединяет целые исходные Parts, пока итоговый proxy остаётся в лимите.</p>
++          <div className="actions part-actions">
++            <button disabled={proxyAction} onClick={() => void previewProxyParts()}>{proxyAction ? "Работаю…" : "Preview Proxy"}</button>
++            <button disabled={proxyAction || !proxyPlan} onClick={() => void buildProxyParts()}>{proxyAction ? "Работаю…" : "Build Proxy Parts"}</button>
++          </div>
++          {proxyPlan && (
++            <div className="part-plan-all">
++              <div className="part-plan">
++                <div><span>Proxy Parts</span><strong>{proxyPlan.part_count}</strong></div>
++                <div><span>Source Parts</span><strong>{proxyPlan.source_part_count}</strong></div>
++                <div><span>Total duration</span><strong>{fmtMs(proxyPlan.duration_ms)}</strong></div>
++                <div><span>Estimated</span><strong>{fmtBytes(proxyPlan.expected_bytes)}</strong></div>
++              </div>
++              <div className="part-plan-all-list">
++                {proxyPlan.items.map((plan, index) => (
++                  <div className="part-plan-all-row" key={`${plan.first_source_part_no}-${plan.last_source_part_no}`}>
++                    <strong>Proxy #{index + 1} · Parts {plan.first_source_part_no}–{plan.last_source_part_no}</strong>
++                    <span>{plan.source_part_count} source · {fmtMs(plan.duration_ms)} · ~{fmtBytes(plan.expected_bytes)} · max {plan.target_mib} MiB</span>
++                  </div>
++                ))}
++              </div>
++            </div>
++          )}
++        </section>
+         <section className="video-block telegram-storage-block">
+           <div className="row telegram-storage-head">
+             <div>
+@@ -5612,9 +5720,9 @@ function App() {
+         </section>
+         <section className="video-block">
+           <div className="section-label">PARTS / BUILD QUEUE</div>
+-          {videoParts.length === 0 ? <div className="empty-child">Parts ещё не создавались</div> : (
++          {videoParts.filter((part) => (part.kind || "source") === "source").length === 0 ? <div className="empty-child">Parts ещё не создавались</div> : (
+             <div className="part-list">
+-              {videoParts.map((part) => {
++              {videoParts.filter((part) => (part.kind || "source") === "source").map((part) => {
+                 const job = part.job;
+                 const telegram = telegramBindings[part.id];
+                 const progressTotal = job?.total_bytes || part.expected_bytes || 1;
+@@ -5682,6 +5790,57 @@ function App() {
+             </div>
+           )}
+         </section>
++        <section className="video-block">
++          <div className="section-label">PROXY PARTS / BUILD QUEUE</div>
++          {videoParts.filter((part) => part.kind === "proxy").length === 0 ? <div className="empty-child">Proxy Parts ещё не создавались</div> : (
++            <div className="part-list">
++              {videoParts.filter((part) => part.kind === "proxy").map((part) => {
++                const job = part.job;
++                const telegram = telegramBindings[part.id];
++                const progressTotal = job?.total_bytes || part.expected_bytes || 1;
++                const progressBytes = job?.progress_bytes || (part.status === "ready" ? (part.final_bytes || part.expected_bytes) : 0);
++                const progressPercent = Math.max(0, Math.min(100, Math.round((progressBytes / progressTotal) * 100)));
++                const sourceNos = part.profile?.source_part_nos || [];
++                return (
++                  <div className="part-row proxy-part-row" key={part.id}>
++                    <div className="row"><strong>Proxy Part #{part.part_no}{sourceNos.length ? ` · source ${sourceNos[0]}–${sourceNos[sourceNos.length - 1]}` : ""}</strong><span className={`part-status part-status-${part.status}`}>{part.status}</span></div>
++                    <div className="muted small">1080p60 · HEVC target/max 4/4 Mbps · AAC 160 kbps · {fmtMs(part.duration_ms)} · {fmtBytes(part.final_bytes ?? part.expected_bytes)} · attempts {job?.attempts || 0}</div>
++                    {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && (
++                      <>
++                        <div className="progress-track part-progress"><div className="progress-fill" style={{ width: `${progressPercent}%` }} /></div>
++                        <div className="muted small">{job?.phase || part.status} · {fmtBytes(progressBytes)} / {fmtBytes(progressTotal)}{part.status === "waiting_capture_idle" || part.status === "suspended_for_capture" ? " · ожидает завершения Video capture" : ""}</div>
++                      </>
++                    )}
++                    {part.sha256 && <div className="muted small hash-line">sha256 <code>{part.sha256}</code></div>}
++                    <div className="muted small path-cell"><code>{part.relative_path}</code></div>
++                    <div className={`part-local-status part-local-status-${part.local_file_state || "present"}`}>
++                      Local Proxy: <strong>{part.local_file_state === "unlinked" ? "deleted" : part.local_file_state || "present"}</strong>
++                      {part.local_unlinked_at_utc && <> · {new Date(part.local_unlinked_at_utc).toLocaleString()}</>}
++                    </div>
++                    {part.local_unlink_error && <div className="inline-error small">{part.local_unlink_error}</div>}
++                    {part.status === "ready" && (
++                      <div className={`telegram-part-status telegram-part-status-${telegram?.status || "missing"}`}>
++                        Telegram: <strong>{telegram?.status || "missing"}</strong>
++                        {telegram?.message_id != null && <> · message <code>{telegram.message_id}</code></>}
++                        {telegram?.matched_by && <> · {telegram.matched_by}</>}
++                      </div>
++                    )}
++                    {(part.last_error || job?.last_error) && <div className="inline-error small">{part.last_error || job?.last_error}</div>}
++                    <div className="actions part-row-actions">
++                      {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}
++                      {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && <button disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "cancel")}>Cancel</button>}
++                      <button onClick={() => copyPartPath(part)}>Copy path</button>
++                      {part.status === "ready" && telegram?.status === "linked" && part.local_file_state !== "unlinked" && (
++                        <button className="danger subtle" disabled={partAction || proxyAction} onClick={() => void unlinkLocalPart(part)}>Unlink Proxy</button>
++                      )}
++                      {(part.status === "failed" || part.status === "cancelled") && <button className="danger subtle" disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "delete")}>Delete reservation</button>}
++                    </div>
++                  </div>
++                );
++              })}
++            </div>
++          )}
++        </section>
+         <section className="video-block">
+           <div className="section-label">SEGMENTS · spool → output</div>
+           <p className="muted small">Закрытый segment сначала живёт в Docker spool. Backend переносит закрытые segments пачками в физический output. Spool очищается только после проверки всей пачки и DB commit.</p>
+diff --git a/migrations/versions/0022_proxy_parts.py b/migrations/versions/0022_proxy_parts.py
+new file mode 100644
+index 0000000..766667d
+--- /dev/null
++++ b/migrations/versions/0022_proxy_parts.py
+@@ -0,0 +1,121 @@
++"""proxy parts and manual media reclaim schema
++
++Revision ID: 0022_proxy_parts
++Revises: 0021_site_watch_room_chat
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import mysql
++
++revision = "0022_proxy_parts"
++down_revision = "0021_site_watch_room_chat"
++branch_labels = None
++depends_on = None
++
++DT = mysql.DATETIME(fsp=6)
++UUID = mysql.BINARY(16)
++
++
++def _inspect():
++    return sa.inspect(op.get_bind())
++
++
++def _columns(table: str) -> set[str]:
++    return {row["name"] for row in _inspect().get_columns(table)}
++
++
++def _indexes(table: str) -> set[str]:
++    return {row["name"] for row in _inspect().get_indexes(table)}
++
++
++def _uniques(table: str) -> set[str]:
++    return {row["name"] for row in _inspect().get_unique_constraints(table) if row.get("name")}
++
++
++def _table_exists(name: str) -> bool:
++    return name in _inspect().get_table_names()
++
++
++def upgrade() -> None:
++    part_columns = _columns("video_parts")
++    with op.batch_alter_table("video_parts") as batch:
++        if "kind" not in part_columns:
++            batch.add_column(sa.Column("kind", sa.String(length=16), nullable=False, server_default="source"))
++        if "local_file_state" not in part_columns:
++            batch.add_column(sa.Column("local_file_state", sa.String(length=24), nullable=False, server_default="present"))
++        if "local_unlinked_at_utc" not in part_columns:
++            batch.add_column(sa.Column("local_unlinked_at_utc", DT, nullable=True))
++        if "local_unlink_error" not in part_columns:
++            batch.add_column(sa.Column("local_unlink_error", sa.Text(), nullable=True))
++        if "profile_json" not in part_columns:
++            batch.add_column(sa.Column("profile_json", sa.JSON(), nullable=True))
++
++    part_indexes = _indexes("video_parts")
++    if "ix_video_parts_kind" not in part_indexes:
++        op.create_index("ix_video_parts_kind", "video_parts", ["kind"])
++    if "ix_video_parts_local_file_state" not in part_indexes:
++        op.create_index("ix_video_parts_local_file_state", "video_parts", ["local_file_state"])
++    if "ix_video_parts_local_unlinked_at_utc" not in part_indexes:
++        op.create_index("ix_video_parts_local_unlinked_at_utc", "video_parts", ["local_unlinked_at_utc"])
++
++    uniques = _uniques("video_parts")
++    if "uq_video_part_session_no" in uniques:
++        op.drop_constraint("uq_video_part_session_no", "video_parts", type_="unique")
++    uniques = _uniques("video_parts")
++    if "uq_video_part_session_kind_no" not in uniques:
++        op.create_unique_constraint(
++            "uq_video_part_session_kind_no", "video_parts", ["video_session_id", "kind", "part_no"]
++        )
++
++    segment_columns = _columns("video_segments")
++    with op.batch_alter_table("video_segments") as batch:
++        if "replacement_directory" not in segment_columns:
++            batch.add_column(sa.Column("replacement_directory", sa.String(length=1024), nullable=True))
++        if "replacement_path" not in segment_columns:
++            batch.add_column(sa.Column("replacement_path", sa.String(length=1024), nullable=True))
++        if "replaced_at_utc" not in segment_columns:
++            batch.add_column(sa.Column("replaced_at_utc", DT, nullable=True))
++    if "ix_video_segments_replaced_at_utc" not in _indexes("video_segments"):
++        op.create_index("ix_video_segments_replaced_at_utc", "video_segments", ["replaced_at_utc"])
++
++    if not _table_exists("video_proxy_part_sources"):
++        op.create_table(
++            "video_proxy_part_sources",
++            sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
++            sa.Column("proxy_part_id", UUID, nullable=False),
++            sa.Column("source_part_id", UUID, nullable=False),
++            sa.Column("position", sa.Integer(), nullable=False),
++            sa.Column("created_at", DT, nullable=False),
++            sa.ForeignKeyConstraint(["proxy_part_id"], ["video_parts.id"], ondelete="CASCADE"),
++            sa.ForeignKeyConstraint(["source_part_id"], ["video_parts.id"], ondelete="RESTRICT"),
++            sa.PrimaryKeyConstraint("id"),
++            sa.UniqueConstraint("proxy_part_id", "source_part_id", name="uq_video_proxy_part_source_pair"),
++            sa.UniqueConstraint("source_part_id", name="uq_video_proxy_source_part"),
++        )
++        op.create_index("ix_video_proxy_part_sources_proxy_part_id", "video_proxy_part_sources", ["proxy_part_id"])
++        op.create_index("ix_video_proxy_part_sources_source_part_id", "video_proxy_part_sources", ["source_part_id"])
++
++    op.execute(sa.text("UPDATE video_parts SET kind='source' WHERE kind IS NULL OR kind=''"))
++
++
++def downgrade() -> None:
++    if _table_exists("video_proxy_part_sources"):
++        op.drop_table("video_proxy_part_sources")
++    uniques = _uniques("video_parts")
++    if "uq_video_part_session_kind_no" in uniques:
++        op.drop_constraint("uq_video_part_session_kind_no", "video_parts", type_="unique")
++    if "uq_video_part_session_no" not in _uniques("video_parts"):
++        op.create_unique_constraint("uq_video_part_session_no", "video_parts", ["video_session_id", "part_no"])
++    for index in ("ix_video_parts_local_unlinked_at_utc", "ix_video_parts_local_file_state", "ix_video_parts_kind"):
++        if index in _indexes("video_parts"):
++            op.drop_index(index, table_name="video_parts")
++    for column in ("profile_json", "local_unlink_error", "local_unlinked_at_utc", "local_file_state", "kind"):
++        if column in _columns("video_parts"):
++            op.drop_column("video_parts", column)
++    if "ix_video_segments_replaced_at_utc" in _indexes("video_segments"):
++        op.drop_index("ix_video_segments_replaced_at_utc", table_name="video_segments")
++    for column in ("replaced_at_utc", "replacement_path", "replacement_directory"):
++        if column in _columns("video_segments"):
++            op.drop_column("video_segments", column)
+diff --git a/packages/python_common/streamhub_common/models.py b/packages/python_common/streamhub_common/models.py
+index a972a61..5fc3a59 100644
+--- a/packages/python_common/streamhub_common/models.py
++++ b/packages/python_common/streamhub_common/models.py
+@@ -387,10 +387,11 @@ class VideoGap(Base):
+ 
+ class VideoPart(Base):
+     __tablename__ = "video_parts"
+-    __table_args__ = (UniqueConstraint("video_session_id", "part_no", name="uq_video_part_session_no"),)
++    __table_args__ = (UniqueConstraint("video_session_id", "kind", "part_no", name="uq_video_part_session_kind_no"),)
+ 
+     id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
+     video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
++    kind: Mapped[str] = mapped_column(String(16), default="source", index=True)
+     part_no: Mapped[int] = mapped_column(Integer)
+     run_no: Mapped[int] = mapped_column(Integer)
+     start_segment_no: Mapped[int] = mapped_column(Integer)
+@@ -406,6 +407,7 @@ class VideoPart(Base):
+     local_file_state: Mapped[str] = mapped_column(String(24), default="present", index=True)
+     local_unlinked_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
+     local_unlink_error: Mapped[str | None] = mapped_column(Text)
++    profile_json: Mapped[dict | None] = mapped_column(JSON)
+     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+     completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+@@ -430,6 +432,24 @@ class VideoPartSegment(Base):
+     part_offset_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+ 
+ 
++class VideoProxyPartSource(Base):
++    __tablename__ = "video_proxy_part_sources"
++    __table_args__ = (
++        UniqueConstraint("proxy_part_id", "source_part_id", name="uq_video_proxy_part_source_pair"),
++        UniqueConstraint("source_part_id", name="uq_video_proxy_source_part"),
++    )
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    proxy_part_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("video_parts.id", ondelete="CASCADE"), index=True
++    )
++    source_part_id: Mapped[uuid.UUID] = mapped_column(
++        UUIDBinary(), ForeignKey("video_parts.id", ondelete="RESTRICT"), index=True
++    )
++    position: Mapped[int] = mapped_column(Integer)
++    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
++
++
+ class TelegramChannelState(Base):
+     __tablename__ = "telegram_channel_state"
+ 
+diff --git a/packages/python_common/streamhub_common/telegram_names.py b/packages/python_common/streamhub_common/telegram_names.py
+index 6a2210f..0a1a6ed 100644
+--- a/packages/python_common/streamhub_common/telegram_names.py
++++ b/packages/python_common/streamhub_common/telegram_names.py
+@@ -5,6 +5,7 @@ from pathlib import PurePath
+ 
+ 
+ _PART_RE = re.compile(r"(?:^|_+)part_?(\d{1,9})(?:_+|\.|$)", re.IGNORECASE)
++_PROXY_RANGE_RE = re.compile(r"(?:^|_+)p(\d{1,9})[-_]+p?(\d{1,9})(?:_+|\.|$)", re.IGNORECASE)
+ _SEG_RE = re.compile(
+     r"(?:^|_+)(?:seg_?|s)(\d{1,9})[-_]+(?:seg_?|s)?(\d{1,9})(?:_+|\.|$)",
+     re.IGNORECASE,
+@@ -30,22 +31,23 @@ def canonical_part_identity(name: str) -> tuple[str, int, int, int] | None:
+     """
+ 
+     value = _stem(name)
+-    if not value.startswith("vp_"):
++    prefix = "vpx_" if value.startswith("vpx_") else "vp_" if value.startswith("vp_") else None
++    if prefix is None:
+         return None
+ 
+     part_match = _PART_RE.search(value)
+-    seg_match = _SEG_RE.search(value)
+-    if part_match is None or seg_match is None:
++    range_match = _PROXY_RANGE_RE.search(value) if prefix == "vpx_" else _SEG_RE.search(value)
++    if part_match is None or range_match is None:
+         return None
+ 
+-    session_text = value[3 : part_match.start()]
++    session_text = value[len(prefix) : part_match.start()]
+     session_hex = re.sub(r"[^0-9a-f]", "", session_text)
+     if len(session_hex) != 32:
+         return None
+ 
+     part_no = int(part_match.group(1))
+-    start_segment = int(seg_match.group(1))
+-    end_segment = int(seg_match.group(2))
++    start_segment = int(range_match.group(1))
++    end_segment = int(range_match.group(2))
+     if part_no <= 0 or start_segment <= 0 or end_segment < start_segment:
+         return None
+     return session_hex, part_no, start_segment, end_segment
+diff --git a/tests/test_proxy_parts.py b/tests/test_proxy_parts.py
+new file mode 100644
+index 0000000..1c11d7e
+--- /dev/null
++++ b/tests/test_proxy_parts.py
+@@ -0,0 +1,41 @@
++from pathlib import Path
++
++from streamhub_common.telegram_names import canonical_part_identity, filenames_equivalent
++
++
++def test_proxy_parts_schema_and_profile_are_wired():
++    root = Path(__file__).resolve().parents[1]
++    migration = (root / "migrations/versions/0022_proxy_parts.py").read_text()
++    models = (root / "packages/python_common/streamhub_common/models.py").read_text()
++    api = (root / "apps/api/app/routers/video.py").read_text()
++    builder = (root / "apps/video_part_builder/app/main.py").read_text()
++    dockerfile = (root / "apps/video_part_builder/Dockerfile").read_text()
++    playback = (root / "apps/api/app/telegram/playback.py").read_text()
++    site = (root / "apps/api/app/routers/site.py").read_text()
++
++    assert 'revision = "0022_proxy_parts"' in migration
++    assert 'down_revision = "0021_site_watch_room_chat"' in migration
++    assert 'video_proxy_part_sources' in migration
++    assert 'kind: Mapped[str]' in models
++    assert 'class VideoProxyPartSource' in models
++    assert '/proxy-parts/plan' in api
++    assert '/proxy-parts/build-all' in api
++    assert 'video_bitrate_kbps": 4000' in api
++    assert 'audio_bitrate_kbps": 160' in api
++    assert 'proxy_parts/{file_name}' in api
++    assert 'scale=1920:1080' in builder
++    assert '"fps=60"' not in builder  # the fps filter is part of the combined filter string
++    assert 'fps=60' in builder
++    assert '"4000k"' in builder
++    assert '"160k"' in builder
++    assert 'libx265' in builder
++    assert 'apt-get install -y --no-install-recommends ffmpeg' in dockerfile
++    assert 'VideoPart.kind == "source"' in playback
++    assert 'VideoPart.kind == "source"' in site
++
++
++def test_proxy_telegram_filename_has_stable_identity():
++    original = "vpx_0123456789abcdef0123456789abcdef__part0003__p0007-p0011.mp4"
++    normalized = "vpx_0123456789abcdef0123456789abcdef_part_3_p7-p11.mp4"
++    assert canonical_part_identity(original) == ("0123456789abcdef0123456789abcdef", 3, 7, 11)
++    assert filenames_equivalent(original, normalized)

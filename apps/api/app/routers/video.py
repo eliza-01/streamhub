@@ -18,6 +18,7 @@ from streamhub_common.models import (
     VideoPart,
     VideoPartBuildJob,
     VideoPartSegment,
+    VideoProxyPartSource,
     TelegramVideoPartBinding,
     VideoRun,
     VideoSegment,
@@ -44,6 +45,10 @@ class PartPlanRequest(BaseModel):
 
 class PartCreateRequest(PartPlanRequest):
     pass
+
+
+class ProxyPartPlanRequest(BaseModel):
+    target_mib: int = Field(default=1990, ge=1, le=102400)
 
 
 class SegmentReplacementRequest(BaseModel):
@@ -81,6 +86,7 @@ def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
     return {
         "id": str(part.id),
         "video_session_id": str(part.video_session_id),
+        "kind": part.kind or "source",
         "part_no": part.part_no,
         "run_no": part.run_no,
         "start_segment_no": part.start_segment_no,
@@ -96,6 +102,7 @@ def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
         "local_file_state": part.local_file_state,
         "local_unlinked_at_utc": part.local_unlinked_at_utc,
         "local_unlink_error": part.local_unlink_error,
+        "profile": part.profile_json,
         "created_at": part.created_at,
         "completed_at_utc": part.completed_at_utc,
         "job": None if job is None else {
@@ -117,6 +124,18 @@ def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
 
 def _part_file_name(session_id: uuid.UUID, part_no: int, start_segment_no: int, end_segment_no: int) -> str:
     return f"vp_{session_id.hex}__part{part_no:04d}__s{start_segment_no:06d}-s{end_segment_no:06d}.ts"
+
+
+def _proxy_part_file_name(session_id: uuid.UUID, part_no: int, first_source_part: int, last_source_part: int) -> str:
+    return f"vpx_{session_id.hex}__part{part_no:04d}__p{first_source_part:04d}-p{last_source_part:04d}.mp4"
+
+
+PROXY_VIDEO_BITRATE_BPS = 4_000_000
+PROXY_AUDIO_BITRATE_BPS = 160_000
+PROXY_MUX_SAFETY = 1.03
+
+def _proxy_expected_bytes(duration_ms: int) -> int:
+    return int((max(0, duration_ms) / 1000.0) * ((PROXY_VIDEO_BITRATE_BPS + PROXY_AUDIO_BITRATE_BPS) / 8.0) * PROXY_MUX_SAFETY)
 
 
 async def plan_part_range(
@@ -818,6 +837,7 @@ async def _reserve_video_part(
     part = VideoPart(
         id=uuid.uuid4(),
         video_session_id=session_id,
+        kind="source",
         part_no=part_no,
         run_no=run_no,
         start_segment_no=segments[0].segment_no,
@@ -870,7 +890,7 @@ async def create_video_part(
     await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
     session, segments, run_no, plan = await plan_part_range(db, session_id, payload, lock=True)
     part_no = int(
-        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
+        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id, VideoPart.kind == "source"))
         or 0
     ) + 1
     queued_status = await _queued_part_status(db)
@@ -901,7 +921,7 @@ async def create_all_video_parts(
     await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
     session, planned, skipped = await plan_all_part_ranges(db, session_id, payload, lock=True)
     next_part_no = int(
-        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id))
+        await db.scalar(select(func.coalesce(func.max(VideoPart.part_no), 0)).where(VideoPart.video_session_id == session_id, VideoPart.kind == "source"))
         or 0
     ) + 1
     queued_status = await _queued_part_status(db)
@@ -933,6 +953,185 @@ async def create_all_video_parts(
         "items": [{**part_dict(part, job), "plan": plan} for part, job, plan in created],
         "part_count": len(created),
         "skipped": skipped,
+        "builder_wakeup_error": wakeup_error,
+    }
+
+
+async def _proxy_part_plan(db: AsyncSession, session_id: uuid.UUID, target_mib: int, *, lock: bool = False) -> tuple[VideoSession, list[dict]]:
+    session = await db.get(VideoSession, session_id)
+    if session is None or session.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    stmt = (
+        select(VideoPart)
+        .where(
+            VideoPart.video_session_id == session_id,
+            VideoPart.kind == "source",
+            VideoPart.status == "ready",
+            VideoPart.local_file_state == "present",
+        )
+        .order_by(VideoPart.part_no)
+    )
+    if lock:
+        stmt = stmt.with_for_update()
+    source_parts = (await db.execute(stmt)).scalars().all()
+    if not source_parts:
+        raise HTTPException(409, "no local ready source parts are available")
+
+    used_ids = set(
+        (await db.execute(select(VideoProxyPartSource.source_part_id))).scalars().all()
+    )
+    available = [part for part in source_parts if part.id not in used_ids]
+    if not available:
+        raise HTTPException(409, "all local ready source parts are already assigned to proxy parts")
+
+    max_bytes = int(target_mib) * 1024 * 1024
+    plans: list[dict] = []
+    current: list[VideoPart] = []
+    duration_ms = 0
+
+    def flush() -> None:
+        nonlocal current, duration_ms
+        if not current:
+            return
+        expected = _proxy_expected_bytes(duration_ms)
+        plans.append({
+            "source_part_ids": [str(part.id) for part in current],
+            "source_part_nos": [int(part.part_no) for part in current],
+            "first_source_part_no": int(current[0].part_no),
+            "last_source_part_no": int(current[-1].part_no),
+            "source_part_count": len(current),
+            "start_segment_no": int(current[0].start_segment_no),
+            "end_segment_no": int(current[-1].end_segment_no),
+            "duration_ms": int(duration_ms),
+            "expected_bytes": expected,
+            "target_mib": int(target_mib),
+        })
+        current = []
+        duration_ms = 0
+
+    for part in available:
+        next_duration = duration_ms + int(part.duration_ms or 0)
+        next_expected = _proxy_expected_bytes(next_duration)
+        if current and next_expected > max_bytes:
+            flush()
+            next_duration = int(part.duration_ms or 0)
+            next_expected = _proxy_expected_bytes(next_duration)
+        if next_expected > max_bytes:
+            raise HTTPException(409, f"source Part #{part.part_no} alone exceeds proxy max size at the 4 Mbps profile")
+        current.append(part)
+        duration_ms = next_duration
+    flush()
+    return session, plans
+
+
+@router.post("/video-sessions/{session_id}/proxy-parts/plan")
+async def plan_proxy_parts(
+    session_id: uuid.UUID,
+    payload: ProxyPartPlanRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    _session, plans = await _proxy_part_plan(db, session_id, payload.target_mib)
+    return {
+        "items": plans,
+        "part_count": len(plans),
+        "source_part_count": sum(item["source_part_count"] for item in plans),
+        "duration_ms": sum(item["duration_ms"] for item in plans),
+        "expected_bytes": sum(item["expected_bytes"] for item in plans),
+        "target_mib": payload.target_mib,
+        "profile": {"width": 1920, "height": 1080, "fps": 60, "video_codec": "hevc", "video_bitrate_kbps": 4000, "video_max_bitrate_kbps": 4000, "audio_codec": "aac", "audio_bitrate_kbps": 160},
+    }
+
+
+@router.post("/video-sessions/{session_id}/proxy-parts/build-all")
+async def create_proxy_parts(
+    session_id: uuid.UUID,
+    payload: ProxyPartPlanRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await db.execute(select(VideoSession).where(VideoSession.id == session_id).with_for_update())
+    session, plans = await _proxy_part_plan(db, session_id, payload.target_mib, lock=True)
+    source_by_id = {
+        part.id: part for part in (
+            await db.execute(
+                select(VideoPart).where(
+                    VideoPart.video_session_id == session_id,
+                    VideoPart.kind == "source",
+                    VideoPart.id.in_([uuid.UUID(value) for plan in plans for value in plan["source_part_ids"]]),
+                )
+            )
+        ).scalars().all()
+    }
+    next_part_no = int(
+        await db.scalar(
+            select(func.coalesce(func.max(VideoPart.part_no), 0)).where(
+                VideoPart.video_session_id == session_id,
+                VideoPart.kind == "proxy",
+            )
+        ) or 0
+    ) + 1
+    queued_status = await _queued_part_status(db)
+    metadata = session.metadata_json or {}
+    output_subdir = str(metadata.get("output_subdir") or "streamhub").strip("/\\")
+    created: list[tuple[VideoPart, VideoPartBuildJob, dict]] = []
+    for offset, plan in enumerate(plans):
+        source_parts = [source_by_id[uuid.UUID(value)] for value in plan["source_part_ids"]]
+        part_no = next_part_no + offset
+        file_name = _proxy_part_file_name(
+            session_id, part_no, int(plan["first_source_part_no"]), int(plan["last_source_part_no"])
+        )
+        relative_path = f"{output_subdir}/twitch/events/{session.event_id}/video/{session.id}/proxy_parts/{file_name}"
+        profile = {
+            "width": 1920,
+            "height": 1080,
+            "fps": 60,
+            "video_codec": "hevc",
+            "video_bitrate_kbps": 4000,
+            "video_max_bitrate_kbps": 4000,
+            "audio_codec": "aac",
+            "audio_bitrate_kbps": 160,
+            "max_mib": int(payload.target_mib),
+            "source_part_nos": plan["source_part_nos"],
+        }
+        proxy = VideoPart(
+            id=uuid.uuid4(),
+            video_session_id=session_id,
+            kind="proxy",
+            part_no=part_no,
+            run_no=0,
+            start_segment_no=int(plan["start_segment_no"]),
+            end_segment_no=int(plan["end_segment_no"]),
+            duration_ms=int(plan["duration_ms"]),
+            expected_bytes=int(plan["expected_bytes"]),
+            file_name=file_name,
+            relative_path=relative_path,
+            status=queued_status,
+            profile_json=profile,
+        )
+        db.add(proxy)
+        await db.flush()
+        for position, source_part in enumerate(source_parts):
+            db.add(VideoProxyPartSource(proxy_part_id=proxy.id, source_part_id=source_part.id, position=position))
+        job = VideoPartBuildJob(
+            part_id=proxy.id,
+            status=queued_status,
+            phase=queued_status,
+            total_bytes=int(plan["expected_bytes"]),
+        )
+        db.add(job)
+        created.append((proxy, job, plan))
+    await db.commit()
+    for proxy, job, _plan in created:
+        await db.refresh(proxy)
+        await db.refresh(job)
+    wakeup_error = None
+    if created:
+        try:
+            await part_builder_post(f"/internal/v1/parts/{created[0][0].id}/enqueue", {})
+        except HTTPException as exc:
+            wakeup_error = str(exc.detail)
+    return {
+        "items": [{**part_dict(part, job), "plan": plan} for part, job, plan in created],
+        "part_count": len(created),
         "builder_wakeup_error": wakeup_error,
     }
 
@@ -1016,7 +1215,9 @@ async def replace_video_part_segments(
     payload: SegmentReplacementRequest,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await ensure_part_telegram_linked(db, part_id)
+    part = await ensure_part_telegram_linked(db, part_id)
+    if (part.kind or "source") != "source":
+        raise HTTPException(409, "proxy parts do not own source segments")
     return await part_builder_post(
         f"/internal/v1/parts/{part_id}/replace-segments",
         {"copy_directory": payload.copy_directory.strip()},

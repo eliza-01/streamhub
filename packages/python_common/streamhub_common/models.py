@@ -387,10 +387,11 @@ class VideoGap(Base):
 
 class VideoPart(Base):
     __tablename__ = "video_parts"
-    __table_args__ = (UniqueConstraint("video_session_id", "part_no", name="uq_video_part_session_no"),)
+    __table_args__ = (UniqueConstraint("video_session_id", "kind", "part_no", name="uq_video_part_session_kind_no"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid.uuid4)
     video_session_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary(), ForeignKey("video_sessions.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(16), default="source", index=True)
     part_no: Mapped[int] = mapped_column(Integer)
     run_no: Mapped[int] = mapped_column(Integer)
     start_segment_no: Mapped[int] = mapped_column(Integer)
@@ -406,6 +407,7 @@ class VideoPart(Base):
     local_file_state: Mapped[str] = mapped_column(String(24), default="present", index=True)
     local_unlinked_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), index=True)
     local_unlink_error: Mapped[str | None] = mapped_column(Text)
+    profile_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
     completed_at_utc: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -428,6 +430,24 @@ class VideoPartSegment(Base):
     expected_bytes: Mapped[int] = mapped_column(BigInteger)
     source_sha256: Mapped[str | None] = mapped_column(String(64))
     part_offset_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class VideoProxyPartSource(Base):
+    __tablename__ = "video_proxy_part_sources"
+    __table_args__ = (
+        UniqueConstraint("proxy_part_id", "source_part_id", name="uq_video_proxy_part_source_pair"),
+        UniqueConstraint("source_part_id", name="uq_video_proxy_source_part"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    proxy_part_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("video_parts.id", ondelete="CASCADE"), index=True
+    )
+    source_part_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("video_parts.id", ondelete="RESTRICT"), index=True
+    )
+    position: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
 
 
 class TelegramChannelState(Base):

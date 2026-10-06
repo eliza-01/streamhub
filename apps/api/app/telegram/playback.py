@@ -152,7 +152,7 @@ class TelegramPlaybackService:
                     .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
                     .join(VideoPartSegment, VideoPartSegment.part_id == VideoPart.id)
                     .join(VideoSegment, VideoSegment.id == VideoPartSegment.segment_id)
-                    .where(VideoPart.video_session_id == session_id, VideoPart.status == "ready")
+                    .where(VideoPart.video_session_id == session_id, VideoPart.status == "ready", VideoPart.kind == "source")
                     .order_by(VideoPartSegment.segment_no, VideoPart.part_no)
                 )
             ).mappings().all()
@@ -229,6 +229,7 @@ class TelegramPlaybackService:
                     .where(
                         VideoPart.id == part_id,
                         VideoPart.status == "ready",
+                        VideoPart.kind == "source",
                         VideoPartSegment.segment_no == segment_no,
                     )
                 )
@@ -266,7 +267,7 @@ class TelegramPlaybackService:
                         TelegramVideoPartBinding.message_id,
                     )
                     .join(TelegramVideoPartBinding, TelegramVideoPartBinding.part_id == VideoPart.id)
-                    .where(VideoPart.id == part_id, VideoPart.status == "ready")
+                    .where(VideoPart.id == part_id, VideoPart.status == "ready", VideoPart.kind == "source")
                 )
             ).mappings().first()
         if row is None:

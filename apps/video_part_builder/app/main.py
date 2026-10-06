@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import signal
 import socket
 import uuid
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from streamhub_common.models import (
     VideoPart,
     VideoPartBuildJob,
     VideoPartSegment,
+    VideoProxyPartSource,
     TelegramVideoPartBinding,
     VideoSegment,
     VideoSession,
@@ -389,7 +391,163 @@ async def db_cancel_requested(job_id: int) -> bool:
         return bool(value)
 
 
+
+async def load_proxy_inputs(part_id: uuid.UUID) -> tuple[VideoPart, VideoSession, list[VideoPart]]:
+    async with SessionLocal() as db:
+        part = await db.get(VideoPart, part_id)
+        if part is None:
+            raise RuntimeError("proxy part disappeared")
+        session = await db.get(VideoSession, part.video_session_id)
+        if session is None:
+            raise RuntimeError("video session disappeared")
+        rows = (
+            await db.execute(
+                select(VideoProxyPartSource, VideoPart)
+                .join(VideoPart, VideoPart.id == VideoProxyPartSource.source_part_id)
+                .where(VideoProxyPartSource.proxy_part_id == part_id)
+                .order_by(VideoProxyPartSource.position)
+            )
+        ).all()
+        source_parts = [source for _mapping, source in rows]
+        if not source_parts:
+            raise RuntimeError("proxy part has no source parts")
+        return part, session, source_parts
+
+
+def _ffconcat_quote(path: Path) -> str:
+    return str(path).replace("'", "'\\''")
+
+
+async def build_proxy_part(job_id: int, part_id: uuid.UUID) -> None:
+    part, session, source_parts = await load_proxy_inputs(part_id)
+    if session.deleted_at_utc is not None:
+        raise RuntimeError("video session is in trash")
+    if (part.kind or "source") != "proxy":
+        raise RuntimeError("not a proxy part")
+    profile = part.profile_json or {}
+    max_mib = int(profile.get("max_mib") or 1990)
+    max_bytes = max_mib * 1024 * 1024
+    metadata = session.metadata_json or {}
+    root = configured_output_root(str(metadata.get("output_root_key") or "root1")).resolve()
+    final_path = safe_child(root, part.relative_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    source_paths: list[Path] = []
+    for source_part in source_parts:
+        if (source_part.kind or "source") != "source":
+            raise RuntimeError("proxy source is not an original part")
+        if source_part.status != "ready":
+            raise RuntimeError(f"source Part #{source_part.part_no} is not ready")
+        if source_part.local_file_state != "present":
+            raise RuntimeError(f"source Part #{source_part.part_no} is not available locally")
+        source_path = safe_child(root, source_part.relative_path)
+        if not source_path.is_file():
+            raise RuntimeError(f"source Part #{source_part.part_no} file is missing")
+        if source_part.final_bytes is not None and source_path.stat().st_size != int(source_part.final_bytes):
+            raise RuntimeError(f"source Part #{source_part.part_no} size mismatch")
+        source_paths.append(source_path)
+
+    for pattern in (f"{final_path.name}.partial-*", f"{final_path.name}.quarantine-*", f"{final_path.name}.concat-*"):
+        for stale in final_path.parent.glob(pattern):
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+    if final_path.exists():
+        quarantine = final_path.with_name(f"{final_path.name}.quarantine-{uuid.uuid4().hex}")
+        os.replace(final_path, quarantine)
+        fsync_directory(final_path.parent)
+        try:
+            quarantine.unlink()
+        except FileNotFoundError:
+            pass
+
+    token = uuid.uuid4().hex
+    partial = final_path.with_name(f"{final_path.name}.partial-{token}")
+    concat_file = final_path.with_name(f"{final_path.name}.concat-{token}.txt")
+    concat_file.write_text("".join(f"file '{_ffconcat_quote(path)}'\n" for path in source_paths), encoding="utf-8")
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-fflags", "+genpts",
+        "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=60",
+        "-c:v", "libx265", "-preset", "medium",
+        "-b:v", "4000k", "-maxrate", "4000k", "-bufsize", "8000k",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+        "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
+        "-f", "mp4", str(partial),
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    communicate_task = asyncio.create_task(process.communicate())
+    last_progress = -1
+    try:
+        while not communicate_task.done():
+            written = partial.stat().st_size if partial.exists() else 0
+            if await db_cancel_requested(job_id):
+                process.terminate()
+                await communicate_task
+                raise BuildCancelled("cancel requested")
+            if gate.requested:
+                try:
+                    process.send_signal(signal.SIGSTOP)
+                    await maybe_wait_gate(job_id, part_id, written)
+                finally:
+                    if process.returncode is None:
+                        process.send_signal(signal.SIGCONT)
+            if written != last_progress:
+                await progress(job_id, part_id, written, "building")
+                last_progress = written
+            await asyncio.sleep(0.5)
+        _stdout, stderr = await communicate_task
+        if process.returncode != 0:
+            detail = (stderr or b"").decode("utf-8", "replace").strip()
+            raise RuntimeError(f"ffmpeg proxy transcode failed ({process.returncode}): {detail[-3000:]}")
+
+        final_bytes = partial.stat().st_size if partial.exists() else 0
+        if final_bytes <= 0:
+            raise RuntimeError("ffmpeg produced an empty proxy part")
+        if final_bytes > max_bytes:
+            raise RuntimeError(f"proxy part exceeds max size: {final_bytes} > {max_bytes} bytes ({max_mib} MiB)")
+
+        await progress(job_id, part_id, final_bytes, "verifying")
+        digest = hashlib.sha256()
+        with partial.open("rb") as handle:
+            while True:
+                await maybe_wait_gate(job_id, part_id, final_bytes, resume_phase="verifying")
+                chunk = handle.read(settings.part_build_chunk_bytes)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                await asyncio.sleep(0)
+        await maybe_wait_gate(job_id, part_id, final_bytes, resume_phase="verifying")
+        os.replace(partial, final_path)
+        fsync_directory(final_path.parent)
+        await finalize_ready(job_id, part_id, final_bytes, digest.hexdigest(), {})
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.terminate()
+        communicate_task.cancel()
+        raise
+    finally:
+        for temp in (partial, concat_file):
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+
 async def build_part(job_id: int, part_id: uuid.UUID) -> None:
+    async with SessionLocal() as db:
+        kind = await db.scalar(select(VideoPart.kind).where(VideoPart.id == part_id))
+    if kind == "proxy":
+        await build_proxy_part(job_id, part_id)
+        return
     part, session, pairs = await load_build_inputs(part_id)
     if session.deleted_at_utc is not None:
         raise RuntimeError("video session is in trash")
@@ -537,7 +695,7 @@ async def finalize_ready(
         job.status = "ready"
         job.phase = "ready"
         job.progress_bytes = final_bytes
-        job.total_bytes = int(part.expected_bytes)
+        job.total_bytes = final_bytes if (part.kind or "source") == "proxy" else int(part.expected_bytes)
         job.last_error = None
         job.completed_at_utc = now
         job.heartbeat_at_utc = now
@@ -808,6 +966,8 @@ async def replace_part_segments(part_id: uuid.UUID, payload: SegmentReplacementP
     replaced_count = 0
     async with SessionLocal() as db:
         part, session = await require_linked_ready_part(db, part_id)
+        if (part.kind or "source") != "source":
+            raise HTTPException(409, "proxy parts do not own source segments")
         job = await db.scalar(select(VideoPartBuildJob).where(VideoPartBuildJob.part_id == part_id))
         if job is not None and job.status in BUILDING_JOB_STATUSES:
             raise HTTPException(409, "part build must be idle before replacing segments")

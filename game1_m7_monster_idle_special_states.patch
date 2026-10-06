@@ -1,0 +1,174 @@
+diff --git a/src/server/monster/MonsterSpawnerService.luau b/src/server/monster/MonsterSpawnerService.luau
+index 2140d8c..7f6002d 100644
+--- a/src/server/monster/MonsterSpawnerService.luau
++++ b/src/server/monster/MonsterSpawnerService.luau
+@@ -99,6 +99,22 @@ local function animatorFor(model: Model): Animator?
+     return animator
+ end
+ 
++local function animationPriority(value: any): Enum.AnimationPriority
++    local name = tostring(value or "")
++    if name == "Idle" then
++        return Enum.AnimationPriority.Idle
++    elseif name == "Movement" then
++        return Enum.AnimationPriority.Movement
++    elseif name == "Action2" then
++        return Enum.AnimationPriority.Action2
++    elseif name == "Action3" then
++        return Enum.AnimationPriority.Action3
++    elseif name == "Action4" then
++        return Enum.AnimationPriority.Action4
++    end
++    return Enum.AnimationPriority.Action
++end
++
+ local function loadAnimationTrack(animator: Animator?, row: any?, looped: boolean): AnimationTrack?
+     if not animator or not row then
+         return nil
+@@ -119,10 +135,19 @@ local function loadAnimationTrack(animator: Animator?, row: any?, looped: boolea
+     end
+     local track = result :: AnimationTrack
+     track.Looped = looped
+-    track.Priority = if tostring(row.priority or "") == "Action4" then Enum.AnimationPriority.Action4 else Enum.AnimationPriority.Action
++    track.Priority = animationPriority(row.priority)
+     return track
+ end
+ 
++local function stopTrack(track: AnimationTrack?)
++    if not track then
++        return
++    end
++    pcall(function()
++        track:Stop(0.08)
++    end)
++end
++
+ local function visibleBounds(model: Model): (CFrame, Vector3)
+     local minimum = Vector3.new(math.huge, math.huge, math.huge)
+     local maximum = Vector3.new(-math.huge, -math.huge, -math.huge)
+@@ -246,10 +271,13 @@ local function applyMonsterAttributes(model: Model, definition: any, record: any
+ end
+ 
+ local function releaseInstance(state: any, model: Model, scheduleRespawn: boolean)
+-    if state.instances[model] == nil then
++    local entry = state.instances[model]
++    if entry == nil then
+         return
+     end
+     state.instances[model] = nil
++    stopTrack(entry.idleTrack)
++    stopTrack(entry.deathTrack)
+     EntityHitboxService.Detach(model)
+     if model.Parent then
+         model:Destroy()
+@@ -270,6 +298,8 @@ local function beginDeath(state: any, model: Model, entry: any)
+     end
+     entry.dying = true
+     model:SetAttribute("Damageable", false)
++    model:SetAttribute("MonsterAnimationState", "death")
++    stopTrack(entry.idleTrack)
+     local track = entry.deathTrack
+     local holdSeconds = DEATH_FALLBACK_SECONDS
+     if track then
+@@ -322,9 +352,16 @@ local function spawnOne(state: any): Model?
+ 
+     local profile = animationProfile(slug)
+     local animator = animatorFor(model)
++    local idleTrack = loadAnimationTrack(animator, firstPublishedTrack(profile, "idle"), true)
+     local deathTrack = loadAnimationTrack(animator, firstPublishedTrack(profile, "death"), false)
+-    local entry = { deathTrack = deathTrack, dying = false }
++    local entry = { idleTrack = idleTrack, deathTrack = deathTrack, dying = false }
+     state.instances[model] = entry
++    model:SetAttribute("MonsterAnimationState", "idle")
++    if idleTrack then
++        pcall(function()
++            idleTrack:Play(0.12)
++        end)
++    end
+ 
+     model:GetAttributeChangedSignal("LifeState"):Connect(function()
+         if state.instances[model] ~= entry then
+diff --git a/src/shared/RuntimeVersion.luau b/src/shared/RuntimeVersion.luau
+index e706efa..263ea43 100644
+--- a/src/shared/RuntimeVersion.luau
++++ b/src/shared/RuntimeVersion.luau
+@@ -1 +1 @@
+-return table.freeze({ Version = "2026.10.06.003", SourceDigest = "game1-m7-monster-spawn-authoring" })
++return table.freeze({ Version = "2026.10.06.004", SourceDigest = "game1-m7-monster-idle-states" })
+diff --git a/system/control-center/monster_animation_store.py b/system/control-center/monster_animation_store.py
+index 3080ba6..0720150 100644
+--- a/system/control-center/monster_animation_store.py
++++ b/system/control-center/monster_animation_store.py
+@@ -15,6 +15,8 @@ PROJECT = "game1"
+ MAX_SCAN_FILES = 5000
+ ANIMATION_EXTENSIONS = {".rbxm", ".rbxmx"}
+ SLOT_CATALOG = [
++    {"group": "stance", "slot": "idle", "label": "idle", "looped": True, "priority": "Idle", "variants": False},
++    {"group": "stance", "slot": "idle_special", "label": "idle special", "looped": False, "priority": "Action", "variants": True},
+     {"group": "movement", "slot": "walk", "label": "walk", "looped": True, "priority": "Movement", "variants": False},
+     {"group": "movement", "slot": "run", "label": "run", "looped": True, "priority": "Movement", "variants": False},
+     {"group": "combat", "slot": "attack", "label": "attack", "looped": False, "priority": "Action", "variants": True},
+@@ -43,6 +45,12 @@ def classify(path: Path, slug: str) -> dict | None:
+         stem = stem[len(prefix):]
+     body, variant = _parse_variant(stem)
+     aliases = {
++        "idle": "idle",
++        "wait": "idle",
++        "wait_idle": "idle",
++        "idle_special": "idle_special",
++        "special_idle": "idle_special",
++        "sp_wait": "idle_special",
+         "walk": "walk",
+         "run": "run",
+         "attack": "attack",
+@@ -55,6 +63,11 @@ def classify(path: Path, slug: str) -> dict | None:
+         "die": "death",
+     }
+     slot = aliases.get(body)
++    if not slot:
++        special_idle = re.fullmatch(r"(?:spwait|idlespecial)0*([0-9]+)", body)
++        if special_idle:
++            slot = "idle_special"
++            variant = max(1, int(special_idle.group(1)))
+     if not slot:
+         atk = re.fullmatch(r"atk0*([0-9]+)", body)
+         if atk:
+diff --git a/system/verify/verify.py b/system/verify/verify.py
+index b4bf74d..ef9556d 100644
+--- a/system/verify/verify.py
++++ b/system/verify/verify.py
+@@ -651,13 +651,13 @@ else:
+ if monster_animation_manifest.get("schemaVersion") != 1 or monster_animation_manifest.get("project") != "game1":
+     err("monster animation manifest must be game1 schema 1")
+ monster_slots = [row.get("slot") for row in (monster_animation_manifest.get("slotCatalog") or [])]
+-if monster_slots != ["walk", "run", "attack", "attack_wait", "death"]:
+-    err("monster animation states must be walk, run, attack, attack_wait, death")
++if monster_slots != ["idle", "idle_special", "walk", "run", "attack", "attack_wait", "death"]:
++    err("monster animation states must be idle, idle_special, walk, run, attack, attack_wait, death")
+ monster_animation_store_path = ROOT / "system/control-center/monster_animation_store.py"
+ monster_animation_store_text = monster_animation_store_path.read_text(encoding="utf-8") if monster_animation_store_path.is_file() else ""
+ for required in [
+     "class MonsterAnimationStore", "def scan_folder", "def assign_file", "def publish_missing",
+-    '"slot": "attack_wait"', '"variants": True', "canonicalFilename",
++    '"slot": "idle"', '"slot": "idle_special"', '"slot": "attack_wait"', '"variants": True', "canonicalFilename",
+     'src/shared/monster/MonsterAnimationRegistry.luau',
+ ]:
+     if required not in monster_animation_store_text:
+@@ -720,7 +720,7 @@ for required in ["monster-spawn", "Game1MonsterSpawnMarker", "Game1Authoring", "
+ 
+ monster_spawner_path = ROOT / "src/server/monster/MonsterSpawnerService.luau"
+ monster_spawner_text = monster_spawner_path.read_text(encoding="utf-8") if monster_spawner_path.is_file() else ""
+-for required in ["MonsterSpawnRegistry", "MonsterRegistry", "MonsterAnimationRegistry", "spawnRadius", "maxAlive", "respawnSeconds", "math.sqrt", "Workspace:Raycast", "EntityHitboxService.Attach", 'GetAttributeChangedSignal("LifeState")', '== "Dead"']:
++for required in ["MonsterSpawnRegistry", "MonsterRegistry", "MonsterAnimationRegistry", "spawnRadius", "maxAlive", "respawnSeconds", "math.sqrt", "Workspace:Raycast", "EntityHitboxService.Attach", 'GetAttributeChangedSignal("LifeState")', '== "Dead"', 'firstPublishedTrack(profile, "idle")', 'MonsterAnimationState', 'idleTrack:Play']:
+     if required not in monster_spawner_text:
+         err(f"monster runtime spawner missing {required}")
+ if "RunService.Heartbeat" in monster_spawner_text:
+@@ -751,7 +751,7 @@ if errors:
+         print(" -", item)
+     sys.exit(1)
+ 
+-print("verify ok · game1 m7 monster assets + animations + spawn authoring/runtime + crit/life contracts passed")
++print("verify ok · game1 m7 monster idle/special-idle + assets + spawn + crit/life contracts passed")
+ print("registered character archetypes:", len(archetypes))
+ print("active character archetype:", active_id or "none")
+ print("race pool: human")

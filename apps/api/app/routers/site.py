@@ -253,6 +253,7 @@ async def _storage_event_ids(db: AsyncSession) -> set[uuid.UUID]:
             .where(
                 VideoSession.deleted_at_utc.is_(None),
                 VideoPart.status == "ready",
+                VideoPart.kind == "source",
             )
             .distinct()
         )
@@ -270,6 +271,7 @@ async def _event_has_public_storage(db: AsyncSession, event_id: uuid.UUID) -> bo
                 VideoSession.event_id == event_id,
                 VideoSession.deleted_at_utc.is_(None),
                 VideoPart.status == "ready",
+                VideoPart.kind == "source",
             )
             .limit(1)
         )
@@ -366,6 +368,7 @@ async def _video_summaries(db: AsyncSession, event_ids: list[uuid.UUID]) -> dict
                 VideoSession.event_id.in_(event_ids),
                 VideoSession.deleted_at_utc.is_(None),
                 VideoPart.status == "ready",
+                VideoPart.kind == "source",
             )
             .group_by(VideoSession.id)
             .order_by(VideoSession.event_id, VideoSession.created_at.desc())
@@ -1183,6 +1186,7 @@ async def site_event_playback_timeline(event_id: uuid.UUID, db: AsyncSession = D
             .where(
                 VideoPart.video_session_id == session_id,
                 VideoPart.status == "ready",
+                VideoPart.kind == "source",
             )
             .order_by(VideoSegment.segment_no, VideoPart.part_no)
         )

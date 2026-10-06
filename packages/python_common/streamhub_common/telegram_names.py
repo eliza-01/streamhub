@@ -5,6 +5,7 @@ from pathlib import PurePath
 
 
 _PART_RE = re.compile(r"(?:^|_+)part_?(\d{1,9})(?:_+|\.|$)", re.IGNORECASE)
+_PROXY_RANGE_RE = re.compile(r"(?:^|_+)p(\d{1,9})[-_]+p?(\d{1,9})(?:_+|\.|$)", re.IGNORECASE)
 _SEG_RE = re.compile(
     r"(?:^|_+)(?:seg_?|s)(\d{1,9})[-_]+(?:seg_?|s)?(\d{1,9})(?:_+|\.|$)",
     re.IGNORECASE,
@@ -30,22 +31,23 @@ def canonical_part_identity(name: str) -> tuple[str, int, int, int] | None:
     """
 
     value = _stem(name)
-    if not value.startswith("vp_"):
+    prefix = "vpx_" if value.startswith("vpx_") else "vp_" if value.startswith("vp_") else None
+    if prefix is None:
         return None
 
     part_match = _PART_RE.search(value)
-    seg_match = _SEG_RE.search(value)
-    if part_match is None or seg_match is None:
+    range_match = _PROXY_RANGE_RE.search(value) if prefix == "vpx_" else _SEG_RE.search(value)
+    if part_match is None or range_match is None:
         return None
 
-    session_text = value[3 : part_match.start()]
+    session_text = value[len(prefix) : part_match.start()]
     session_hex = re.sub(r"[^0-9a-f]", "", session_text)
     if len(session_hex) != 32:
         return None
 
     part_no = int(part_match.group(1))
-    start_segment = int(seg_match.group(1))
-    end_segment = int(seg_match.group(2))
+    start_segment = int(range_match.group(1))
+    end_segment = int(range_match.group(2))
     if part_no <= 0 or start_segment <= 0 or end_segment < start_segment:
         return None
     return session_hex, part_no, start_segment, end_segment

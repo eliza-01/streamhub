@@ -2,6 +2,7 @@ FROM python:3.12-slim
 WORKDIR /opt/streamhub
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY requirements.txt ./requirements.txt
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt
 COPY packages/python_common ./packages/python_common
 RUN pip install --no-cache-dir ./packages/python_common

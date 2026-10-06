@@ -85,6 +85,7 @@ type VideoPartJob = {
 type VideoPart = {
   id: string;
   video_session_id: string;
+  kind?: "source" | "proxy" | string;
   part_no: number;
   run_no: number;
   start_segment_no: number;
@@ -100,6 +101,10 @@ type VideoPart = {
   local_file_state: string;
   local_unlinked_at_utc?: string | null;
   local_unlink_error?: string | null;
+  profile?: {
+    width?: number; height?: number; fps?: number; video_codec?: string; video_bitrate_kbps?: number; video_max_bitrate_kbps?: number;
+    audio_codec?: string; audio_bitrate_kbps?: number; max_mib?: number; source_part_nos?: number[];
+  } | null;
   created_at: string;
   completed_at_utc?: string | null;
   job?: VideoPartJob | null;
@@ -174,6 +179,29 @@ type PartPlanAll = {
   expected_bytes: number;
   duration_ms: number;
   skipped: string[];
+};
+
+type ProxyPartPlan = {
+  source_part_ids: string[];
+  source_part_nos: number[];
+  first_source_part_no: number;
+  last_source_part_no: number;
+  source_part_count: number;
+  start_segment_no: number;
+  end_segment_no: number;
+  duration_ms: number;
+  expected_bytes: number;
+  target_mib: number;
+};
+
+type ProxyPartPlanAll = {
+  items: ProxyPartPlan[];
+  part_count: number;
+  source_part_count: number;
+  duration_ms: number;
+  expected_bytes: number;
+  target_mib: number;
+  profile: { width: number; height: number; fps: number; video_codec: string; video_bitrate_kbps: number; video_max_bitrate_kbps: number; audio_codec: string; audio_bitrate_kbps: number };
 };
 
 type OutputRoot = {
@@ -707,6 +735,7 @@ function SiteCategoryIcon({ slug }: { slug: string }) {
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:18741";
 const PROGRESS_POLL_MS = 5000;
 const PART_TARGET_MIB_KEY = "streamhub.videoManager.targetMib";
+const PROXY_PART_TARGET_MIB_KEY = "streamhub.videoManager.proxyTargetMib";
 const PART_SEGMENT_COUNT_KEY = "streamhub.videoManager.segmentCount";
 const EVENT_TITLE_MODE_KEY = "streamhub.events.titleMode";
 const SITE_COMMENT_COLOR_KEY = "streamhub.site.commentColor";
@@ -3308,6 +3337,9 @@ function App() {
   const [partPlan, setPartPlan] = useState<PartPlan | null>(null);
   const [partPlanAll, setPartPlanAll] = useState<PartPlanAll | null>(null);
   const [partAction, setPartAction] = useState(false);
+  const [proxyTargetMib, setProxyTargetMib] = useState(() => storedPositiveInt(PROXY_PART_TARGET_MIB_KEY, 1990));
+  const [proxyPlan, setProxyPlan] = useState<ProxyPartPlanAll | null>(null);
+  const [proxyAction, setProxyAction] = useState(false);
   const [telegramBindings, setTelegramBindings] = useState<Record<string, TelegramBinding>>({});
   const [telegramStatus, setTelegramStatus] = useState<TelegramStatus | null>(null);
   const [telegramSyncing, setTelegramSyncing] = useState(false);
@@ -3572,6 +3604,10 @@ function App() {
   useEffect(() => {
     try { window.localStorage.setItem(PART_SEGMENT_COUNT_KEY, String(partSegmentCount)); } catch { /* browser storage unavailable */ }
   }, [partSegmentCount]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem(PROXY_PART_TARGET_MIB_KEY, String(proxyTargetMib)); } catch { /* browser storage unavailable */ }
+  }, [proxyTargetMib]);
 
   useEffect(() => {
     const query = siteQuery.trim();
@@ -4396,6 +4432,7 @@ function App() {
     setSelectedVideo(session);
     setPartPlan(null);
     setPartPlanAll(null);
+    setProxyPlan(null);
     setSegmentReplacementPartId(null);
     setSegmentReplacementDirectory("");
     try {
@@ -4417,7 +4454,7 @@ function App() {
       setVideoSegments(loadedSegments);
       setVideoParts(loadedParts);
       const reserved = new Set<number>();
-      loadedParts.forEach((part) => {
+      loadedParts.filter((part) => (part.kind || "source") === "source").forEach((part) => {
         for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
       });
       const next = loadedSegments.find((segment) => segment.storage_state === "archive_ready" && segment.integrity_state === "hashed" && !reserved.has(segment.segment_no))?.segment_no || loadedSegments[0]?.segment_no || 1;
@@ -4447,7 +4484,7 @@ function App() {
 
   function nextBuildableSegment(after: number, parts: VideoPart[]) {
     const reserved = new Set<number>();
-    parts.forEach((part) => {
+    parts.filter((part) => (part.kind || "source") === "source").forEach((part) => {
       for (let no = part.start_segment_no; no <= part.end_segment_no; no += 1) reserved.add(no);
     });
     return videoSegments.find((segment) => (
@@ -4551,6 +4588,47 @@ function App() {
       setError(String(e));
     } finally {
       setPartAction(false);
+    }
+  }
+
+  async function previewProxyParts() {
+    if (!selectedVideo) return;
+    setProxyAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/proxy-parts/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target_mib: proxyTargetMib }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setProxyPlan(await res.json() as ProxyPartPlanAll);
+      setError(null);
+    } catch (e) {
+      setProxyPlan(null);
+      setError(String(e));
+    } finally {
+      setProxyAction(false);
+    }
+  }
+
+  async function buildProxyParts() {
+    if (!selectedVideo || !proxyPlan) return;
+    setProxyAction(true);
+    try {
+      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/proxy-parts/build-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target_mib: proxyTargetMib }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json() as { builder_wakeup_error?: string | null };
+      await loadVideoParts(selectedVideo.id);
+      setProxyPlan(null);
+      setError(data.builder_wakeup_error ? `Proxy Parts поставлены в durable queue, но wakeup builder не прошёл: ${data.builder_wakeup_error}` : null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProxyAction(false);
     }
   }
 
@@ -5584,6 +5662,36 @@ function App() {
             </div>
           )}
         </section>
+        <section className="video-block proxy-parts-block">
+          <div className="section-label">PROXY PARTS · HEVC 1080p60</div>
+          <p className="muted small">Создаются из готовых локальных Parts. Профиль фиксирован: HEVC/H.265 · 1920×1080 · 60 fps · target/max 4/4 Mbps · AAC 160 kbps. Исходные Parts не изменяются.</p>
+          <div className="part-controls">
+            <label className="storage-field"><span>Max Proxy Part MiB · сохраняется</span><input type="number" min={1} value={proxyTargetMib} onChange={(e) => { setProxyTargetMib(Math.max(1, Number(e.target.value) || 1)); setProxyPlan(null); }} /></label>
+          </div>
+          <p className="muted small">Стандарт: 1990 MiB. Builder объединяет целые исходные Parts, пока итоговый proxy остаётся в лимите.</p>
+          <div className="actions part-actions">
+            <button disabled={proxyAction} onClick={() => void previewProxyParts()}>{proxyAction ? "Работаю…" : "Preview Proxy"}</button>
+            <button disabled={proxyAction || !proxyPlan} onClick={() => void buildProxyParts()}>{proxyAction ? "Работаю…" : "Build Proxy Parts"}</button>
+          </div>
+          {proxyPlan && (
+            <div className="part-plan-all">
+              <div className="part-plan">
+                <div><span>Proxy Parts</span><strong>{proxyPlan.part_count}</strong></div>
+                <div><span>Source Parts</span><strong>{proxyPlan.source_part_count}</strong></div>
+                <div><span>Total duration</span><strong>{fmtMs(proxyPlan.duration_ms)}</strong></div>
+                <div><span>Estimated</span><strong>{fmtBytes(proxyPlan.expected_bytes)}</strong></div>
+              </div>
+              <div className="part-plan-all-list">
+                {proxyPlan.items.map((plan, index) => (
+                  <div className="part-plan-all-row" key={`${plan.first_source_part_no}-${plan.last_source_part_no}`}>
+                    <strong>Proxy #{index + 1} · Parts {plan.first_source_part_no}–{plan.last_source_part_no}</strong>
+                    <span>{plan.source_part_count} source · {fmtMs(plan.duration_ms)} · ~{fmtBytes(plan.expected_bytes)} · max {plan.target_mib} MiB</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
         <section className="video-block telegram-storage-block">
           <div className="row telegram-storage-head">
             <div>
@@ -5612,9 +5720,9 @@ function App() {
         </section>
         <section className="video-block">
           <div className="section-label">PARTS / BUILD QUEUE</div>
-          {videoParts.length === 0 ? <div className="empty-child">Parts ещё не создавались</div> : (
+          {videoParts.filter((part) => (part.kind || "source") === "source").length === 0 ? <div className="empty-child">Parts ещё не создавались</div> : (
             <div className="part-list">
-              {videoParts.map((part) => {
+              {videoParts.filter((part) => (part.kind || "source") === "source").map((part) => {
                 const job = part.job;
                 const telegram = telegramBindings[part.id];
                 const progressTotal = job?.total_bytes || part.expected_bytes || 1;
@@ -5676,6 +5784,57 @@ function App() {
                         </div>
                       </div>
                     )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+        <section className="video-block">
+          <div className="section-label">PROXY PARTS / BUILD QUEUE</div>
+          {videoParts.filter((part) => part.kind === "proxy").length === 0 ? <div className="empty-child">Proxy Parts ещё не создавались</div> : (
+            <div className="part-list">
+              {videoParts.filter((part) => part.kind === "proxy").map((part) => {
+                const job = part.job;
+                const telegram = telegramBindings[part.id];
+                const progressTotal = job?.total_bytes || part.expected_bytes || 1;
+                const progressBytes = job?.progress_bytes || (part.status === "ready" ? (part.final_bytes || part.expected_bytes) : 0);
+                const progressPercent = Math.max(0, Math.min(100, Math.round((progressBytes / progressTotal) * 100)));
+                const sourceNos = part.profile?.source_part_nos || [];
+                return (
+                  <div className="part-row proxy-part-row" key={part.id}>
+                    <div className="row"><strong>Proxy Part #{part.part_no}{sourceNos.length ? ` · source ${sourceNos[0]}–${sourceNos[sourceNos.length - 1]}` : ""}</strong><span className={`part-status part-status-${part.status}`}>{part.status}</span></div>
+                    <div className="muted small">1080p60 · HEVC target/max 4/4 Mbps · AAC 160 kbps · {fmtMs(part.duration_ms)} · {fmtBytes(part.final_bytes ?? part.expected_bytes)} · attempts {job?.attempts || 0}</div>
+                    {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && (
+                      <>
+                        <div className="progress-track part-progress"><div className="progress-fill" style={{ width: `${progressPercent}%` }} /></div>
+                        <div className="muted small">{job?.phase || part.status} · {fmtBytes(progressBytes)} / {fmtBytes(progressTotal)}{part.status === "waiting_capture_idle" || part.status === "suspended_for_capture" ? " · ожидает завершения Video capture" : ""}</div>
+                      </>
+                    )}
+                    {part.sha256 && <div className="muted small hash-line">sha256 <code>{part.sha256}</code></div>}
+                    <div className="muted small path-cell"><code>{part.relative_path}</code></div>
+                    <div className={`part-local-status part-local-status-${part.local_file_state || "present"}`}>
+                      Local Proxy: <strong>{part.local_file_state === "unlinked" ? "deleted" : part.local_file_state || "present"}</strong>
+                      {part.local_unlinked_at_utc && <> · {new Date(part.local_unlinked_at_utc).toLocaleString()}</>}
+                    </div>
+                    {part.local_unlink_error && <div className="inline-error small">{part.local_unlink_error}</div>}
+                    {part.status === "ready" && (
+                      <div className={`telegram-part-status telegram-part-status-${telegram?.status || "missing"}`}>
+                        Telegram: <strong>{telegram?.status || "missing"}</strong>
+                        {telegram?.message_id != null && <> · message <code>{telegram.message_id}</code></>}
+                        {telegram?.matched_by && <> · {telegram.matched_by}</>}
+                      </div>
+                    )}
+                    {(part.last_error || job?.last_error) && <div className="inline-error small">{part.last_error || job?.last_error}</div>}
+                    <div className="actions part-row-actions">
+                      {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}
+                      {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && <button disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "cancel")}>Cancel</button>}
+                      <button onClick={() => copyPartPath(part)}>Copy path</button>
+                      {part.status === "ready" && telegram?.status === "linked" && part.local_file_state !== "unlinked" && (
+                        <button className="danger subtle" disabled={partAction || proxyAction} onClick={() => void unlinkLocalPart(part)}>Unlink Proxy</button>
+                      )}
+                      {(part.status === "failed" || part.status === "cancelled") && <button className="danger subtle" disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "delete")}>Delete reservation</button>}
+                    </div>
                   </div>
                 );
               })}

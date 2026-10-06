@@ -1,0 +1,237 @@
+diff --git a/docs/character-animation-system.md b/docs/character-animation-system.md
+index 5a13ebd..a76d27d 100644
+--- a/docs/character-animation-system.md
++++ b/docs/character-animation-system.md
+@@ -23,7 +23,6 @@ weapon scope is a context overlay. m5.1 starts with `hands`, `1hs` and `bow`:
+ - `idle`, `combat_idle`, `walk`, `run`
+ - `attack` with variants `01..n`
+ - `special_attack` with variants `01..n`
+-- `equip`, `unequip`
+ - `bow` additionally supports `aim`
+ 
+ `hands` is the canonical unarmed weapon context. newly spawned characters request `hands` first and fall back to base slots when a hands-specific clip is absent.
+@@ -80,7 +79,7 @@ registered now but reserved for their gameplay/state owner:
+ 
+ - airborne (`jump_start`, `jump_loop`, `fall`, `land`)
+ - seated transitions (`seated.enter`, `seated.loop`, `seated.exit`)
+-- combat stance (`combat_idle`), special attack, equip/unequip and bow aim
++- combat stance (`combat_idle`), special attack and bow aim
+ 
+ this keeps the semantic contract stable without pretending that an animation clip itself owns physics, posture or combat state.
+ 
+diff --git a/src/shared/RuntimeVersion.luau b/src/shared/RuntimeVersion.luau
+index c2239aa..14cd621 100644
+--- a/src/shared/RuntimeVersion.luau
++++ b/src/shared/RuntimeVersion.luau
+@@ -1 +1 @@
+-return table.freeze({ Version = "2026.10.06.005", SourceDigest = "game1-m7-monster-idle-special-in-idle" })
++return table.freeze({ Version = "2026.10.06.006", SourceDigest = "game1-m7-unified-combat-idle-no-equip-animations" })
+diff --git a/system/control-center/animation_core/common.py b/system/control-center/animation_core/common.py
+index 4c1d425..6e50df0 100644
+--- a/system/control-center/animation_core/common.py
++++ b/system/control-center/animation_core/common.py
+@@ -33,8 +33,6 @@ WEAPON_SLOT_CATALOG = [
+     {"group": "movement", "slot": "run", "label": "run", "looped": True, "priority": "Movement", "variants": False},
+     {"group": "combat", "slot": "attack", "label": "attack", "looped": False, "priority": "Action", "variants": True},
+     {"group": "combat", "slot": "special_attack", "label": "special attack", "looped": False, "priority": "Action", "variants": True},
+-    {"group": "transition", "slot": "equip", "label": "equip", "looped": False, "priority": "Action", "variants": False},
+-    {"group": "transition", "slot": "unequip", "label": "unequip", "looped": False, "priority": "Action", "variants": False},
+ ]
+ 
+ BOW_EXTRA_SLOTS = [
+@@ -216,8 +214,7 @@ def classify_animation(path: Path, character_id: str | None = None) -> dict | No
+         slot = {
+             "idle": "idle", "combat_idle": "combat_idle", "attack_wait": "combat_idle",
+             "walk": "walk", "run": "run", "attack": "attack",
+-            "special_attack": "special_attack", "equip": "equip", "unequip": "unequip",
+-            "aim": "aim",
++            "special_attack": "special_attack", "aim": "aim",
+         }.get(body)
+         catalog = _catalog_for_weapon(weapon_set)
+         if slot in catalog:
+diff --git a/system/control-center/animation_core/storage.py b/system/control-center/animation_core/storage.py
+index a854a64..a20a91d 100644
+--- a/system/control-center/animation_core/storage.py
++++ b/system/control-center/animation_core/storage.py
+@@ -71,6 +71,22 @@ class AnimationStorageMixin:
+                 );
+                 """
+             )
++            # equip/unequip are runtime weapon operations, not animation states.
++            # Remove legacy bindings so they disappear from manifests/registries permanently.
++            obsolete = connection.execute(
++                "SELECT id,clip_id FROM animation_bindings WHERE scope='weapon' AND slot IN ('equip','unequip')"
++            ).fetchall()
++            obsolete_clip_ids = {str(row["clip_id"]) for row in obsolete}
++            connection.execute(
++                "DELETE FROM animation_bindings WHERE scope='weapon' AND slot IN ('equip','unequip')"
++            )
++            for clip_id in obsolete_clip_ids:
++                still_used = connection.execute(
++                    "SELECT 1 FROM animation_bindings WHERE clip_id=? LIMIT 1", (clip_id,)
++                ).fetchone()
++                if still_used is None:
++                    connection.execute("DELETE FROM animation_publications WHERE clip_id=?", (clip_id,))
++                    connection.execute("DELETE FROM animation_clips WHERE id=?", (clip_id,))
+ 
+     @staticmethod
+     def _sha256(path: Path) -> str:
+diff --git a/system/control-center/monster_animation_store.py b/system/control-center/monster_animation_store.py
+index 8bc5518..5c4b88b 100644
+--- a/system/control-center/monster_animation_store.py
++++ b/system/control-center/monster_animation_store.py
+@@ -19,8 +19,8 @@ SLOT_CATALOG = [
+     {"group": "stance", "slot": "idle_special", "state": "idle", "role": "special", "label": "idle · special", "looped": False, "priority": "Idle", "variants": True},
+     {"group": "movement", "slot": "walk", "state": "walk", "role": "base", "label": "walk", "looped": True, "priority": "Movement", "variants": False},
+     {"group": "movement", "slot": "run", "state": "run", "role": "base", "label": "run", "looped": True, "priority": "Movement", "variants": False},
++    {"group": "combat", "slot": "combat_idle", "state": "combat_idle", "role": "base", "label": "combat idle", "looped": True, "priority": "Idle", "variants": False},
+     {"group": "combat", "slot": "attack", "state": "attack", "role": "variant", "label": "attack", "looped": False, "priority": "Action", "variants": True},
+-    {"group": "combat", "slot": "attack_wait", "state": "attack_wait", "role": "base", "label": "attack wait", "looped": True, "priority": "Idle", "variants": False},
+     {"group": "life", "slot": "death", "state": "death", "role": "base", "label": "death", "looped": False, "priority": "Action", "variants": False},
+ ]
+ SLOT_BY_NAME = {row["slot"]: row for row in SLOT_CATALOG}
+@@ -55,9 +55,9 @@ def classify(path: Path, slug: str) -> dict | None:
+         "run": "run",
+         "attack": "attack",
+         "atk": "attack",
+-        "attack_wait": "attack_wait",
+-        "combat_idle": "attack_wait",
+-        "atkwait": "attack_wait",
++        "combat_idle": "combat_idle",
++        "attack_wait": "combat_idle",  # legacy filename compatibility only
++        "atkwait": "combat_idle",
+         "death": "death",
+         "dead": "death",
+         "die": "death",
+@@ -163,6 +163,40 @@ class MonsterAnimationStore:
+                 );
+                 """
+             )
++            self._migrate_combat_idle(connection)
++
++    def _migrate_combat_idle(self, connection) -> None:
++        """Move the old attack_wait storage coordinate to the canonical combat_idle state."""
++        legacy_rows = connection.execute(
++            "SELECT id,monster_slug,variant,clip_id FROM monster_animation_bindings WHERE slot='attack_wait'"
++        ).fetchall()
++        for row in legacy_rows:
++            slug = str(row["monster_slug"])
++            variant = int(row["variant"] or 0)
++            old_clip_id = str(row["clip_id"])
++            new_clip_id = f"monster__{slug}__combat_idle__{variant:02d}"
++            new_binding_id = "binding__" + new_clip_id
++            conflict = connection.execute(
++                "SELECT id FROM monster_animation_bindings WHERE monster_slug=? AND slot='combat_idle' AND variant=?",
++                (slug, variant),
++            ).fetchone()
++            if conflict is not None:
++                connection.execute("DELETE FROM monster_animation_bindings WHERE id=?", (str(row["id"]),))
++                if not connection.execute("SELECT 1 FROM monster_animation_bindings WHERE clip_id=? LIMIT 1", (old_clip_id,)).fetchone():
++                    connection.execute("DELETE FROM monster_animation_publications WHERE clip_id=?", (old_clip_id,))
++                    connection.execute("DELETE FROM monster_animation_clips WHERE id=?", (old_clip_id,))
++                continue
++
++            clip = connection.execute("SELECT id FROM monster_animation_clips WHERE id=?", (old_clip_id,)).fetchone()
++            target_clip = connection.execute("SELECT id FROM monster_animation_clips WHERE id=?", (new_clip_id,)).fetchone()
++            if clip is not None and target_clip is None:
++                connection.execute("UPDATE monster_animation_publications SET clip_id=? WHERE clip_id=?", (new_clip_id, old_clip_id))
++                connection.execute("UPDATE monster_animation_clips SET id=?,name='combat_idle' WHERE id=?", (new_clip_id, old_clip_id))
++                old_clip_id = new_clip_id
++            connection.execute(
++                "UPDATE monster_animation_bindings SET id=?,slot='combat_idle',clip_id=?,updated_at=? WHERE id=?",
++                (new_binding_id, old_clip_id, time.time(), str(row["id"])),
++            )
+ 
+     @staticmethod
+     def _sha256(path: Path) -> str:
+diff --git a/system/control-center/monster_spawn_store.py b/system/control-center/monster_spawn_store.py
+index 4bfd4cb..43440c6 100644
+--- a/system/control-center/monster_spawn_store.py
++++ b/system/control-center/monster_spawn_store.py
+@@ -10,7 +10,7 @@ from datetime import datetime, timezone
+ 
+ SCHEMA_VERSION = 1
+ PROJECT = "game1"
+-REQUIRED_ANIMATION_SLOTS = ("walk", "run", "attack", "attack_wait", "death")
++REQUIRED_ANIMATION_SLOTS = ("walk", "run", "combat_idle", "attack", "death")
+ 
+ 
+ def utc_now() -> str:
+diff --git a/system/control-center/static/index.html b/system/control-center/static/index.html
+index 4ca0d20..7048100 100644
+--- a/system/control-center/static/index.html
++++ b/system/control-center/static/index.html
+@@ -148,7 +148,7 @@
+ 
+ <div id="monsters-view" hidden>
+ <div class="panel hero">
+-<div><span class="eyebrow">monster assets · canonical game1 registry</span><h2>monsters</h2><p>one monster owns one rigged fbx, zero or more textures, absolute combat stats and its animations. monster animations have no weapon-class split: idle, idle special variants, walk, run, attack variants, attack wait and death are bound directly to the monster.</p></div>
++<div><span class="eyebrow">monster assets · canonical game1 registry</span><h2>monsters</h2><p>one monster owns one rigged fbx, zero or more textures, absolute combat stats and its animations. monster animations have no weapon-class split: idle, idle special variants, combat idle, walk, run, attack variants and death are bound directly to the monster.</p></div>
+ <div class="metrics"><div><b id="monster-metric-total">0</b><span>registered</span></div><div><b id="monster-metric-published">0</b><span>published</span></div><div><b id="monster-metric-changed">0</b><span>changed</span></div></div>
+ </div>
+ <div class="panel runtime-card"><div id="monster-registry-state" class="runtime-state registered"><strong>monster registry</strong><span>loading…</span></div><div id="monster-publication-state" class="publication-missing">open cloud: checking…</div></div>
+@@ -188,7 +188,7 @@
+ <label>monster<select id="monster-animation-monster"></select><small class="hint">this is the monster whose animation files will be scanned, registered and published.</small></label>
+ <hr class="card-separator">
+ <h3 class="subheading">animation folder</h3>
+-<details id="monster-animation-filename-guide" class="naming-guide" open><summary>filename rules · monster states</summary><div id="monster-animation-filename-rules" class="filename-rules"><span class="muted">select a monster.</span></div><small class="hint">canonical names start with the monster slug. <code>idle_special_01</code>, <code>idle_special_02</code>, … are variants inside the <code>idle</code> state; <code>attack_01</code>, <code>attack_02</code>, … are variants inside <code>attack</code>.</small></details>
++<details id="monster-animation-filename-guide" class="naming-guide" open><summary>filename rules · monster states</summary><div id="monster-animation-filename-rules" class="filename-rules"><span class="muted">select a monster.</span></div><small class="hint">canonical names start with the monster slug. <code>idle_special_01</code>, <code>idle_special_02</code>, … are variants inside <code>idle</code>; <code>combat_idle</code> is the waiting pose while already in combat; <code>attack_01</code>, <code>attack_02</code>, … are variants inside <code>attack</code>.</small></details>
+ <div class="picker folder-picker"><div class="folder-explorer"><input id="monster-animation-folder-path" type="text" autocomplete="off" spellcheck="false" placeholder="C:\path\to\monster-animations"><button id="choose-monster-animation-folder" type="button">explore…</button></div><small>paste a folder path or choose it in Explorer · the last monster animation folder is remembered</small></div>
+ <div class="actions"><button id="scan-monster-animations" class="primary wide" type="button" disabled>scan folder</button></div>
+ <div id="monster-animation-scan-status" class="status-box"><strong>nothing scanned yet</strong><span>unrecognized files can be assigned manually.</span></div>
+diff --git a/system/verify/verify.py b/system/verify/verify.py
+index ccf9593..090a353 100644
+--- a/system/verify/verify.py
++++ b/system/verify/verify.py
+@@ -659,11 +659,11 @@ if monster_animation_manifest.get("schemaVersion") != 1 or monster_animation_man
+     err("monster animation manifest must be game1 schema 1")
+ monster_slot_catalog = monster_animation_manifest.get("slotCatalog") or []
+ monster_slots = [row.get("slot") for row in monster_slot_catalog]
+-if monster_slots != ["idle", "idle_special", "walk", "run", "attack", "attack_wait", "death"]:
+-    err("monster animation storage slots must preserve idle/idle_special, movement, combat and death bindings")
++if monster_slots != ["idle", "idle_special", "walk", "run", "combat_idle", "attack", "death"]:
++    err("monster animation storage slots must use combat_idle and must not expose attack_wait")
+ monster_states = [row.get("state") for row in monster_slot_catalog]
+-if monster_states != ["idle", "idle", "walk", "run", "attack", "attack_wait", "death"]:
+-    err("monster idle_special must be a variant inside the idle state")
++if monster_states != ["idle", "idle", "walk", "run", "combat_idle", "attack", "death"]:
++    err("monster idle_special must stay inside idle and combat waiting must be combat_idle")
+ monster_assets_js_path = ROOT / "system/control-center/static/monster-assets.js"
+ monster_assets_js_text = monster_assets_js_path.read_text(encoding="utf-8") if monster_assets_js_path.is_file() else ""
+ monster_index_text = (ROOT / "system/control-center/static/index.html").read_text(encoding="utf-8")
+@@ -677,7 +677,7 @@ monster_animation_store_path = ROOT / "system/control-center/monster_animation_s
+ monster_animation_store_text = monster_animation_store_path.read_text(encoding="utf-8") if monster_animation_store_path.is_file() else ""
+ for required in [
+     "class MonsterAnimationStore", "def scan_folder", "def assign_file", "def publish_missing",
+-    '"slot": "idle"', '"slot": "idle_special"', '"state": "idle"', '"role": "special"', '"slot": "attack_wait"', '"variants": True', "canonicalFilename",
++    '"slot": "idle"', '"slot": "idle_special"', '"state": "idle"', '"role": "special"', '"slot": "combat_idle"', '"variants": True', "canonicalFilename",
+     '"sourceSlot": internal_slot', 'profile["slots"].setdefault(state', 'src/shared/monster/MonsterAnimationRegistry.luau',
+ ]:
+     if required not in monster_animation_store_text:
+@@ -767,6 +767,17 @@ if 'setBase(character, "CritChance", d.CritChance)' not in stats_service_text:
+ for required in ['"slot": "death"', '"slot": "death_wait"', '"slot": "revive"']:
+     if required not in animation_store_text:
+         err(f"character life animation catalog missing {required}")
++if '"slot": "equip"' in animation_store_text or '"slot": "unequip"' in animation_store_text:
++    err("character animation catalog must not expose equip/unequip states")
++character_animation_manifest_path = ROOT / "assets/manifests/character-animations.json"
++if character_animation_manifest_path.is_file():
++    character_animation_manifest = json.loads(character_animation_manifest_path.read_text(encoding="utf-8"))
++    obsolete_character_bindings = [
++        row for row in (character_animation_manifest.get("bindings") or [])
++        if str(row.get("slot") or "") in {"equip", "unequip"}
++    ]
++    if obsolete_character_bindings:
++        err("character animation manifest still contains equip/unequip bindings")
+ for required in ['return "death_wait"', 'playBaseLifeAction("death"', 'playBaseLifeAction("revive"', 'GetAttributeChangedSignal("LifeState")']:
+     if required not in controller_runtime:
+         err(f"character life animation runtime missing {required}")
+@@ -777,7 +788,7 @@ if errors:
+         print(" -", item)
+     sys.exit(1)
+ 
+-print("verify ok · game1 m7 monster idle-state variants + assets + spawn + crit/life contracts passed")
++print("verify ok · game1 m7 unified combat_idle + no equip animation states + monster assets/spawn contracts passed")
+ print("registered character archetypes:", len(archetypes))
+ print("active character archetype:", active_id or "none")
+ print("race pool: human")
