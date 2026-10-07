@@ -1,0 +1,996 @@
+diff --git a/src/client/combat/AttackController.luau b/src/client/combat/AttackController.luau
+index b1eaf13..fa9eba4 100644
+--- a/src/client/combat/AttackController.luau
++++ b/src/client/combat/AttackController.luau
+@@ -1,5 +1,6 @@
+ local Players = game:GetService("Players")
+ local ReplicatedStorage = game:GetService("ReplicatedStorage")
++local RunService = game:GetService("RunService")
+ local UserInputService = game:GetService("UserInputService")
+ 
+ local Shared = ReplicatedStorage:WaitForChild("Game1Shared")
+@@ -7,6 +8,7 @@ local CharacterShared = Shared:WaitForChild("character")
+ local CombatShared = Shared:WaitForChild("combat")
+ local CharacterConfig = require(CharacterShared:WaitForChild("CharacterConfig"))
+ local AttackConfig = require(CombatShared:WaitForChild("AttackConfig"))
++local WeaponAttackVolume = require(CombatShared:WaitForChild("WeaponAttackVolume"))
+ local UiInputGuard = require(script.Parent.Parent:WaitForChild("UiInputGuard"))
+ local AttackController = {}
+ local started = false
+@@ -14,6 +16,31 @@ local movementController: any = nil
+ local animationController: any = nil
+ local aimPoseController: any = nil
+ local attackSequence = 0
++local activePoseAttackId = 0
++local activePoseUntil = 0
++local activePoseStartedAt = 0
++local poseAccumulator = 0
++local weaponPoseRemote: RemoteEvent? = nil
++
++
++local function publishWeaponPose()
++    if not weaponPoseRemote or activePoseAttackId <= 0 then
++        return
++    end
++    local character = Players.LocalPlayer.Character
++    if not character or tostring(character:GetAttribute("LifeState") or "Alive") ~= "Alive" then
++        return
++    end
++    local boxCFrame = WeaponAttackVolume.ReadEquippedWeaponBox(character)
++    if typeof(boxCFrame) ~= "CFrame" then
++        return
++    end
++    weaponPoseRemote:FireServer({
++        clientAttackId = activePoseAttackId,
++        elapsed = math.max(0, os.clock() - activePoseStartedAt),
++        boxCFrame = boxCFrame,
++    })
++end
+ 
+ local function finishPresentation(sequence: number)
+     if sequence ~= attackSequence then
+@@ -43,6 +70,23 @@ function AttackController.Start(movement: any?, animation: any?, aimPose: any?)
+     started = true
+     local remotes = ReplicatedStorage:WaitForChild("Game1Remotes")
+     local attack = remotes:WaitForChild("AttackIntent")
++    weaponPoseRemote = remotes:WaitForChild("AttackWeaponPose") :: RemoteEvent
++
++    RunService.RenderStepped:Connect(function(deltaTime)
++        if activePoseAttackId <= 0 then
++            return
++        end
++        if os.clock() > activePoseUntil then
++            activePoseAttackId = 0
++            poseAccumulator = 0
++            return
++        end
++        poseAccumulator += deltaTime
++        if poseAccumulator >= AttackConfig.WeaponPoseSampleInterval then
++            poseAccumulator = poseAccumulator % AttackConfig.WeaponPoseSampleInterval
++            publishWeaponPose()
++        end
++    end)
+     UserInputService.InputBegan:Connect(function(input, processed)
+         if input.UserInputType ~= CharacterConfig.InputBindings.AttackPrimary[1] or UiInputGuard.BlocksWorldInput(input, processed) then return end
+ 
+@@ -113,10 +157,19 @@ function AttackController.Start(movement: any?, animation: any?, aimPose: any?)
+ 
+         -- The server validates clipId against the equipped animation profile and
+         -- resolves the same authoritative timeline before scheduling any result.
++        -- The server resolves damage from the animated EquippedWeapon box at
++        -- the configured Hit event. Keep streaming that box while this local
++        -- attack is alive; the server validates the canonical dimensions/range.
++        activePoseAttackId = sequence
++        activePoseStartedAt = os.clock()
++        activePoseUntil = activePoseStartedAt + attackDuration
++        poseAccumulator = 0
+         attack:FireServer({
+             aim = target,
+             clipId = action.clipId,
++            clientAttackId = sequence,
+         })
++        publishWeaponPose()
+     end)
+ end
+ return AttackController
+diff --git a/src/client/dev/TestLoadoutController.luau b/src/client/dev/TestLoadoutController.luau
+index 9705fe0..ecc62e3 100644
+--- a/src/client/dev/TestLoadoutController.luau
++++ b/src/client/dev/TestLoadoutController.luau
+@@ -4,12 +4,16 @@ local RunService = game:GetService("RunService")
+ local TweenService = game:GetService("TweenService")
+ local Workspace = game:GetService("Workspace")
+ 
++local Shared = ReplicatedStorage:WaitForChild("Game1Shared")
++local CombatShared = Shared:WaitForChild("combat")
++local WeaponAttackVolume = require(CombatShared:WaitForChild("WeaponAttackVolume"))
++
+ local TestLoadoutController = {}
+ local started = false
+ local player = Players.LocalPlayer
+ 
+ local PANEL_WIDTH = 320
+-local PANEL_EXPANDED_HEIGHT = 410
++local PANEL_EXPANDED_HEIGHT = 448
+ local PANEL_COLLAPSED_SIZE = 44
+ local PANEL_X = 16
+ local PANEL_Y = 150
+@@ -374,6 +378,34 @@ local function createAttackRadiusRing()
+     return folder, parts
+ end
+ 
++local function createWeaponHitVolumePreview()
++    local folder = Instance.new("Folder")
++    folder.Name = "Game1WeaponHitVolumePreview"
++
++    local part = Instance.new("Part")
++    part.Name = "AnimatedWeaponHitVolume"
++    part.Anchored = true
++    part.CanCollide = false
++    part.CanQuery = false
++    part.CanTouch = false
++    part.CastShadow = false
++    part.Material = Enum.Material.Neon
++    part.Color = COLORS.error
++    part.Transparency = 0.78
++    part.Parent = folder
++
++    local outline = Instance.new("SelectionBox")
++    outline.Name = "VolumeOutline"
++    outline.Adornee = part
++    outline.Color3 = COLORS.error
++    outline.LineThickness = 0.035
++    outline.SurfaceColor3 = COLORS.error
++    outline.SurfaceTransparency = 0.93
++    outline.Parent = part
++
++    return folder, part
++end
++
+ local function createGui()
+     local playerGui = player:WaitForChild("PlayerGui")
+     local previous = playerGui:FindFirstChild("Game1TestLoadoutGui")
+@@ -451,21 +483,27 @@ local function createGui()
+     radiusToggle.TextSize = 10
+     radiusToggle.Font = Enum.Font.GothamSemibold
+ 
++    local volumeToggle = button(body, "WEAPON HIT VOLUME: OFF")
++    volumeToggle.Position = UDim2.fromOffset(0, 286)
++    volumeToggle.Size = UDim2.new(1, 0, 0, 28)
++    volumeToggle.TextSize = 10
++    volumeToggle.Font = Enum.Font.GothamSemibold
++
+     local statusDot = Instance.new("Frame")
+     statusDot.BackgroundColor3 = COLORS.muted
+     statusDot.BorderSizePixel = 0
+-    statusDot.Position = UDim2.fromOffset(2, 297)
++    statusDot.Position = UDim2.fromOffset(2, 331)
+     statusDot.Size = UDim2.fromOffset(6, 6)
+     statusDot.Parent = body
+     corner(statusDot, 3)
+ 
+     local status = textLabel(body, "Loading catalog…", 9, false)
+     status.TextColor3 = COLORS.muted
+-    status.Position = UDim2.fromOffset(14, 290)
++    status.Position = UDim2.fromOffset(14, 324)
+     status.Size = UDim2.new(1, -14, 0, 20)
+ 
+     local apply = button(body, "LOADING…")
+-    apply.Position = UDim2.fromOffset(0, 316)
++    apply.Position = UDim2.fromOffset(0, 350)
+     apply.Size = UDim2.new(1, 0, 0, 34)
+     apply.BackgroundColor3 = COLORS.disabled
+     apply.TextColor3 = COLORS.muted
+@@ -503,7 +541,7 @@ local function createGui()
+     end)
+     setCollapsed(playerGui:GetAttribute(DEBUG_PANEL_OPEN_ATTRIBUTE) ~= DEBUG_PANEL_ID)
+ 
+-    return gui, character, category, weapon, meta, radiusBox, radiusReset, radiusToggle, apply, status, statusDot
++    return gui, character, category, weapon, meta, radiusBox, radiusReset, radiusToggle, volumeToggle, apply, status, statusDot
+ end
+ 
+ function TestLoadoutController.Start()
+@@ -524,7 +562,7 @@ function TestLoadoutController.Start()
+             return
+         end
+ 
+-        local gui, characterDropdown, categorySelector, weaponDropdown, meta, radiusBox, radiusReset, radiusToggle, applyButton, status, statusDot = createGui()
++        local gui, characterDropdown, categorySelector, weaponDropdown, meta, radiusBox, radiusReset, radiusToggle, volumeToggle, applyButton, status, statusDot = createGui()
+         local catalog = catalogRemote:InvokeServer()
+         local weaponRows = catalog.weapons or {}
+         local weaponBySlug = {}
+@@ -570,6 +608,9 @@ function TestLoadoutController.Start()
+         local ringFolder, ringParts = createAttackRadiusRing()
+         local ringVisible = false
+         local ringConnection: RBXScriptConnection? = nil
++        local volumeFolder, volumePart = createWeaponHitVolumePreview()
++        local volumeVisible = false
++        local volumeConnection: RBXScriptConnection? = nil
+         local rayParams = RaycastParams.new()
+         rayParams.FilterType = Enum.RaycastFilterType.Exclude
+         rayParams.IgnoreWater = false
+@@ -608,6 +649,43 @@ function TestLoadoutController.Start()
+         setRingVisible(false)
+         radiusToggle.Activated:Connect(function() setRingVisible(not ringVisible) end)
+ 
++        local function setVolumeVisible(value: boolean)
++            volumeVisible = value == true
++            volumeToggle.Text = volumeVisible and "WEAPON HIT VOLUME: ON" or "WEAPON HIT VOLUME: OFF"
++            volumeToggle.BackgroundColor3 = volumeVisible and COLORS.controlSelected or COLORS.control
++            volumeToggle.TextColor3 = volumeVisible and COLORS.accent or COLORS.text
++            volumeFolder.Parent = volumeVisible and Workspace or nil
++        end
++
++        local function renderWeaponHitVolume()
++            if not volumeVisible then return end
++            local currentCharacter = player.Character
++            local root = currentCharacter and currentCharacter:FindFirstChild("RootCollider")
++            if not root or not root:IsA("BasePart") then
++                volumePart.Transparency = 1
++                return
++            end
++            local weaponBoxCFrame, weaponBoxSize, equippedWeapon = WeaponAttackVolume.ReadEquippedWeaponBox(currentCharacter)
++            if typeof(weaponBoxCFrame) ~= "CFrame" or typeof(weaponBoxSize) ~= "Vector3" or not equippedWeapon then
++                volumePart.Transparency = 1
++                return
++            end
++            local radius = math.max(1, tonumber(currentCharacter:GetAttribute("AttackRadius")) or 7)
++            local gripBoxLocalPosition = WeaponAttackVolume.ReadGripBoxLocalPosition(equippedWeapon)
++            local volume = WeaponAttackVolume.Build(root.Position, weaponBoxCFrame, weaponBoxSize, radius, gripBoxLocalPosition)
++            if not volume then
++                volumePart.Transparency = 1
++                return
++            end
++            volumePart.CFrame = volume.cframe
++            volumePart.Size = volume.size
++            volumePart.Transparency = 0.78
++        end
++
++        volumeConnection = RunService.RenderStepped:Connect(renderWeaponHitVolume)
++        setVolumeVisible(false)
++        volumeToggle.Activated:Connect(function() setVolumeVisible(not volumeVisible) end)
++
+         local function setStatus(message: string, color: Color3?)
+             status.Text = message
+             status.TextColor3 = color or COLORS.muted
+@@ -747,7 +825,9 @@ function TestLoadoutController.Start()
+         gui.Destroying:Connect(function()
+             preferences = nil
+             if ringConnection then ringConnection:Disconnect() end
++            if volumeConnection then volumeConnection:Disconnect() end
+             ringFolder:Destroy()
++            volumeFolder:Destroy()
+         end)
+     end)
+ end
+diff --git a/src/server/combat/AttackService.luau b/src/server/combat/AttackService.luau
+index 8768498..b0cec3d 100644
+--- a/src/server/combat/AttackService.luau
++++ b/src/server/combat/AttackService.luau
+@@ -8,6 +8,7 @@ local CombatShared = Shared:WaitForChild("combat")
+ local AnimationShared = Shared:WaitForChild("animation")
+ local Config = require(CombatShared:WaitForChild("AttackConfig"))
+ local AttackTimelineConfig = require(CombatShared:WaitForChild("AttackTimelineConfig"))
++local WeaponAttackVolume = require(CombatShared:WaitForChild("WeaponAttackVolume"))
+ local AnimationSpeedScaling = require(AnimationShared:WaitForChild("AnimationSpeedScaling"))
+ local CharacterAnimationRegistry = require(CharacterShared:WaitForChild("CharacterAnimationRegistry"))
+ local DamageService = require(script.Parent:WaitForChild("DamageService"))
+@@ -17,6 +18,8 @@ local EntityHitboxService = require(script.Parent:WaitForChild("EntityHitboxServ
+ local AttackService = {}
+ local activeUntil: { [Player]: number } = {}
+ local activeSerial: { [Player]: number } = {}
++local activeClientAttackId: { [Player]: number } = {}
++local weaponPoseBuffers: { [Player]: any } = {}
+ 
+ local function modelFromPart(part: Instance): Model?
+     local current: Instance? = part
+@@ -58,99 +61,218 @@ local function allowedAttackDescriptor(character: Model, clipId: string): any?
+     return nil
+ end
+ 
+-local function resolveMeleeDamage(player: Player, character: Model, serial: number, aim: Vector3)
+-    if activeSerial[player] ~= serial
+-        or player.Character ~= character
+-        or not character.Parent
+-        or tostring(character:GetAttribute("LifeState") or "") ~= "Alive"
+-    then
+-        return
+-    end
+-
+-    local root = character:FindFirstChild("RootCollider")
+-    if not root or not root:IsA("BasePart") then
+-        return
+-    end
+-
+-    local flat = Vector3.new(aim.X - root.Position.X, 0, aim.Z - root.Position.Z)
+-    if flat.Magnitude < 0.001 then
+-        flat = root.CFrame.LookVector
+-    end
+-    local direction = flat.Unit
+-    local attackRange = math.clamp(tonumber(character:GetAttribute("AttackRadius")) or Config.Range, 1, Config.MaxAimDistance)
+-    local center = root.Position + direction * (attackRange * 0.5)
+-    local boxCf = CFrame.lookAt(center, center + direction)
+-
++local function overlapParams(character: Model): OverlapParams
+     local params = OverlapParams.new()
+     params.FilterType = Enum.RaycastFilterType.Exclude
+     params.FilterDescendantsInstances = { character }
++    return params
++end
+ 
+-    local parts = Workspace:GetPartBoundsInBox(
+-        boxCf,
+-        Vector3.new(Config.BoxWidth, Config.BoxHeight, attackRange),
+-        params
+-    )
+-
++local function applyDamageInVolume(
++    player: Player,
++    character: Model,
++    root: BasePart,
++    serial: number,
++    boxCFrame: CFrame,
++    boxSize: Vector3,
++    attackRange: number,
++    sourceLabel: string
++): number
++    local parts = Workspace:GetPartBoundsInBox(boxCFrame, boxSize, overlapParams(character))
+     local seen = {}
+-    local best: Model? = nil
+-    local bestZone = "root"
+-    local bestHitPosition: Vector3? = nil
+-    local bestDistance = math.huge
+-    local attackBoxSize = Vector3.new(Config.BoxWidth, Config.BoxHeight, attackRange)
++    local hitCount = 0
++
+     for _, part in parts do
+         local model = modelFromPart(part)
+-        if model and not seen[model] then
++        if model and model ~= character and not seen[model] then
+             seen[model] = true
+             local targetRoot = model:FindFirstChild("RootCollider") or model.PrimaryPart
+             if targetRoot and targetRoot:IsA("BasePart") then
+-                local distance = (targetRoot.Position - root.Position).Magnitude
+-                local virtualHit = EntityHitboxService.QueryBox(model, boxCf, attackBoxSize)
++                local virtualHit = EntityHitboxService.QueryBox(model, boxCFrame, boxSize)
+                 local hasVirtualRig = EntityHitboxService.HasBinding(model)
+                 local intersectsTarget = if hasVirtualRig then virtualHit ~= nil else true
+-                if intersectsTarget and distance <= attackRange + 1 and distance < bestDistance then
+-                    best = model
+-                    bestZone = tostring(virtualHit and virtualHit.hitZone or "root")
+-                    bestHitPosition = if virtualHit and typeof(virtualHit.hitPosition) == "Vector3"
++                if intersectsTarget then
++                    local hitPosition = if virtualHit and typeof(virtualHit.hitPosition) == "Vector3"
+                         then virtualHit.hitPosition
+-                        else targetRoot.Position
+-                    bestDistance = distance
++                        else part.Position
++                    local hitRadius = math.max(0, tonumber(virtualHit and virtualHit.radius) or 0)
++                    local hitDistance = (hitPosition - root.Position).Magnitude
++                    if hitDistance <= attackRange + hitRadius + Config.AttackRadiusEpsilon then
++                        local rawDamage = tonumber(character:GetAttribute("Damage")) or 0
++                        local finalDamage, killed = DamageService.Apply(character, model, rawDamage)
++                        HitEffectService.Publish(character, model, model:GetAttribute("LastCritical") == true, hitPosition)
++                        hitCount += 1
++                        if Config.DebugLogs then
++                            print(("[game1][attack] hit player=%s target=%s zone=%s distance=%.2f damage=%d targethp=%s killed=%s serial=%d source=%s")
++                                :format(
++                                    player.Name,
++                                    model.Name,
++                                    tostring(virtualHit and virtualHit.hitZone or "root"),
++                                    hitDistance,
++                                    finalDamage,
++                                    tostring(model:GetAttribute("HP")),
++                                    tostring(killed),
++                                    serial,
++                                    sourceLabel
++                                ))
++                        end
++                    end
+                 end
+             end
+         end
+     end
+ 
+-    if not best then
+-        if Config.DebugLogs then
+-            print(("[game1][attack] miss player=%s range=%.1f serial=%d"):format(player.Name, attackRange, serial))
++    return hitCount
++end
++
++local function fallbackAimVolume(root: BasePart, aim: Vector3, attackRange: number): (CFrame, Vector3)
++    local flat = Vector3.new(aim.X - root.Position.X, 0, aim.Z - root.Position.Z)
++    if flat.Magnitude < 0.001 then
++        flat = root.CFrame.LookVector
++    end
++    local direction = flat.Unit
++    local center = root.Position + direction * (attackRange * 0.5)
++    return CFrame.lookAt(center, center + direction), Vector3.new(Config.BoxWidth, Config.BoxHeight, attackRange)
++end
++
++local function validatedAnimatedWeaponVolume(
++    player: Player,
++    character: Model,
++    root: BasePart,
++    clientAttackId: number,
++    attackRange: number,
++    hitElapsed: number
++): (any?, string?)
++    local weapon = character:FindFirstChild("EquippedWeapon")
++    if not weapon or not weapon:IsA("Model") then
++        return nil, "unarmed"
++    end
++
++    local _, boxSize = WeaponAttackVolume.ReadWeaponBox(weapon)
++    if not boxSize then
++        return nil, "missing_weapon_box"
++    end
++
++    local buffer = weaponPoseBuffers[player]
++    if not buffer or buffer.character ~= character or buffer.clientAttackId ~= clientAttackId then
++        return nil, "missing_weapon_pose"
++    end
++
++    hitElapsed = math.max(0, tonumber(hitElapsed) or 0)
++    local sample = nil
++    local bestError = math.huge
++    for _, candidate in ipairs(buffer.samples or {}) do
++        if typeof(candidate.boxCFrame) == "CFrame" then
++            local errorSeconds = math.abs((tonumber(candidate.elapsed) or 0) - hitElapsed)
++            if errorSeconds < bestError then
++                bestError = errorSeconds
++                sample = candidate
++            end
+         end
++    end
++    if not sample then
++        return nil, "missing_weapon_pose"
++    end
++    if bestError > Config.WeaponPoseHitTimeTolerance then
++        return nil, "weapon_pose_outside_hit_window"
++    end
++    if os.clock() - sample.receivedAt > Config.WeaponPoseMaxAgeSeconds then
++        return nil, "stale_weapon_pose"
++    end
++
++    local maxCenterDistance = attackRange + boxSize.Magnitude + Config.WeaponPoseValidationSlack
++    if (sample.boxCFrame.Position - root.Position).Magnitude > maxCenterDistance then
++        return nil, "invalid_weapon_pose"
++    end
++
++    local gripBoxLocalPosition = WeaponAttackVolume.ReadGripBoxLocalPosition(weapon)
++    local volume = WeaponAttackVolume.Build(root.Position, sample.boxCFrame, boxSize, attackRange, gripBoxLocalPosition)
++    if not volume then
++        return nil, "invalid_weapon_volume"
++    end
++    return volume, nil
++end
++
++local function resolveMeleeDamage(
++    player: Player,
++    character: Model,
++    serial: number,
++    clientAttackId: number,
++    aim: Vector3,
++    hitElapsed: number
++)
++    if activeSerial[player] ~= serial
++        or activeClientAttackId[player] ~= clientAttackId
++        or player.Character ~= character
++        or not character.Parent
++        or tostring(character:GetAttribute("LifeState") or "") ~= "Alive"
++    then
++        return
++    end
++
++    local root = character:FindFirstChild("RootCollider")
++    if not root or not root:IsA("BasePart") then
++        return
++    end
++
++    local attackRange = math.clamp(tonumber(character:GetAttribute("AttackRadius")) or Config.Range, 1, Config.MaxAimDistance)
++    local volume, reason = validatedAnimatedWeaponVolume(player, character, root, clientAttackId, attackRange, hitElapsed)
++    local hitCount = 0
++
++    if volume then
++        -- Equipped weapons use the animated weapon OBB itself as the basis for
++        -- damage. Its longest axis is extended only up to AttackRadius, making
++        -- the hit volume follow the actual attack animation instead of aim yaw.
++        hitCount = applyDamageInVolume(
++            player,
++            character,
++            root,
++            serial,
++            volume.cframe,
++            volume.size,
++            attackRange,
++            "animated_weapon_volume"
++        )
++    elseif reason == "unarmed" then
++        -- Hands keep the legacy aim volume until an authored unarmed attack box
++        -- exists. Equipped weapons never fall back to this approximation.
++        local boxCFrame, boxSize = fallbackAimVolume(root, aim, attackRange)
++        hitCount = applyDamageInVolume(
++            player,
++            character,
++            root,
++            serial,
++            boxCFrame,
++            boxSize,
++            attackRange,
++            "unarmed_fallback"
++        )
++    elseif Config.DebugLogs then
++        print(("[game1][attack] miss player=%s range=%.1f serial=%d reason=%s")
++            :format(player.Name, attackRange, serial, tostring(reason)))
+         return
+     end
+ 
+-    local rawDamage = tonumber(character:GetAttribute("Damage")) or 0
+-    local finalDamage, killed = DamageService.Apply(character, best, rawDamage)
+-    HitEffectService.Publish(character, best, best:GetAttribute("LastCritical") == true, bestHitPosition)
+-    if Config.DebugLogs then
+-        print(("[game1][attack] hit player=%s target=%s zone=%s distance=%.2f damage=%d targethp=%s killed=%s serial=%d")
+-            :format(
+-                player.Name,
+-                best.Name,
+-                bestZone,
+-                bestDistance,
+-                finalDamage,
+-                tostring(best:GetAttribute("HP")),
+-                tostring(killed),
+-                serial
+-            ))
++    if hitCount == 0 and Config.DebugLogs then
++        print(("[game1][attack] miss player=%s range=%.1f serial=%d source=%s")
++            :format(player.Name, attackRange, serial, volume and "animated_weapon_volume" or "unarmed_fallback"))
+     end
+ end
+ 
+-local function scheduleTimelineResults(player: Player, character: Model, serial: number, aim: Vector3, timing: any)
++local function scheduleTimelineResults(
++    player: Player,
++    character: Model,
++    serial: number,
++    clientAttackId: number,
++    aim: Vector3,
++    timing: any
++)
+     for eventName, event in pairs(timing.events or {}) do
+         local resultType = tostring(event.result or "")
+         local delaySeconds = math.max(0, tonumber(event.time) or 0)
+         if resultType == AttackTimelineConfig.ResultTypes.MeleeDamage then
+             task.delay(delaySeconds, function()
+-                resolveMeleeDamage(player, character, serial, aim)
++                resolveMeleeDamage(player, character, serial, clientAttackId, aim, delaySeconds)
+             end)
+         elseif Config.DebugLogs and resultType ~= "" then
+             warn(("[game1][attack] no result handler event=%s result=%s"):format(tostring(eventName), resultType))
+@@ -158,13 +280,18 @@ local function scheduleTimelineResults(player: Player, character: Model, serial:
+     end
+ end
+ 
+-local function clearAttackStateLater(player: Player, character: Model, serial: number, durationSeconds: number)
++local function clearAttackStateLater(player: Player, character: Model, serial: number, clientAttackId: number, durationSeconds: number)
+     task.delay(durationSeconds, function()
+-        if activeSerial[player] ~= serial then
++        if activeSerial[player] ~= serial or activeClientAttackId[player] ~= clientAttackId then
+             return
+         end
+         activeUntil[player] = nil
+         activeSerial[player] = nil
++        activeClientAttackId[player] = nil
++        local buffer = weaponPoseBuffers[player]
++        if buffer and buffer.clientAttackId == clientAttackId then
++            weaponPoseBuffers[player] = nil
++        end
+         if character.Parent and tonumber(character:GetAttribute("AttackSerial")) == serial then
+             character:SetAttribute("AttackEndsAt", nil)
+             character:SetAttribute("AttackClipId", nil)
+@@ -182,6 +309,14 @@ local function attack(player: Player, payload: any)
+ 
+     local aim: Vector3 = payload.aim
+     local clipId = tostring(payload.clipId or "")
++    local clientAttackId = math.floor(tonumber(payload.clientAttackId) or 0)
++    if clientAttackId <= 0 then
++        if Config.DebugLogs then
++            print(("[game1][attack] reject player=%s reason=missing_client_attack_id"):format(player.Name))
++        end
++        return
++    end
++
+     local character = player.Character
+     local root = character and character:FindFirstChild("RootCollider")
+     if not (character and root and root:IsA("BasePart")) or character:GetAttribute("LifeState") ~= "Alive" then
+@@ -216,6 +351,7 @@ local function attack(player: Player, payload: any)
+     local attackDuration = timing.duration
+     local serial = (tonumber(character:GetAttribute("AttackSerial")) or 0) + 1
+     activeSerial[player] = serial
++    activeClientAttackId[player] = clientAttackId
+     activeUntil[player] = now + attackDuration
+     character:SetAttribute("AttackSerial", serial)
+     character:SetAttribute("AttackClipId", clipId)
+@@ -223,10 +359,62 @@ local function attack(player: Player, payload: any)
+     character:SetAttribute("AttackEndsAt", now + attackDuration)
+ 
+     -- Gameplay results are not resolved on input. They are scheduled from the
+-    -- same clip timeline that owns the animation lock, so damage/release windows
+-    -- stay attached to the same stat-scaled animation periods.
+-    scheduleTimelineResults(player, character, serial, aim, timing)
+-    clearAttackStateLater(player, character, serial, attackDuration)
++    -- same clip timeline that owns the animation lock, so the weapon pose used
++    -- at Hit is the pose produced by that animation period.
++    scheduleTimelineResults(player, character, serial, clientAttackId, aim, timing)
++    clearAttackStateLater(player, character, serial, clientAttackId, attackDuration)
++end
++
++local function recordWeaponPose(player: Player, payload: any)
++    if type(payload) ~= "table" or typeof(payload.boxCFrame) ~= "CFrame" then
++        return
++    end
++    local clientAttackId = math.floor(tonumber(payload.clientAttackId) or 0)
++    if clientAttackId <= 0 then
++        return
++    end
++
++    local character = player.Character
++    local root = character and character:FindFirstChild("RootCollider")
++    local weapon = character and character:FindFirstChild("EquippedWeapon")
++    if not character
++        or not root
++        or not root:IsA("BasePart")
++        or not weapon
++        or not weapon:IsA("Model")
++        or tostring(character:GetAttribute("LifeState") or "") ~= "Alive"
++    then
++        return
++    end
++
++    local _, boxSize = WeaponAttackVolume.ReadWeaponBox(weapon)
++    if not boxSize then
++        return
++    end
++    local attackRange = math.clamp(tonumber(character:GetAttribute("AttackRadius")) or Config.Range, 1, Config.MaxAimDistance)
++    local maxCenterDistance = attackRange + boxSize.Magnitude + Config.WeaponPoseValidationSlack
++    if (payload.boxCFrame.Position - root.Position).Magnitude > maxCenterDistance then
++        return
++    end
++
++    local elapsed = math.max(0, tonumber(payload.elapsed) or 0)
++    local buffer = weaponPoseBuffers[player]
++    if not buffer or buffer.character ~= character or buffer.clientAttackId ~= clientAttackId then
++        buffer = {
++            character = character,
++            clientAttackId = clientAttackId,
++            samples = {},
++        }
++        weaponPoseBuffers[player] = buffer
++    end
++    table.insert(buffer.samples, {
++        elapsed = elapsed,
++        boxCFrame = payload.boxCFrame,
++        receivedAt = os.clock(),
++    })
++    while #buffer.samples > Config.WeaponPoseBufferSize do
++        table.remove(buffer.samples, 1)
++    end
+ end
+ 
+ function AttackService.Start()
+@@ -239,9 +427,16 @@ function AttackService.Start()
+     event.Parent = remotes
+     event.OnServerEvent:Connect(attack)
+ 
++    local poseEvent = remotes:FindFirstChild("AttackWeaponPose") or Instance.new("RemoteEvent")
++    poseEvent.Name = "AttackWeaponPose"
++    poseEvent.Parent = remotes
++    poseEvent.OnServerEvent:Connect(recordWeaponPose)
++
+     Players.PlayerRemoving:Connect(function(player)
+         activeUntil[player] = nil
+         activeSerial[player] = nil
++        activeClientAttackId[player] = nil
++        weaponPoseBuffers[player] = nil
+     end)
+ end
+ 
+diff --git a/src/server/weapon/WeaponEquipService.luau b/src/server/weapon/WeaponEquipService.luau
+index e315262..946e722 100644
+--- a/src/server/weapon/WeaponEquipService.luau
++++ b/src/server/weapon/WeaponEquipService.luau
+@@ -5,6 +5,7 @@ local Shared = ReplicatedStorage:WaitForChild("Game1Shared")
+ local WeaponShared = Shared:WaitForChild("weapon")
+ local CombatShared = Shared:WaitForChild("combat")
+ local AttackConfig = require(CombatShared:WaitForChild("AttackConfig"))
++local WeaponAttackVolume = require(CombatShared:WaitForChild("WeaponAttackVolume"))
+ local WeaponRegistry = require(WeaponShared:WaitForChild("WeaponRegistry"))
+ local WeaponAttackMovement = require(WeaponShared:WaitForChild("WeaponAttackMovement"))
+ local CharacterStatsService = require(script.Parent.Parent:WaitForChild("character"):WaitForChild("CharacterStatsService"))
+@@ -197,6 +198,11 @@ function WeaponEquipService.Equip(character: Model, slugValue: any): (boolean, s
+     weapon:SetAttribute("Game1WeaponGripRotation", nil)
+     weapon:SetAttribute("WeaponAttachmentMode", "runtime-canonical-grip-v2")
+     alignWeaponToSocket(weapon, grip, targetSocketCFrame(targetBone) * WEAPON_EQUIP_ROTATION)
++    -- Persist the authored EquippedWeapon OBB in model-local space. The client
++    -- can then reconstruct the exact animated weapon box every frame without
++    -- changing its dimensions, while the server owns the canonical size used
++    -- by combat validation.
++    WeaponAttackVolume.StampWeaponBox(weapon)
+     weapon.Parent = character
+ 
+     character:SetAttribute("EquippedWeaponSlug", slug)
+diff --git a/src/shared/RuntimeVersion.luau b/src/shared/RuntimeVersion.luau
+index 773ee2b..b9955a5 100644
+--- a/src/shared/RuntimeVersion.luau
++++ b/src/shared/RuntimeVersion.luau
+@@ -1 +1 @@
+-return table.freeze({ Version = "2026.10.07.026", SourceDigest = "game1-m26-common-options-combat-state-life-playback" })
++return table.freeze({ Version = "2026.10.07.027", SourceDigest = "game1-m27-animated-weapon-hit-volume-multitarget" })
+diff --git a/src/shared/combat/AttackConfig.luau b/src/shared/combat/AttackConfig.luau
+index 0fd8ee2..5d2d198 100644
+--- a/src/shared/combat/AttackConfig.luau
++++ b/src/shared/combat/AttackConfig.luau
+@@ -3,6 +3,16 @@ return table.freeze({
+     BoxWidth = 5,
+     BoxHeight = 5,
+     MaxAimDistance = 420,
++    AttackRadiusEpsilon = 0.15,
++
++    -- Animated EquippedWeapon pose samples are client-observed because the
++    -- visible weapon follows client-side Bone transforms. The server owns the
++    -- canonical box dimensions and accepts only fresh, nearby pose frames.
++    WeaponPoseSampleInterval = 1 / 30,
++    WeaponPoseMaxAgeSeconds = 0.25,
++    WeaponPoseHitTimeTolerance = 0.09,
++    WeaponPoseBufferSize = 96,
++    WeaponPoseValidationSlack = 2.0,
+ 
+     -- RobloxLineage attack-facing contract. A planted attack can twist the upper
+     -- body up to this yaw. Only the overflow is assigned to whole-character yaw.
+diff --git a/src/shared/combat/WeaponAttackVolume.luau b/src/shared/combat/WeaponAttackVolume.luau
+new file mode 100644
+index 0000000..f88123d
+--- /dev/null
++++ b/src/shared/combat/WeaponAttackVolume.luau
+@@ -0,0 +1,163 @@
++local WeaponAttackVolume = {}
++
++local BOX_LOCAL_ATTRIBUTE = "WeaponAttackBoxLocalCFrame"
++local BOX_SIZE_ATTRIBUTE = "WeaponAttackBoxSize"
++local GRIP_BOX_LOCAL_ATTRIBUTE = "WeaponAttackGripBoxLocalPosition"
++
++local function finiteNumber(value: number): boolean
++    return value == value and value > -math.huge and value < math.huge
++end
++
++local function finiteVector(value: Vector3): boolean
++    return finiteNumber(value.X) and finiteNumber(value.Y) and finiteNumber(value.Z)
++end
++
++local function axisForBox(boxCFrame: CFrame, boxSize: Vector3): (Vector3, string, number)
++    if boxSize.X >= boxSize.Y and boxSize.X >= boxSize.Z then
++        return boxCFrame.RightVector, "X", boxSize.X
++    elseif boxSize.Y >= boxSize.X and boxSize.Y >= boxSize.Z then
++        return boxCFrame.UpVector, "Y", boxSize.Y
++    end
++    return boxCFrame.LookVector, "Z", boxSize.Z
++end
++
++local function setAxisLength(size: Vector3, axisName: string, length: number): Vector3
++    if axisName == "X" then
++        return Vector3.new(length, size.Y, size.Z)
++    elseif axisName == "Y" then
++        return Vector3.new(size.X, length, size.Z)
++    end
++    return Vector3.new(size.X, size.Y, length)
++end
++
++local function outwardDirection(
++    rootPosition: Vector3,
++    boxCFrame: CFrame,
++    axis: Vector3,
++    axisLength: number,
++    gripBoxLocalPosition: Vector3?
++): Vector3
++    local half = math.max(0, axisLength) * 0.5
++    local positive = boxCFrame.Position + axis * half
++    local negative = boxCFrame.Position - axis * half
++
++    -- The runtime grip is normally authored on the handle. Prefer the opposite
++    -- end of the longest weapon axis, so the continuation always leaves from
++    -- the blade/head side and cannot flip just because an animation crosses the
++    -- character root. Root distance is only a compatibility fallback.
++    if typeof(gripBoxLocalPosition) == "Vector3" then
++        local gripWorld = boxCFrame:PointToWorldSpace(gripBoxLocalPosition)
++        local positiveDistance = (positive - gripWorld).Magnitude
++        local negativeDistance = (negative - gripWorld).Magnitude
++        if math.abs(positiveDistance - negativeDistance) > 1e-4 then
++            return if negativeDistance > positiveDistance then -axis else axis
++        end
++    end
++
++    if (negative - rootPosition).Magnitude > (positive - rootPosition).Magnitude then
++        return -axis
++    end
++    return axis
++end
++
++local function distanceToSphereExit(rootPosition: Vector3, startPosition: Vector3, direction: Vector3, radius: number): number
++    local offset = startPosition - rootPosition
++    local c = offset:Dot(offset) - radius * radius
++    if c >= 0 then
++        return 0
++    end
++    local b = offset:Dot(direction)
++    local discriminant = b * b - c
++    if discriminant <= 0 then
++        return 0
++    end
++    return math.max(0, -b + math.sqrt(discriminant))
++end
++
++function WeaponAttackVolume.StampWeaponBox(weapon: Model): (CFrame, Vector3)
++    local boxCFrame, boxSize = weapon:GetBoundingBox()
++    local localCFrame = weapon:GetPivot():ToObjectSpace(boxCFrame)
++    weapon:SetAttribute(BOX_LOCAL_ATTRIBUTE, localCFrame)
++    weapon:SetAttribute(BOX_SIZE_ATTRIBUTE, boxSize)
++
++    local grip = weapon:FindFirstChild("Game1WeaponGrip", true)
++    if grip and grip:IsA("Attachment") then
++        weapon:SetAttribute(GRIP_BOX_LOCAL_ATTRIBUTE, boxCFrame:PointToObjectSpace(grip.WorldPosition))
++    else
++        weapon:SetAttribute(GRIP_BOX_LOCAL_ATTRIBUTE, nil)
++    end
++    return localCFrame, boxSize
++end
++
++function WeaponAttackVolume.ReadWeaponBox(weapon: Model): (CFrame?, Vector3?)
++    local localCFrame = weapon:GetAttribute(BOX_LOCAL_ATTRIBUTE)
++    local boxSize = weapon:GetAttribute(BOX_SIZE_ATTRIBUTE)
++    if typeof(localCFrame) ~= "CFrame" or typeof(boxSize) ~= "Vector3" or not finiteVector(boxSize) then
++        return nil, nil
++    end
++    if boxSize.X <= 0 or boxSize.Y <= 0 or boxSize.Z <= 0 then
++        return nil, nil
++    end
++    return weapon:GetPivot() * localCFrame, boxSize
++end
++
++function WeaponAttackVolume.ReadEquippedWeaponBox(character: Model): (CFrame?, Vector3?, Model?)
++    local weapon = character:FindFirstChild("EquippedWeapon")
++    if not weapon or not weapon:IsA("Model") then
++        return nil, nil, nil
++    end
++    local boxCFrame, boxSize = WeaponAttackVolume.ReadWeaponBox(weapon)
++    return boxCFrame, boxSize, weapon
++end
++
++function WeaponAttackVolume.ReadGripBoxLocalPosition(weapon: Model): Vector3?
++    local value = weapon:GetAttribute(GRIP_BOX_LOCAL_ATTRIBUTE)
++    return if typeof(value) == "Vector3" then value else nil
++end
++
++function WeaponAttackVolume.Build(
++    rootPosition: Vector3,
++    weaponBoxCFrame: CFrame,
++    weaponBoxSize: Vector3,
++    attackRadius: number,
++    gripBoxLocalPosition: Vector3?
++): any?
++    if typeof(rootPosition) ~= "Vector3"
++        or typeof(weaponBoxCFrame) ~= "CFrame"
++        or typeof(weaponBoxSize) ~= "Vector3"
++        or not finiteVector(rootPosition)
++        or not finiteVector(weaponBoxCFrame.Position)
++        or not finiteVector(weaponBoxSize)
++    then
++        return nil
++    end
++
++    local radius = math.max(0, tonumber(attackRadius) or 0)
++    if radius <= 0 or weaponBoxSize.X <= 0 or weaponBoxSize.Y <= 0 or weaponBoxSize.Z <= 0 then
++        return nil
++    end
++
++    local axis, axisName, axisLength = axisForBox(weaponBoxCFrame, weaponBoxSize)
++    local direction = outwardDirection(rootPosition, weaponBoxCFrame, axis, axisLength, gripBoxLocalPosition)
++    local weaponTip = weaponBoxCFrame.Position + direction * (axisLength * 0.5)
++    local extension = distanceToSphereExit(rootPosition, weaponTip, direction, radius)
++
++    -- The gameplay volume is one OBB: the physical EquippedWeapon box plus a
++    -- continuation along its longest axis. Because the box orientation comes
++    -- from the animated weapon itself, a different attack pose creates a
++    -- different hit volume without any aim-sector approximation.
++    local volumeCFrame = weaponBoxCFrame + direction * (extension * 0.5)
++    local volumeSize = setAxisLength(weaponBoxSize, axisName, axisLength + extension)
++
++    return {
++        cframe = volumeCFrame,
++        size = volumeSize,
++        direction = direction,
++        extension = extension,
++        weaponTip = weaponTip,
++        radius = radius,
++        axis = axisName,
++    }
++end
++
++return table.freeze(WeaponAttackVolume)
+diff --git a/system/verify/verify.py b/system/verify/verify.py
+index 37e6d1d..87c55e0 100644
+--- a/system/verify/verify.py
++++ b/system/verify/verify.py
+@@ -690,7 +690,7 @@ if "weapon:PivotTo(socketFrame)" in weapon_attach_text:
+ for required in ['character:SetAttribute("AttackRadius"', "attackRadiusStuds", "AttackConfig.MaxAimDistance"]:
+     if required not in weapon_equip_text:
+         err(f"weapon equip attack-radius runtime missing {required}")
+-for required in ['character:GetAttribute("AttackRadius")', "attackRange", "attackBoxSize"]:
++for required in ['character:GetAttribute("AttackRadius")', "attackRange", "WeaponAttackVolume.Build"]:
+     if required not in attack_text:
+         err(f"server-authoritative weapon attack radius missing {required}")
+ 
+@@ -1543,13 +1543,64 @@ for required in ["stateDurationSeconds", "deathPlaybackPercent", "revivePlayback
+     if required not in game_options_registry_m26:
+         err(f"m26 generated options registry missing {required}")
+ 
++# m27 animated EquippedWeapon volume + multi-target melee + Test Loadout preview.
++weapon_volume_path_m27 = ROOT / "src/shared/combat/WeaponAttackVolume.luau"
++weapon_volume_m27 = weapon_volume_path_m27.read_text(encoding="utf-8") if weapon_volume_path_m27.is_file() else ""
++for required in [
++    "WeaponAttackVolume.StampWeaponBox",
++    "WeaponAttackVolume.ReadEquippedWeaponBox",
++    "WeaponAttackVolume.Build",
++    "distanceToSphereExit",
++    "outwardDirection",
++]:
++    if required not in weapon_volume_m27:
++        err(f"m27 animated weapon hit-volume contract missing {required}")
++
++weapon_equip_m27 = (ROOT / "src/server/weapon/WeaponEquipService.luau").read_text(encoding="utf-8")
++if "WeaponAttackVolume.StampWeaponBox(weapon)" not in weapon_equip_m27:
++    err("m27 equipped weapons must persist their canonical local attack box")
++
++attack_controller_m27 = (ROOT / "src/client/combat/AttackController.luau").read_text(encoding="utf-8")
++for required in [
++    'WaitForChild("AttackWeaponPose")',
++    "WeaponPoseSampleInterval",
++    "publishWeaponPose",
++    "clientAttackId = sequence",
++]:
++    if required not in attack_controller_m27:
++        err(f"m27 client animated weapon-pose sampling missing {required}")
++
++attack_service_m27 = (ROOT / "src/server/combat/AttackService.luau").read_text(encoding="utf-8")
++for required in [
++    "validatedAnimatedWeaponVolume",
++    "animated_weapon_volume",
++    "WeaponAttackVolume.Build",
++    'poseEvent.Name = "AttackWeaponPose"',
++    "weaponPoseBuffers",
++    "hitCount += 1",
++]:
++    if required not in attack_service_m27:
++        err(f"m27 server weapon-volume/multi-target contract missing {required}")
++if "local best: Model?" in attack_service_m27:
++    err("m27 melee damage must not collapse an animated weapon volume to one best target")
++
++test_loadout_m27 = (ROOT / "src/client/dev/TestLoadoutController.luau").read_text(encoding="utf-8")
++for required in [
++    "WEAPON HIT VOLUME: OFF",
++    "createWeaponHitVolumePreview",
++    "renderWeaponHitVolume",
++    "WeaponAttackVolume.Build",
++]:
++    if required not in test_loadout_m27:
++        err(f"m27 Test Loadout weapon-volume preview missing {required}")
++
+ if errors:
+     print("verify failed")
+     for item in errors:
+         print(" -", item)
+     sys.exit(1)
+ 
+-print("verify ok · game1 m26 common options + combat state + life playback passed")
++print("verify ok · game1 m27 animated weapon hit volume + multi-target melee passed")
+ print("registered character archetypes:", len(archetypes))
+ print("active character archetype:", active_id or "none")
+ print("race pool: human")

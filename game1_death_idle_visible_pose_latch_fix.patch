@@ -1,0 +1,169 @@
+diff --git a/src/shared/combat/DeathAnimationPolicy.luau b/src/shared/combat/DeathAnimationPolicy.luau
+--- a/src/shared/combat/DeathAnimationPolicy.luau
++++ b/src/shared/combat/DeathAnimationPolicy.luau
+@@ -1,14 +1,14 @@
+ -- Canonical death playback contract.
+ --
+--- Do not infer an animation "last frame" from 24/30/60 FPS and do not stop at
+--- Length - epsilon. For a KeyframeSequence Roblox defines the sequence length
+--- from the Keyframe with the greatest Keyframe.Time, so AnimationTrack.Length
+--- is the authored final key time once the track is loaded.
++-- Death is allowed to play normally until the next Animator step would reach
++-- or cross AnimationTrack.Length. At that PreAnimation edge we do NOT seek to
++-- Length: imported clips can contain an exporter/runtime terminal sample that is
++-- not the corpse pose the player just saw (especially when root-bone motion is
++-- involved). Seeking to it makes DeathIdle visibly snap the corpse.
+ --
+--- We let the one-shot run normally. PreAnimation only intercepts the animation
+--- step that would cross the end: while the track is still playing, freeze its
+--- speed and evaluate TimePosition == Length exactly. That applies the actual
+--- final authored key and keeps that pose alive for DeathIdle.
++-- Instead, freeze the track at its current TimePosition. That is the last pose
++-- Roblox has already evaluated and rendered, so the transition into DeathIdle is
++-- pose-continuous and independent of the source/export frame rate.
+ local DeathAnimationPolicy = {}
+ 
+ function DeathAnimationPolicy.Start(track: AnimationTrack)
+@@ -19,29 +19,29 @@
+ 	track:AdjustWeight(1, 0)
+ end
+ 
+-function DeathAnimationPolicy.AdvanceToFinalKey(track: AnimationTrack, deltaTimeSim: number): (boolean, number?)
++function DeathAnimationPolicy.LatchVisibleTerminalPose(track: AnimationTrack, deltaTimeSim: number): (boolean, number?)
+ 	if not track.IsPlaying then
+ 		return false, nil
+ 	end
+ 
+-	local finalKeyTime = tonumber(track.Length) or 0
++	local length = tonumber(track.Length) or 0
+ 	local speed = tonumber(track.Speed) or 0
+-	if finalKeyTime <= 0 or speed <= 0 then
++	if length <= 0 or speed <= 0 then
+ 		return false, nil
+ 	end
+ 
+ 	local current = math.max(0, tonumber(track.TimePosition) or 0)
+ 	local step = math.max(0, tonumber(deltaTimeSim) or 0) * speed
+-	if current + step < finalKeyTime then
+-		return false, finalKeyTime
++	if current + step < length then
++		return false, current
+ 	end
+ 
+-	-- TimePosition can only be changed while the track is playing. Freeze first,
+-	-- then evaluate the exact final key instead of an FPS-derived approximation.
++	-- PreAnimation runs before Animator advances this frame. Freezing now keeps
++	-- the exact pose that was visible on the previous rendered frame. Do not seek
++	-- to Length here: that terminal sample may restore root-bone orientation.
+ 	track:AdjustSpeed(0)
+-	track.TimePosition = finalKeyTime
+ 	track:AdjustWeight(1, 0)
+-	return true, finalKeyTime
++	return true, current
+ end
+ 
+ return table.freeze(DeathAnimationPolicy)
+diff --git a/src/server/monster/MonsterSpawnerService.luau b/src/server/monster/MonsterSpawnerService.luau
+--- a/src/server/monster/MonsterSpawnerService.luau
++++ b/src/server/monster/MonsterSpawnerService.luau
+@@ -661,7 +661,7 @@
+         return
+     end
+ 
+-    local reached, terminalTime = DeathAnimationPolicy.AdvanceToFinalKey(track, deltaTimeSim)
++    local reached, terminalTime = DeathAnimationPolicy.LatchVisibleTerminalPose(track, deltaTimeSim)
+     if not reached then
+         return
+     end
+@@ -865,8 +865,8 @@
+     ensureMonstersFolder()
+ 
+     -- Death runs as a normal one-shot. PreAnimation only catches the step that
+-    -- would pass AnimationTrack.Length, then evaluates that exact final key and
+-    -- freezes it for DeathIdle. No source-FPS or epsilon assumptions.
++    -- would reach/pass AnimationTrack.Length and freezes the already-evaluated
++    -- visible pose. DeathIdle must never seek into a terminal reset sample.
+     RunService.PreAnimation:Connect(function(deltaTimeSim)
+         for _, state in pairs(states) do
+             for model, entry in pairs(state.instances) do
+diff --git a/src/client/character/animation/CharacterAnimationController.luau b/src/client/character/animation/CharacterAnimationController.luau
+--- a/src/client/character/animation/CharacterAnimationController.luau
++++ b/src/client/character/animation/CharacterAnimationController.luau
+@@ -189,7 +189,7 @@
+ 		return
+ 	end
+ 
+-	local reached, terminalTime = DeathAnimationPolicy.AdvanceToFinalKey(track, deltaTimeSim)
++	local reached, terminalTime = DeathAnimationPolicy.LatchVisibleTerminalPose(track, deltaTimeSim)
+ 	if not reached then
+ 		return
+ 	end
+diff --git a/src/shared/RuntimeVersion.luau b/src/shared/RuntimeVersion.luau
+--- a/src/shared/RuntimeVersion.luau
++++ b/src/shared/RuntimeVersion.luau
+@@ -1 +1 @@
+-return table.freeze({ Version = "2026.10.06.016", SourceDigest = "game1-m7-monster-root-bone-animation-bridge" })
++return table.freeze({ Version = "2026.10.06.017", SourceDigest = "game1-m7-death-idle-visible-pose-latch" })
+diff --git a/system/verify/verify.py b/system/verify/verify.py
+--- a/system/verify/verify.py
++++ b/system/verify/verify.py
+@@ -820,32 +820,28 @@
+ death_policy_text = death_policy_path.read_text(encoding="utf-8") if death_policy_path.is_file() else ""
+ for required in [
+     "function DeathAnimationPolicy.Start",
+-    "function DeathAnimationPolicy.AdvanceToFinalKey",
+-    "finalKeyTime = tonumber(track.Length) or 0",
+-    "current + step < finalKeyTime",
++    "function DeathAnimationPolicy.LatchVisibleTerminalPose",
++    "length = tonumber(track.Length) or 0",
++    "current + step < length",
+     "track:AdjustSpeed(0)",
+-    "track.TimePosition = finalKeyTime",
++    "return true, current",
+ ]:
+     if required not in death_policy_text:
+         err(f"canonical death animation policy missing {required}")
+ 
+ for forbidden in [
++    "AdvanceToFinalKey",
++    "track.TimePosition = finalKeyTime",
++    "terminalTime = math.max(0, length -",
+     "EndEpsilonSeconds",
+-    "1 / 24",
+-    "1 / 30",
+-    "1 / 60",
+-    "1 / 240",
+-    "endEpsilon",
+-    "terminalTime = math.max(0, length -",
+-    "AdvanceToTerminal",
+ ]:
+     if forbidden in death_policy_text:
+-        err(f"death playback must target the exact final authored key, found legacy timing token: {forbidden}")
++        err(f"death terminal latch must preserve the last visible pose, found legacy terminal seek token: {forbidden}")
+ 
+ for required in [
+     "maintainDeathTerminalPose",
+     "DeathAnimationPolicy.Start",
+-    "DeathAnimationPolicy.AdvanceToFinalKey",
++    "DeathAnimationPolicy.LatchVisibleTerminalPose",
+     'MonsterAnimationState", "death_idle"',
+     "DeathLifecycleService.BeginDeathIdle",
+     "RunService.PreAnimation:Connect",
+@@ -869,7 +865,7 @@
+     "playDeath",
+     "maintainDeathTerminalPose",
+     "DeathAnimationPolicy.Start",
+-    "DeathAnimationPolicy.AdvanceToFinalKey",
++    "DeathAnimationPolicy.LatchVisibleTerminalPose",
+     "DeathTerminalReached",
+     "RunService.PreAnimation:Connect(maintainDeathTerminalPose)",
+     "DeathTerminalPoseHeld",
+@@ -933,7 +929,7 @@
+         print(" -", item)
+     sys.exit(1)
+ 
+-print("verify ok · game1 m7 monster root-bone animation bridge + death/corpse contracts passed")
++print("verify ok · game1 m7 visible death-pose latch + root-bone/corpse contracts passed")
+ print("registered character archetypes:", len(archetypes))
+ print("active character archetype:", active_id or "none")
+ print("race pool: human")

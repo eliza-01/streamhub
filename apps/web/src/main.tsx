@@ -101,6 +101,9 @@ type VideoPart = {
   local_file_state: string;
   local_unlinked_at_utc?: string | null;
   local_unlink_error?: string | null;
+  external_copy_directory?: string | null;
+  external_copy_path?: string | null;
+  external_copy_verified_at_utc?: string | null;
   profile?: {
     width?: number; height?: number; fps?: number; video_codec?: string; video_bitrate_kbps?: number; video_max_bitrate_kbps?: number;
     audio_codec?: string; audio_bitrate_kbps?: number; max_mib?: number; source_part_nos?: number[];
@@ -202,6 +205,40 @@ type ProxyPartPlanAll = {
   expected_bytes: number;
   target_mib: number;
   profile: { width: number; height: number; fps: number; video_codec: string; video_bitrate_kbps: number; video_max_bitrate_kbps: number; audio_codec: string; audio_bitrate_kbps: number };
+};
+
+type ReclaimPartItem = {
+  id: string;
+  part_no: number;
+  file_name: string;
+  bytes: number;
+  sha256?: string | null;
+  local_file_state: string;
+  telegram_linked: boolean;
+  external_copy_directory?: string | null;
+  external_copy_path?: string | null;
+};
+
+type ReclaimSegmentItem = {
+  id: number;
+  segment_no: number;
+  file_name: string;
+  bytes: number;
+  sha256?: string | null;
+  covered_by_linked_part: boolean;
+};
+
+type ReclaimManifest = {
+  session_id: string;
+  capture_active: boolean;
+  source_parts: ReclaimPartItem[];
+  proxy_parts: ReclaimPartItem[];
+  segments: ReclaimSegmentItem[];
+};
+
+type ReclaimDirectoryFile = {
+  file: File;
+  relativePath: string;
 };
 
 type OutputRoot = {
@@ -3312,6 +3349,128 @@ function SiteAdminPanel({
 }
 
 
+
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+class StreamingSha256 {
+  private state = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+  private buffer = new Uint8Array(64);
+  private bufferLength = 0;
+  private bytesHashed = 0;
+  private words = new Uint32Array(64);
+
+  update(data: Uint8Array) {
+    this.bytesHashed += data.length;
+    let offset = 0;
+    while (offset < data.length) {
+      const take = Math.min(64 - this.bufferLength, data.length - offset);
+      this.buffer.set(data.subarray(offset, offset + take), this.bufferLength);
+      this.bufferLength += take;
+      offset += take;
+      if (this.bufferLength === 64) {
+        this.processBlock(this.buffer);
+        this.bufferLength = 0;
+      }
+    }
+  }
+
+  digestHex() {
+    const bitLength = this.bytesHashed * 8;
+    this.buffer[this.bufferLength++] = 0x80;
+    if (this.bufferLength > 56) {
+      this.buffer.fill(0, this.bufferLength, 64);
+      this.processBlock(this.buffer);
+      this.bufferLength = 0;
+    }
+    this.buffer.fill(0, this.bufferLength, 56);
+    const high = Math.floor(bitLength / 0x100000000);
+    const low = bitLength >>> 0;
+    this.buffer[56] = (high >>> 24) & 0xff;
+    this.buffer[57] = (high >>> 16) & 0xff;
+    this.buffer[58] = (high >>> 8) & 0xff;
+    this.buffer[59] = high & 0xff;
+    this.buffer[60] = (low >>> 24) & 0xff;
+    this.buffer[61] = (low >>> 16) & 0xff;
+    this.buffer[62] = (low >>> 8) & 0xff;
+    this.buffer[63] = low & 0xff;
+    this.processBlock(this.buffer);
+    return Array.from(this.state).map((value) => value.toString(16).padStart(8, "0")).join("");
+  }
+
+  private processBlock(block: Uint8Array) {
+    const w = this.words;
+    for (let i = 0; i < 16; i += 1) {
+      const j = i * 4;
+      w[i] = ((block[j] << 24) | (block[j + 1] << 16) | (block[j + 2] << 8) | block[j + 3]) >>> 0;
+    }
+    for (let i = 16; i < 64; i += 1) {
+      const x = w[i - 15];
+      const y = w[i - 2];
+      const s0 = ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3);
+      const s1 = ((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = Array.from(this.state);
+    for (let i = 0; i < 64; i += 1) {
+      const s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + s1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (s0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    this.state[0] = (this.state[0] + a) >>> 0;
+    this.state[1] = (this.state[1] + b) >>> 0;
+    this.state[2] = (this.state[2] + c) >>> 0;
+    this.state[3] = (this.state[3] + d) >>> 0;
+    this.state[4] = (this.state[4] + e) >>> 0;
+    this.state[5] = (this.state[5] + f) >>> 0;
+    this.state[6] = (this.state[6] + g) >>> 0;
+    this.state[7] = (this.state[7] + h) >>> 0;
+  }
+}
+
+async function sha256File(file: File, onProgress?: (done: number, total: number) => void) {
+  const hasher = new StreamingSha256();
+  const chunkSize = 8 * 1024 * 1024;
+  for (let offset = 0; offset < file.size; offset += chunkSize) {
+    const chunk = new Uint8Array(await file.slice(offset, Math.min(file.size, offset + chunkSize)).arrayBuffer());
+    hasher.update(chunk);
+    onProgress?.(Math.min(file.size, offset + chunk.length), file.size);
+  }
+  return hasher.digestHex();
+}
+
+async function collectDirectoryFiles(handle: any, prefix = ""): Promise<ReclaimDirectoryFile[]> {
+  const files: ReclaimDirectoryFile[] = [];
+  for await (const [name, entry] of handle.entries()) {
+    const relativePath = prefix ? `${prefix}/${name}` : name;
+    if (entry.kind === "file") files.push({ file: await entry.getFile(), relativePath });
+    else if (entry.kind === "directory") files.push(...await collectDirectoryFiles(entry, relativePath));
+  }
+  return files;
+}
+
+function filesByBasename(files: ReclaimDirectoryFile[]) {
+  const index = new Map<string, ReclaimDirectoryFile[]>();
+  files.forEach((item) => {
+    const list = index.get(item.file.name) || [];
+    list.push(item);
+    index.set(item.file.name, list);
+  });
+  return index;
+}
+
 function App() {
   const [events, setEvents] = useState<MediaEvent[]>([]);
   const [trashEvents, setTrashEvents] = useState<MediaEvent[]>([]);
@@ -3327,8 +3486,11 @@ function App() {
   const [videoSegments, setVideoSegments] = useState<VideoSegment[]>([]);
   const [videoSessions, setVideoSessions] = useState<VideoSession[]>([]);
   const [videoParts, setVideoParts] = useState<VideoPart[]>([]);
-  const [segmentReplacementPartId, setSegmentReplacementPartId] = useState<string | null>(null);
-  const [segmentReplacementDirectory, setSegmentReplacementDirectory] = useState("");
+  const [reclaimDirectoryFiles, setReclaimDirectoryFiles] = useState<ReclaimDirectoryFile[]>([]);
+  const [reclaimDirectoryName, setReclaimDirectoryName] = useState("");
+  const [reclaimDirectoryLabel, setReclaimDirectoryLabel] = useState("");
+  const [reclaimAction, setReclaimAction] = useState<"source" | "proxy" | "segments" | null>(null);
+  const [reclaimProgress, setReclaimProgress] = useState("");
   const [partMode, setPartMode] = useState<"manual" | "target" | "count">("manual");
   const [partFromSegment, setPartFromSegment] = useState(1);
   const [partToSegment, setPartToSegment] = useState(1);
@@ -4433,8 +4595,10 @@ function App() {
     setPartPlan(null);
     setPartPlanAll(null);
     setProxyPlan(null);
-    setSegmentReplacementPartId(null);
-    setSegmentReplacementDirectory("");
+    setReclaimDirectoryFiles([]);
+    setReclaimDirectoryName("");
+    setReclaimDirectoryLabel("");
+    setReclaimProgress("");
     try {
       const [detailRes, runsRes, segmentsRes, partsRes] = await Promise.all([
         fetch(`${API}/api/v1/video-sessions/${session.id}`, { cache: "no-store" }),
@@ -4648,47 +4812,127 @@ function App() {
     }
   }
 
-  async function unlinkLocalPart(part: VideoPart) {
-    if (!selectedVideo) return;
-    if (!window.confirm(`Удалить локальный файл Part #${part.part_no}? Запись Part и Telegram linkage останутся в Video Manager.`)) return;
-    setPartAction(true);
+  async function chooseReclaimDirectory() {
+    const picker = (window as any).showDirectoryPicker;
+    if (typeof picker !== "function") {
+      setError("Выбор каталога требует Chrome/Edge с File System Access API.");
+      return;
+    }
     try {
-      const res = await fetch(`${API}/api/v1/video-parts/${part.id}/unlink-local`, { method: "POST" });
-      if (!res.ok) throw new Error(await res.text());
-      await loadVideoParts(selectedVideo.id);
+      const handle = await picker({ mode: "read" });
+      setReclaimProgress("Читаю каталог…");
+      const files = await collectDirectoryFiles(handle);
+      setReclaimDirectoryFiles(files);
+      setReclaimDirectoryName(String(handle.name || "selected directory"));
+      setReclaimDirectoryLabel((current) => current.trim() || String(handle.name || "selected directory"));
+      setReclaimProgress(`Выбрано файлов: ${files.length}`);
       setError(null);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setPartAction(false);
+    } catch (e: any) {
+      if (e?.name !== "AbortError") setError(String(e));
+      setReclaimProgress("");
     }
   }
 
-  async function replacePartSegments(part: VideoPart) {
-    if (!selectedVideo) return;
-    const copyDirectory = segmentReplacementDirectory.trim();
-    if (!copyDirectory) {
-      setError("Укажите каталог, содержащий проверенные копии segments.");
+  async function loadReclaimManifest() {
+    if (!selectedVideo) throw new Error("Video session не выбрана");
+    const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/reclaim-manifest`, { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    return await res.json() as ReclaimManifest;
+  }
+
+  async function verifyCopies<T extends { file_name: string; bytes: number; sha256?: string | null }>(items: T[]) {
+    if (reclaimDirectoryFiles.length === 0) throw new Error("Сначала выберите каталог с уже скопированными файлами.");
+    const index = filesByBasename(reclaimDirectoryFiles);
+    const verified: Array<T & { verified_sha256: string }> = [];
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      if (!item.sha256) throw new Error(`${item.file_name}: в БД нет SHA-256`);
+      const matches = index.get(item.file_name) || [];
+      if (matches.length === 0) throw new Error(`В выбранном каталоге нет ${item.file_name}`);
+      if (matches.length > 1) throw new Error(`В выбранном каталоге несколько файлов с именем ${item.file_name}`);
+      const selected = matches[0].file;
+      if (selected.size !== item.bytes) throw new Error(`${item.file_name}: размер ${fmtBytes(selected.size)} вместо ${fmtBytes(item.bytes)}`);
+      setReclaimProgress(`SHA-256 ${i + 1}/${items.length}: ${item.file_name}`);
+      const sha256 = await sha256File(selected, (done, total) => {
+        const percent = total ? Math.floor((done / total) * 100) : 100;
+        setReclaimProgress(`SHA-256 ${i + 1}/${items.length}: ${item.file_name} · ${percent}%`);
+      });
+      if (sha256.toLowerCase() !== item.sha256.toLowerCase()) throw new Error(`${item.file_name}: SHA-256 копии не совпадает`);
+      verified.push({ ...item, verified_sha256: sha256 });
+    }
+    setReclaimProgress(`Проверено: ${verified.length}/${items.length}`);
+    return verified;
+  }
+
+  async function reclaimAllParts(kind: "source" | "proxy") {
+    if (!selectedVideo || reclaimAction) return;
+    const label = reclaimDirectoryLabel.trim() || reclaimDirectoryName.trim();
+    if (!label) {
+      setError("Укажите путь или метку каталога копий для сохранения в Video Manager.");
       return;
     }
-    if (!window.confirm(`Проверить копии segments Part #${part.part_no} в указанном каталоге и удалить оригиналы из output? Метаданные segments останутся со статусом replaced.`)) return;
-    setPartAction(true);
+    setReclaimAction(kind);
     try {
-      const res = await fetch(`${API}/api/v1/video-parts/${part.id}/replace-segments`, {
+      const manifest = await loadReclaimManifest();
+      if (manifest.capture_active) throw new Error("Сначала завершите capture: массовое удаление Parts доступно после окончания записи.");
+      const allParts = kind === "source" ? manifest.source_parts : manifest.proxy_parts;
+      const localParts = allParts.filter((part) => part.local_file_state === "present");
+      if (localParts.length === 0) throw new Error(kind === "source" ? "Локальных source Parts для удаления нет." : "Локальных proxy Parts для удаления нет.");
+      if (allParts.some((part) => !part.telegram_linked)) throw new Error("Сначала все готовые Parts должны получить Telegram: linked.");
+      const verified = await verifyCopies(localParts);
+      if (!window.confirm(`Проверены все ${verified.length} ${kind === "source" ? "source" : "proxy"} Parts. Удалить их локальные файлы из MRW Hub? Записи и Telegram linkage останутся.`)) return;
+      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/reclaim-parts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ copy_directory: copyDirectory }),
+        body: JSON.stringify({
+          kind,
+          copy_directory: label,
+          items: verified.map((item: any) => ({ part_id: item.id, file_name: item.file_name, bytes: item.bytes, sha256: item.verified_sha256 })),
+        }),
       });
       if (!res.ok) throw new Error(await res.text());
-      const result = await res.json() as { cleanup_pending?: number; replaced_segments?: number };
+      const result = await res.json() as { unlinked_parts?: number; cleanup_pending?: number };
       await openVideoSession(selectedVideo);
-      setSegmentReplacementPartId(null);
-      setSegmentReplacementDirectory("");
+      setError(result.cleanup_pending ? `Parts удалены из output, но ${result.cleanup_pending} quarantine-файлов требуют повторной очистки.` : null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setReclaimAction(null);
+    }
+  }
+
+  async function reclaimAllSegments() {
+    if (!selectedVideo || reclaimAction) return;
+    const label = reclaimDirectoryLabel.trim() || reclaimDirectoryName.trim();
+    if (!label) {
+      setError("Укажите путь или метку каталога копий для сохранения в Video Manager.");
+      return;
+    }
+    setReclaimAction("segments");
+    try {
+      const manifest = await loadReclaimManifest();
+      if (manifest.capture_active) throw new Error("Сначала остановите capture: segments можно удалить только после завершения записи.");
+      if (manifest.source_parts.length === 0 || manifest.source_parts.some((part) => !part.telegram_linked)) throw new Error("Сначала все готовые source Parts должны получить Telegram: linked.");
+      if (manifest.segments.length === 0) throw new Error("Локальных archive_ready segments для удаления нет.");
+      if (manifest.segments.some((segment) => !segment.covered_by_linked_part)) throw new Error("Не все локальные segments покрыты Telegram-linked source Parts.");
+      const verified = await verifyCopies(manifest.segments);
+      if (!window.confirm(`Проверены все ${verified.length} segments. Удалить оригиналы из MRW Hub и пометить их Storage: replaced?`)) return;
+      const res = await fetch(`${API}/api/v1/video-sessions/${selectedVideo.id}/reclaim-segments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          copy_directory: label,
+          items: verified.map((item: any) => ({ segment_id: item.id, file_name: item.file_name, bytes: item.bytes, sha256: item.verified_sha256 })),
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const result = await res.json() as { replaced_segments?: number; cleanup_pending?: number };
+      await openVideoSession(selectedVideo);
       setError(result.cleanup_pending ? `Segments помечены replaced, но ${result.cleanup_pending} quarantine-файлов требуют повторной очистки.` : null);
     } catch (e) {
       setError(String(e));
     } finally {
-      setPartAction(false);
+      setReclaimAction(null);
     }
   }
 
@@ -5572,6 +5816,7 @@ function App() {
         <header className="detail-header">
           <div>
             <h1>Video Manager · output</h1>
+            <div className="video-manager-event-title">{visibleVideoEventTitle(selectedVideo, eventTitleMode)}</div>
             <p className="muted">{selectedVideo.metadata?.media_type?.toUpperCase() || "VIDEO"} · {selectedVideo.status} · {selectedVideo.completeness_status}</p>
           </div>
           <div className="actions">
@@ -5663,7 +5908,8 @@ function App() {
           )}
         </section>
         <section className="video-block proxy-parts-block">
-          <div className="section-label">PROXY PARTS · HEVC 1080p60</div>
+          <div className="section-label">МОНТАЖ · ПОНИЖЕННОЕ КАЧЕСТВО</div>
+          <h2 className="proxy-builder-title">Собрать proxy_parts · HEVC 1080p60</h2>
           <p className="muted small">Создаются из готовых локальных Parts. Профиль фиксирован: HEVC/H.265 · 1920×1080 · 60 fps · target/max 4/4 Mbps · AAC 160 kbps. Исходные Parts не изменяются.</p>
           <div className="part-controls">
             <label className="storage-field"><span>Max Proxy Part MiB · сохраняется</span><input type="number" min={1} value={proxyTargetMib} onChange={(e) => { setProxyTargetMib(Math.max(1, Number(e.target.value) || 1)); setProxyPlan(null); }} /></label>
@@ -5718,6 +5964,26 @@ function App() {
             <div className="muted small">Playback: {playbackStatus.playback_error}</div>
           ) : null}
         </section>
+        <section className="video-block media-reclaim-block">
+          <div className="section-label">ОСВОБОЖДЕНИЕ ЛОКАЛЬНОГО ХРАНИЛИЩА</div>
+          <h2>Проверить копии → удалить локальные файлы</h2>
+          <p className="muted small">Никакого автоматического удаления. Каталог выбирается на этом ПК напрямую через браузер и может находиться на любом доступном диске; Docker-директории VIDEO_OUTPUT_ROOT здесь не ограничивают выбор.</p>
+          <div className="reclaim-directory-row">
+            <button type="button" disabled={Boolean(reclaimAction)} onClick={() => void chooseReclaimDirectory()}>Выбрать каталог с копиями</button>
+            <div className="reclaim-directory-name">{reclaimDirectoryName || "Каталог не выбран"}</div>
+          </div>
+          <label className="storage-field reclaim-directory-label">
+            <span>Путь / метка каталога · сохраняется в Video Manager</span>
+            <input type="text" value={reclaimDirectoryLabel} onChange={(event) => setReclaimDirectoryLabel(event.target.value)} placeholder="I:\\MRW Hub\\backup\\event" />
+          </label>
+          {reclaimProgress && <div className="muted small reclaim-progress">{reclaimProgress}</div>}
+          <div className="reclaim-actions">
+            <button type="button" disabled={Boolean(reclaimAction) || reclaimDirectoryFiles.length === 0} onClick={() => void reclaimAllParts("source")}>{reclaimAction === "source" ? "Проверяю…" : "Проверить и удалить все source Parts"}</button>
+            <button type="button" disabled={Boolean(reclaimAction) || reclaimDirectoryFiles.length === 0} onClick={() => void reclaimAllParts("proxy")}>{reclaimAction === "proxy" ? "Проверяю…" : "Проверить и удалить все proxy Parts"}</button>
+            <button type="button" className="danger subtle" disabled={Boolean(reclaimAction) || reclaimDirectoryFiles.length === 0} onClick={() => void reclaimAllSegments()}>{reclaimAction === "segments" ? "Проверяю…" : "Проверить копии и удалить все segments"}</button>
+          </div>
+          <p className="muted small">Parts удаляются только всей локальной группой выбранного типа и только когда все ready Parts имеют Telegram: linked. Для segments сначала проверяются все локальные archive_ready segments; после удаления записи остаются и получают Storage: replaced.</p>
+        </section>
         <section className="video-block">
           <div className="section-label">PARTS / BUILD QUEUE</div>
           {videoParts.filter((part) => (part.kind || "source") === "source").length === 0 ? <div className="empty-child">Parts ещё не создавались</div> : (
@@ -5744,6 +6010,7 @@ function App() {
                       Local Part: <strong>{part.local_file_state === "unlinked" ? "deleted" : part.local_file_state || "present"}</strong>
                       {part.local_unlinked_at_utc && <> · {new Date(part.local_unlinked_at_utc).toLocaleString()}</>}
                     </div>
+                    {part.external_copy_path && <div className="muted small external-copy-line">Verified copy: <code>{part.external_copy_path}</code></div>}
                     {part.local_unlink_error && <div className="inline-error small">{part.local_unlink_error}</div>}
                     {part.status === "ready" && (
                       <div className={`telegram-part-status telegram-part-status-${telegram?.status || "missing"}`}>
@@ -5757,33 +6024,8 @@ function App() {
                       {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}
                       {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && <button disabled={partAction} onClick={() => partActionRequest(part, "cancel")}>Cancel</button>}
                       <button onClick={() => copyPartPath(part)}>Copy path</button>
-                      {part.status === "ready" && telegram?.status === "linked" && part.local_file_state !== "unlinked" && (
-                        <button className="danger subtle" disabled={partAction} onClick={() => void unlinkLocalPart(part)}>Unlink Part</button>
-                      )}
-                      {part.status === "ready" && telegram?.status === "linked" && (
-                        <button disabled={partAction} onClick={() => { setSegmentReplacementPartId((current) => current === part.id ? null : part.id); setSegmentReplacementDirectory(""); }}>Replace segments</button>
-                      )}
                       {(part.status === "failed" || part.status === "cancelled") && <button className="danger subtle" disabled={partAction} onClick={() => partActionRequest(part, "delete")}>Delete reservation</button>}
                     </div>
-                    {segmentReplacementPartId === part.id && (
-                      <div className="segment-replacement-form">
-                        <label>
-                          <span>Каталог с копиями segments</span>
-                          <input
-                            type="text"
-                            value={segmentReplacementDirectory}
-                            onChange={(event) => setSegmentReplacementDirectory(event.target.value)}
-                            placeholder="E:\\StreamHub\\backup\\segments"
-                            autoFocus
-                          />
-                        </label>
-                        <p className="muted small">Каталог должен быть внутри подключённого VIDEO_OUTPUT_ROOT. Перед удалением проверяются имя, размер и SHA-256 каждого segment.</p>
-                        <div className="actions">
-                          <button disabled={partAction || !segmentReplacementDirectory.trim()} onClick={() => void replacePartSegments(part)}>Verify & replace</button>
-                          <button disabled={partAction} onClick={() => { setSegmentReplacementPartId(null); setSegmentReplacementDirectory(""); }}>Отмена</button>
-                        </div>
-                      </div>
-                    )}
                   </div>
                 );
               })}
@@ -5817,6 +6059,7 @@ function App() {
                       Local Proxy: <strong>{part.local_file_state === "unlinked" ? "deleted" : part.local_file_state || "present"}</strong>
                       {part.local_unlinked_at_utc && <> · {new Date(part.local_unlinked_at_utc).toLocaleString()}</>}
                     </div>
+                    {part.external_copy_path && <div className="muted small external-copy-line">Verified copy: <code>{part.external_copy_path}</code></div>}
                     {part.local_unlink_error && <div className="inline-error small">{part.local_unlink_error}</div>}
                     {part.status === "ready" && (
                       <div className={`telegram-part-status telegram-part-status-${telegram?.status || "missing"}`}>
@@ -5830,9 +6073,6 @@ function App() {
                       {(part.status === "failed" || part.status === "cancelled") && <button disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "retry")}>Retry</button>}
                       {["queued", "waiting_capture_idle", "building", "verifying", "suspended_for_capture"].includes(part.status) && <button disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "cancel")}>Cancel</button>}
                       <button onClick={() => copyPartPath(part)}>Copy path</button>
-                      {part.status === "ready" && telegram?.status === "linked" && part.local_file_state !== "unlinked" && (
-                        <button className="danger subtle" disabled={partAction || proxyAction} onClick={() => void unlinkLocalPart(part)}>Unlink Proxy</button>
-                      )}
                       {(part.status === "failed" || part.status === "cancelled") && <button className="danger subtle" disabled={partAction || proxyAction} onClick={() => partActionRequest(part, "delete")}>Delete reservation</button>}
                     </div>
                   </div>

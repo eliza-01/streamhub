@@ -51,8 +51,29 @@ class ProxyPartPlanRequest(BaseModel):
     target_mib: int = Field(default=1990, ge=1, le=102400)
 
 
-class SegmentReplacementRequest(BaseModel):
+class VerifiedPartCopy(BaseModel):
+    part_id: uuid.UUID
+    file_name: str = Field(min_length=1, max_length=255)
+    bytes: int = Field(ge=0)
+    sha256: str = Field(min_length=64, max_length=64)
+
+
+class VerifiedSegmentCopy(BaseModel):
+    segment_id: int = Field(ge=1)
+    file_name: str = Field(min_length=1, max_length=255)
+    bytes: int = Field(ge=0)
+    sha256: str = Field(min_length=64, max_length=64)
+
+
+class BulkPartReclaimRequest(BaseModel):
+    kind: str = Field(pattern="^(source|proxy)$")
     copy_directory: str = Field(min_length=1, max_length=1024)
+    items: list[VerifiedPartCopy] = Field(min_length=1)
+
+
+class BulkSegmentReclaimRequest(BaseModel):
+    copy_directory: str = Field(min_length=1, max_length=1024)
+    items: list[VerifiedSegmentCopy] = Field(min_length=1)
 
 
 async def part_builder_request(method: str, path: str, payload: dict | None = None, *, timeout: float = 30.0) -> dict:
@@ -102,6 +123,9 @@ def part_dict(part: VideoPart, job: VideoPartBuildJob | None = None) -> dict:
         "local_file_state": part.local_file_state,
         "local_unlinked_at_utc": part.local_unlinked_at_utc,
         "local_unlink_error": part.local_unlink_error,
+        "external_copy_directory": part.external_copy_directory,
+        "external_copy_path": part.external_copy_path,
+        "external_copy_verified_at_utc": part.external_copy_verified_at_utc,
         "profile": part.profile_json,
         "created_at": part.created_at,
         "completed_at_utc": part.completed_at_utc,
@@ -1182,47 +1206,214 @@ async def cancel_video_part(part_id: uuid.UUID, db: AsyncSession = Depends(get_d
     return part_dict(row[0], row[1])
 
 
-async def ensure_part_telegram_linked(db: AsyncSession, part_id: uuid.UUID) -> VideoPart:
-    part = await db.get(VideoPart, part_id)
-    if part is None:
-        raise HTTPException(404, "part not found")
-    if part.status != "ready":
-        raise HTTPException(409, "part must be ready before local media can be reclaimed")
-    binding = await db.get(TelegramVideoPartBinding, part_id)
-    if binding is None:
-        raise HTTPException(409, "part must be Telegram: linked before local media can be reclaimed")
+def _telegram_channel_id() -> int:
     raw_channel_id = str(settings.telegram_channel_id or "").strip()
     if not raw_channel_id:
         raise HTTPException(409, "Telegram channel is not configured")
     try:
-        channel_id = int(raw_channel_id)
+        return int(raw_channel_id)
     except ValueError as exc:
         raise HTTPException(409, "TELEGRAM_CHANNEL_ID must be numeric") from exc
-    if int(binding.channel_id) != channel_id:
-        raise HTTPException(409, "part is linked to another Telegram channel")
-    return part
+
+
+async def _session_ready_parts_and_links(db: AsyncSession, session_id: uuid.UUID, kind: str) -> tuple[list[VideoPart], set[uuid.UUID]]:
+    parts = (
+        await db.execute(
+            select(VideoPart)
+            .where(VideoPart.video_session_id == session_id, VideoPart.kind == kind, VideoPart.status == "ready")
+            .order_by(VideoPart.part_no)
+        )
+    ).scalars().all()
+    if not parts:
+        return parts, set()
+    channel_id = _telegram_channel_id()
+    linked = set(
+        (
+            await db.execute(
+                select(TelegramVideoPartBinding.part_id).where(
+                    TelegramVideoPartBinding.part_id.in_([part.id for part in parts]),
+                    TelegramVideoPartBinding.channel_id == channel_id,
+                )
+            )
+        ).scalars().all()
+    )
+    return parts, linked
+
+
+@router.get("/video-sessions/{session_id}/reclaim-manifest")
+async def video_reclaim_manifest(session_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    session = await db.get(VideoSession, session_id)
+    if session is None or session.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    source_parts, source_linked = await _session_ready_parts_and_links(db, session_id, "source")
+    proxy_parts, proxy_linked = await _session_ready_parts_and_links(db, session_id, "proxy")
+    segment_rows = (
+        await db.execute(
+            select(VideoSegment)
+            .where(VideoSegment.video_session_id == session_id, VideoSegment.storage_state == "archive_ready")
+            .order_by(VideoSegment.segment_no)
+        )
+    ).scalars().all()
+    covered_segment_ids: set[int] = set()
+    if source_linked:
+        covered_segment_ids = set(
+            (
+                await db.execute(
+                    select(VideoPartSegment.segment_id)
+                    .join(VideoPart, VideoPart.id == VideoPartSegment.part_id)
+                    .where(
+                        VideoPart.video_session_id == session_id,
+                        VideoPart.kind == "source",
+                        VideoPart.status == "ready",
+                        VideoPart.id.in_(list(source_linked)),
+                    )
+                )
+            ).scalars().all()
+        )
+
+    def part_item(part: VideoPart, linked: set[uuid.UUID]) -> dict:
+        return {
+            "id": str(part.id),
+            "part_no": part.part_no,
+            "file_name": part.file_name,
+            "bytes": int(part.final_bytes or part.expected_bytes or 0),
+            "sha256": part.sha256,
+            "local_file_state": part.local_file_state,
+            "telegram_linked": part.id in linked,
+            "external_copy_directory": part.external_copy_directory,
+            "external_copy_path": part.external_copy_path,
+        }
+
+    return {
+        "session_id": str(session_id),
+        "capture_active": session.status in ACTIVE_VIDEO_STATUSES,
+        "source_parts": [part_item(part, source_linked) for part in source_parts],
+        "proxy_parts": [part_item(part, proxy_linked) for part in proxy_parts],
+        "segments": [
+            {
+                "id": segment.id,
+                "segment_no": segment.segment_no,
+                "file_name": segment.file_name,
+                "bytes": int(segment.bytes),
+                "sha256": segment.sha256,
+                "covered_by_linked_part": segment.id in covered_segment_ids,
+            }
+            for segment in segment_rows
+        ],
+    }
+
+
+def _assert_verified_part_manifest(parts: list[VideoPart], linked: set[uuid.UUID], payload: BulkPartReclaimRequest) -> list[VideoPart]:
+    candidates = [part for part in parts if part.local_file_state == "present"]
+    if not candidates:
+        raise HTTPException(409, "no local parts remain to reclaim")
+    if any(part.id not in linked for part in parts):
+        raise HTTPException(409, "all ready parts must be Telegram: linked before reclaim")
+    if any(not part.sha256 for part in candidates):
+        raise HTTPException(409, "all local parts must have SHA-256 before reclaim")
+    expected = {part.id: part for part in candidates}
+    received = {item.part_id: item for item in payload.items}
+    if set(expected) != set(received):
+        raise HTTPException(409, "verified copy set must contain every local ready part")
+    for part_id, part in expected.items():
+        item = received[part_id]
+        expected_bytes = int(part.final_bytes or part.expected_bytes or 0)
+        if item.file_name != part.file_name or item.bytes != expected_bytes or item.sha256.lower() != str(part.sha256).lower():
+            raise HTTPException(409, f"verified copy manifest mismatch for Part #{part.part_no}")
+    return candidates
+
+
+@router.post("/video-sessions/{session_id}/reclaim-parts")
+async def reclaim_video_parts_bulk(
+    session_id: uuid.UUID,
+    payload: BulkPartReclaimRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    session = await db.get(VideoSession, session_id)
+    if session is None or session.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    parts, linked = await _session_ready_parts_and_links(db, session_id, payload.kind)
+    candidates = _assert_verified_part_manifest(parts, linked, payload)
+    return await part_builder_post(
+        f"/internal/v1/video-sessions/{session_id}/reclaim-parts",
+        {
+            "kind": payload.kind,
+            "copy_directory": payload.copy_directory.strip(),
+            "part_ids": [str(part.id) for part in candidates],
+        },
+        timeout=600.0,
+    )
+
+
+@router.post("/video-sessions/{session_id}/reclaim-segments")
+async def reclaim_video_segments_bulk(
+    session_id: uuid.UUID,
+    payload: BulkSegmentReclaimRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    session = await db.get(VideoSession, session_id)
+    if session is None or session.deleted_at_utc is not None:
+        raise HTTPException(404, "video session not found")
+    if session.status in ACTIVE_VIDEO_STATUSES:
+        raise HTTPException(409, "capture must be stopped before source segments can be reclaimed")
+    source_parts, linked = await _session_ready_parts_and_links(db, session_id, "source")
+    if not source_parts:
+        raise HTTPException(409, "source Parts are not ready")
+    if any(part.id not in linked for part in source_parts):
+        raise HTTPException(409, "all ready source Parts must be Telegram: linked before reclaiming segments")
+    segments = (
+        await db.execute(
+            select(VideoSegment)
+            .where(VideoSegment.video_session_id == session_id, VideoSegment.storage_state == "archive_ready")
+            .order_by(VideoSegment.segment_no)
+        )
+    ).scalars().all()
+    if not segments:
+        raise HTTPException(409, "no local archive_ready segments remain to reclaim")
+    covered = set(
+        (
+            await db.execute(
+                select(VideoPartSegment.segment_id)
+                .join(VideoPart, VideoPart.id == VideoPartSegment.part_id)
+                .where(
+                    VideoPart.video_session_id == session_id,
+                    VideoPart.kind == "source",
+                    VideoPart.status == "ready",
+                    VideoPart.id.in_(list(linked)),
+                )
+            )
+        ).scalars().all()
+    )
+    if any(segment.id not in covered for segment in segments):
+        raise HTTPException(409, "every local segment must be covered by a Telegram-linked source Part")
+    if any(not segment.sha256 for segment in segments):
+        raise HTTPException(409, "all local segments must have SHA-256 before reclaim")
+    expected = {segment.id: segment for segment in segments}
+    received = {item.segment_id: item for item in payload.items}
+    if set(expected) != set(received):
+        raise HTTPException(409, "verified copy set must contain every local archive_ready segment")
+    for segment_id, segment in expected.items():
+        item = received[segment_id]
+        if item.file_name != segment.file_name or item.bytes != int(segment.bytes) or item.sha256.lower() != str(segment.sha256).lower():
+            raise HTTPException(409, f"verified copy manifest mismatch for segment #{segment.segment_no}")
+    return await part_builder_post(
+        f"/internal/v1/video-sessions/{session_id}/reclaim-segments",
+        {
+            "copy_directory": payload.copy_directory.strip(),
+            "segment_ids": [segment.id for segment in segments],
+        },
+        timeout=1800.0,
+    )
 
 
 @router.post("/video-parts/{part_id}/unlink-local")
-async def unlink_local_video_part(part_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
-    await ensure_part_telegram_linked(db, part_id)
-    return await part_builder_post(f"/internal/v1/parts/{part_id}/unlink-local", {}, timeout=120.0)
+async def unlink_local_video_part(part_id: uuid.UUID) -> dict:
+    raise HTTPException(410, "individual Part unlink is disabled; use the Video Manager bulk verified reclaim flow")
 
 
 @router.post("/video-parts/{part_id}/replace-segments")
-async def replace_video_part_segments(
-    part_id: uuid.UUID,
-    payload: SegmentReplacementRequest,
-    db: AsyncSession = Depends(get_db),
-) -> dict:
-    part = await ensure_part_telegram_linked(db, part_id)
-    if (part.kind or "source") != "source":
-        raise HTTPException(409, "proxy parts do not own source segments")
-    return await part_builder_post(
-        f"/internal/v1/parts/{part_id}/replace-segments",
-        {"copy_directory": payload.copy_directory.strip()},
-        timeout=600.0,
-    )
+async def replace_video_part_segments(part_id: uuid.UUID) -> dict:
+    raise HTTPException(410, "per-Part segment replacement is disabled; use the Video Manager bulk verified reclaim flow")
 
 
 @router.delete("/video-parts/{part_id}")

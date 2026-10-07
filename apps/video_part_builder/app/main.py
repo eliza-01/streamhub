@@ -50,6 +50,17 @@ class SegmentReplacementPayload(BaseModel):
     copy_directory: str = Field(min_length=1, max_length=1024)
 
 
+class BulkPartReclaimPayload(BaseModel):
+    kind: str = Field(pattern="^(source|proxy)$")
+    copy_directory: str = Field(min_length=1, max_length=1024)
+    part_ids: list[uuid.UUID] = Field(min_length=1)
+
+
+class BulkSegmentReclaimPayload(BaseModel):
+    copy_directory: str = Field(min_length=1, max_length=1024)
+    segment_ids: list[int] = Field(min_length=1)
+
+
 def _telegram_channel_id() -> int:
     raw = str(settings.telegram_channel_id or "").strip()
     if not raw:
@@ -62,6 +73,12 @@ def _telegram_channel_id() -> int:
 
 def _normalize_path_text(value: str) -> str:
     return value.strip().replace("\\", "/").rstrip("/")
+
+
+def external_copy_path(directory: str, file_name: str) -> str:
+    base = directory.strip().rstrip("/\\")
+    separator = "\\" if "\\" in directory and "/" not in directory else "/"
+    return f"{base}{separator}{file_name}" if base else file_name
 
 
 def resolve_copy_directory(raw_directory: str) -> tuple[Path, str]:
@@ -904,6 +921,213 @@ async def cancel_part(part_id: uuid.UUID) -> dict:
     await gate.request_cancel(part_id)
     wakeup.set()
     return {"ok": True, "part_id": str(part_id)}
+
+
+@app.post("/internal/v1/video-sessions/{session_id}/reclaim-parts", dependencies=[Depends(require_internal_token)])
+async def reclaim_parts_bulk(session_id: uuid.UUID, payload: BulkPartReclaimPayload) -> dict:
+    copy_directory = payload.copy_directory.strip()
+    quarantines: list[tuple[Path, Path, uuid.UUID]] = []
+    async with SessionLocal() as db:
+        session = await db.get(VideoSession, session_id)
+        if session is None or session.deleted_at_utc is not None:
+            raise HTTPException(404, "video session not found")
+        active_job = await db.scalar(
+            select(VideoPartBuildJob.id)
+            .join(VideoPart, VideoPart.id == VideoPartBuildJob.part_id)
+            .where(VideoPart.video_session_id == session_id, VideoPartBuildJob.status.in_(BUILDING_JOB_STATUSES | CLAIMABLE_JOB_STATUSES))
+            .limit(1)
+        )
+        if active_job is not None:
+            raise HTTPException(409, "all part builds must be idle before bulk reclaim")
+        parts = (
+            await db.execute(
+                select(VideoPart)
+                .where(
+                    VideoPart.video_session_id == session_id,
+                    VideoPart.kind == payload.kind,
+                    VideoPart.status == "ready",
+                    VideoPart.local_file_state == "present",
+                )
+                .order_by(VideoPart.part_no)
+                .with_for_update()
+            )
+        ).scalars().all()
+        if {part.id for part in parts} != set(payload.part_ids):
+            raise HTTPException(409, "bulk reclaim must include every local ready part of the selected kind")
+        channel_id = _telegram_channel_id()
+        linked_ids = set(
+            (
+                await db.execute(
+                    select(TelegramVideoPartBinding.part_id).where(
+                        TelegramVideoPartBinding.part_id.in_([part.id for part in parts]),
+                        TelegramVideoPartBinding.channel_id == channel_id,
+                    )
+                )
+            ).scalars().all()
+        )
+        if any(part.id not in linked_ids for part in parts):
+            raise HTTPException(409, "all ready parts must be Telegram: linked before bulk reclaim")
+        metadata = session.metadata_json or {}
+        root = configured_output_root(str(metadata.get("output_root_key") or "root1"))
+        now = now_utc_naive()
+        try:
+            for part in parts:
+                final_path = safe_child(root, part.relative_path)
+                if not final_path.is_file():
+                    raise HTTPException(409, f"local Part #{part.part_no} is missing: {part.relative_path}")
+                quarantine = final_path.with_name(f"{final_path.name}.unlink-{uuid.uuid4().hex}")
+                os.replace(final_path, quarantine)
+                fsync_directory(final_path.parent)
+                quarantines.append((quarantine, final_path, part.id))
+                part.local_file_state = "unlinked"
+                part.local_unlinked_at_utc = now
+                part.local_unlink_error = None
+                part.external_copy_directory = copy_directory
+                part.external_copy_path = external_copy_path(copy_directory, part.file_name)
+                part.external_copy_verified_at_utc = now
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            for quarantine, final_path, _part_id in reversed(quarantines):
+                if quarantine.exists() and not final_path.exists():
+                    os.replace(quarantine, final_path)
+                    fsync_directory(final_path.parent)
+            raise
+
+    cleanup_errors: list[tuple[uuid.UUID, str]] = []
+    for quarantine, _final_path, part_id in quarantines:
+        error = await unlink_with_retries(quarantine)
+        if error:
+            cleanup_errors.append((part_id, error))
+    if cleanup_errors:
+        async with SessionLocal() as db:
+            for part_id, error in cleanup_errors:
+                part = await db.get(VideoPart, part_id)
+                if part is not None:
+                    part.local_file_state = "cleanup_pending"
+                    part.local_unlink_error = error
+            await db.commit()
+    return {
+        "ok": True,
+        "kind": payload.kind,
+        "unlinked_parts": len(quarantines),
+        "copy_directory": copy_directory,
+        "cleanup_pending": len(cleanup_errors),
+    }
+
+
+@app.post("/internal/v1/video-sessions/{session_id}/reclaim-segments", dependencies=[Depends(require_internal_token)])
+async def reclaim_segments_bulk(session_id: uuid.UUID, payload: BulkSegmentReclaimPayload) -> dict:
+    copy_directory = payload.copy_directory.strip()
+    quarantines: list[tuple[Path, Path, int]] = []
+    async with SessionLocal() as db:
+        session = await db.get(VideoSession, session_id)
+        if session is None or session.deleted_at_utc is not None:
+            raise HTTPException(404, "video session not found")
+        if session.status in ACTIVE_CAPTURE_STATUSES:
+            raise HTTPException(409, "capture must be stopped before segment reclaim")
+        active_job = await db.scalar(
+            select(VideoPartBuildJob.id)
+            .join(VideoPart, VideoPart.id == VideoPartBuildJob.part_id)
+            .where(VideoPart.video_session_id == session_id, VideoPartBuildJob.status.in_(BUILDING_JOB_STATUSES | CLAIMABLE_JOB_STATUSES))
+            .limit(1)
+        )
+        if active_job is not None:
+            raise HTTPException(409, "all part builds must be idle before segment reclaim")
+        source_parts = (
+            await db.execute(
+                select(VideoPart).where(
+                    VideoPart.video_session_id == session_id,
+                    VideoPart.kind == "source",
+                    VideoPart.status == "ready",
+                )
+            )
+        ).scalars().all()
+        if not source_parts:
+            raise HTTPException(409, "source Parts are not ready")
+        channel_id = _telegram_channel_id()
+        linked_ids = set(
+            (
+                await db.execute(
+                    select(TelegramVideoPartBinding.part_id).where(
+                        TelegramVideoPartBinding.part_id.in_([part.id for part in source_parts]),
+                        TelegramVideoPartBinding.channel_id == channel_id,
+                    )
+                )
+            ).scalars().all()
+        )
+        if any(part.id not in linked_ids for part in source_parts):
+            raise HTTPException(409, "all ready source Parts must be Telegram: linked before segment reclaim")
+        segments = (
+            await db.execute(
+                select(VideoSegment)
+                .where(VideoSegment.video_session_id == session_id, VideoSegment.storage_state == "archive_ready")
+                .order_by(VideoSegment.segment_no)
+                .with_for_update()
+            )
+        ).scalars().all()
+        if {segment.id for segment in segments} != set(payload.segment_ids):
+            raise HTTPException(409, "bulk reclaim must include every local archive_ready segment")
+        covered = set(
+            (
+                await db.execute(
+                    select(VideoPartSegment.segment_id)
+                    .join(VideoPart, VideoPart.id == VideoPartSegment.part_id)
+                    .where(
+                        VideoPart.video_session_id == session_id,
+                        VideoPart.kind == "source",
+                        VideoPart.status == "ready",
+                        VideoPart.id.in_(list(linked_ids)),
+                    )
+                )
+            ).scalars().all()
+        )
+        if any(segment.id not in covered for segment in segments):
+            raise HTTPException(409, "every local segment must be covered by a Telegram-linked source Part")
+        metadata = session.metadata_json or {}
+        root = configured_output_root(str(metadata.get("output_root_key") or "root1"))
+        now = now_utc_naive()
+        try:
+            for segment in segments:
+                final_path = safe_child(root, segment.relative_path)
+                if not final_path.is_file():
+                    raise HTTPException(409, f"local segment #{segment.segment_no} is missing: {segment.relative_path}")
+                quarantine = final_path.with_name(f"{final_path.name}.replace-{uuid.uuid4().hex}")
+                os.replace(final_path, quarantine)
+                fsync_directory(final_path.parent)
+                quarantines.append((quarantine, final_path, segment.id))
+                segment.storage_state = "replaced"
+                segment.replacement_directory = copy_directory
+                segment.replacement_path = external_copy_path(copy_directory, segment.file_name)
+                segment.replaced_at_utc = now
+                segment.archive_last_error = None
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            for quarantine, final_path, _segment_id in reversed(quarantines):
+                if quarantine.exists() and not final_path.exists():
+                    os.replace(quarantine, final_path)
+                    fsync_directory(final_path.parent)
+            raise
+
+    cleanup_errors: list[tuple[int, str]] = []
+    for quarantine, _final_path, segment_id in quarantines:
+        error = await unlink_with_retries(quarantine)
+        if error:
+            cleanup_errors.append((segment_id, error))
+    if cleanup_errors:
+        async with SessionLocal() as db:
+            for segment_id, error in cleanup_errors:
+                segment = await db.get(VideoSegment, segment_id)
+                if segment is not None:
+                    segment.archive_last_error = f"replacement cleanup pending: {error}"
+            await db.commit()
+    return {
+        "ok": True,
+        "replaced_segments": len(quarantines),
+        "copy_directory": copy_directory,
+        "cleanup_pending": len(cleanup_errors),
+    }
 
 
 @app.post("/internal/v1/parts/{part_id}/unlink-local", dependencies=[Depends(require_internal_token)])

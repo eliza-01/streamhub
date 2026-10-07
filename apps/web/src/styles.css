@@ -1319,3 +1319,50 @@ button.site-replay-chat-empty.is-seekable strong { color: var(--sv-orange, #ff78
 .segment-replacement-form label { display: grid; gap: 6px; }
 .segment-replacement-form label > span { color: #aeb9c1; font-size: 12px; }
 .segment-replacement-form input { width: 100%; box-sizing: border-box; }
+
+.video-manager-event-title {
+  margin-top: 4px;
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1.2;
+  color: #eef3f6;
+}
+.proxy-builder-title,
+.media-reclaim-block h2 {
+  margin: 6px 0 8px;
+  font-size: 18px;
+  line-height: 1.2;
+}
+.media-reclaim-block {
+  border-color: #2d3b45;
+}
+.reclaim-directory-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+.reclaim-directory-name {
+  min-width: 180px;
+  color: #d7e0e6;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.reclaim-directory-label {
+  max-width: 760px;
+}
+.reclaim-progress {
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.reclaim-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.external-copy-line {
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
